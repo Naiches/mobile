@@ -23,7 +23,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -498,6 +498,7 @@ check(Keychain.with { Keychain.keys.isEmpty && Keychain.items.isEmpty },
 print("Files key access group: \(count) cases passed, \(failed) failed")
 `;
   const dir = mkdtempSync(join(tmpdir(), 'beebeeb-files-key-group-'));
+  try {
   const swift = join(dir, 'main.swift'), binary = join(dir, 'runner'), output = join(dir, 'output.log');
   writeFileSync(swift, harness);
   try {
@@ -515,4 +516,7 @@ print("Files key access group: \(count) cases passed, \(failed) failed")
   console.log(text);
   expect(text).not.toContain('FAIL:');
   expect(text).toContain('Files key access group: 31 cases passed, 0 failed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 300_000);

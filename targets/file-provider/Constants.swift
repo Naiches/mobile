@@ -63,6 +63,13 @@ enum BeebeebConstants {
   /// Logical root directory shown in the iOS Files app.
   static let rootContainerIdentifier = "io.beebeeb.root"
 
+  /// The read-only "Trash" folder at the top of the Beebeeb location, and the prefix of every id
+  /// inside it. Trashed items live in their own id namespace so they can never be mistaken for a
+  /// live row: the normal folders, the working set (Recents, search) and the sign-out purge's
+  /// per-folder pruning never see them.
+  static let trashContainerIdentifier = "io.beebeeb.trash"
+  static let trashItemPrefix = "trash:"
+
   /// File Provider domain registered by the containing app.
   static let fileProviderDomainIdentifier = NSFileProviderDomainIdentifier("io.beebeeb.files")
   static let fileProviderDisplayName = "Beebeeb"

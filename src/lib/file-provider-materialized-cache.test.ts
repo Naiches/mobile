@@ -12,7 +12,7 @@
  */
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -113,6 +113,7 @@ struct Driver {
 
 nativeSwiftHarnessTest('the real CacheManager stores the materialized folders under the purge rules', () => {
   const dir = mkdtempSync(join(tmpdir(), 'beebeeb-materialized-cache-'));
+  try {
   const driverPath = join(dir, 'Driver.swift');
   const binary = join(dir, 'driver');
   const output = join(dir, 'output.log');
@@ -132,4 +133,7 @@ nativeSwiftHarnessTest('the real CacheManager stores the materialized folders un
   console.log(text);
   expect(text).not.toContain('FAIL:');
   expect(text).toContain('materialized-cache-harness: 17 checks passed, 0 failed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 300_000);

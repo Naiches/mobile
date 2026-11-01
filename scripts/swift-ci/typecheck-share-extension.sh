@@ -24,8 +24,15 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 
 rc=0
-LOG_DIR="${SWIFT_CI_LOG_DIR:-$(mktemp -d)}"
+if [ -n "${SWIFT_CI_LOG_DIR:-}" ]; then
+  LOG_DIR="$SWIFT_CI_LOG_DIR"
+else
+  LOG_DIR="$(mktemp -d)"
+  trap 'rm -rf -- "$LOG_DIR"' EXIT
+fi
 mkdir -p "$LOG_DIR"
+TOOL_TMP="$LOG_DIR/tool-tmp"
+mkdir -p "$TOOL_TMP"
 
 SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
 HDR="ios/BeebeebCore.xcframework/ios-arm64_x86_64-simulator/Headers"
@@ -40,7 +47,7 @@ typecheck() {
   local log="$LOG_DIR/typecheck-$label.log"
   echo "== typecheck [$label]: $# files"
   printf '   %s\n' "$@"
-  xcrun swiftc -typecheck \
+  TMPDIR="$TOOL_TMP/" xcrun swiftc -typecheck \
     -sdk "$SDK" \
     -target arm64-apple-ios16.0-simulator \
     -swift-version 5 \

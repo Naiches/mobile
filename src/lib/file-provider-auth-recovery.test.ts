@@ -27,7 +27,7 @@ test('the resume provisions through the locked Files key writer with its full co
   expect(rule).toContain('PlaintextStorageProtection.isPurgePending()');
 });
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 const nativeTest = process.platform === 'darwin' ? test : test.skip;
@@ -244,6 +244,7 @@ ${helper}
 }
 `;
   const dir = mkdtempSync(join(tmpdir(), 'beebeeb-auth-recovery-'));
+  try {
   const swift = join(dir, 'main.swift'), binary = join(dir, 'harness');
   writeFileSync(swift, harness);
   execFileSync('swiftc', ['-parse-as-library', swift, '-o', binary], { timeout: 60_000 });
@@ -257,4 +258,7 @@ ${helper}
   // eslint-disable-next-line no-console
   if (!text.includes('PASS')) console.log(text);
   expect(text).toContain('PASS native authentication recovery cases=24');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 65_000);

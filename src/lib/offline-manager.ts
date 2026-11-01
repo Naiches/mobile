@@ -100,6 +100,9 @@ class OfflineManager {
   private initialized = false;
   private listeners = new Set<Listener>();
   private version = 0;
+  /** Bumped by clearAll(); a download that started under an older one writes nothing. */
+  private generation = 0;
+  private cancelWaiters = new Set<() => void | Promise<void>>();
 
   // -- subscription (useSyncExternalStore) ---------------------------------
 
@@ -272,13 +275,24 @@ class OfflineManager {
     this.status.set(fileId, { state: 'downloading', progress: 0 });
     this.emit();
     let lastPct = -1;
+    const gen = this.generation;
+    const isStale = () => gen !== this.generation;
+    let cancel: () => void = () => {};
+    let pauser: (() => Promise<void>) | null = null;
+    const cancelled = new Promise<'cancelled'>((resolve) => {
+      cancel = () => resolve('cancelled');
+      this.cancelWaiters.add(cancel);
+    });
     try {
       const dirInfo = await FileSystem.getInfoAsync(OFFLINE_DIR);
+      if (isStale()) return;
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(OFFLINE_DIR, { intermediates: true });
+        if (isStale()) return;
         notePlaintextPathCreated();
       }
       const token = await getToken();
+      if (isStale()) return;
       if (!token) throw new Error('Not signed in');
 
       const resumable = FileSystem.createDownloadResumable(
@@ -286,6 +300,7 @@ class OfflineManager {
         offlineFilePath(fileId),
         { headers: { Authorization: `Bearer ${token}` } },
         (p) => {
+          if (gen !== this.generation) return;
           const total = p.totalBytesExpectedToWrite;
           const pct = total > 0 ? p.totalBytesWritten / total : 0;
           // Throttle re-renders to whole-percent changes.
@@ -297,7 +312,25 @@ class OfflineManager {
         },
       );
 
-      const result = await resumable.downloadAsync();
+      let pausePromise: Promise<void> | null = null;
+      pauser = () => {
+        pausePromise ??= resumable.pauseAsync().then(() => undefined).catch(() => undefined);
+        return pausePromise;
+      };
+      this.cancelWaiters.add(pauser);
+      if (isStale()) {
+        await pauser();
+        return;
+      }
+      const pending = resumable.downloadAsync();
+      pending.catch(() => {});
+      const raced = await Promise.race([pending, cancelled]);
+      if (raced === 'cancelled' || gen !== this.generation) {
+        await pauser();
+        await FileSystem.deleteAsync(offlineFilePath(fileId), { idempotent: true }).catch(() => {});
+        return;
+      }
+      const result = raced;
 
       // If the user removed this file while it was downloading, its status was
       // deleted — honor that, drop the bytes, and don't re-add to the manifest.
@@ -324,9 +357,13 @@ class OfflineManager {
       await this.persistFiles();
       this.emit();
     } catch {
-      this.status.set(fileId, { state: 'error', progress: 0 });
       await FileSystem.deleteAsync(offlineFilePath(fileId), { idempotent: true }).catch(() => {});
+      if (gen !== this.generation) return;
+      this.status.set(fileId, { state: 'error', progress: 0 });
       this.emit();
+    } finally {
+      this.cancelWaiters.delete(cancel);
+      if (pauser) this.cancelWaiters.delete(pauser);
     }
   }
 
@@ -366,6 +403,30 @@ class OfflineManager {
       statuses: Object.fromEntries(this.status),
       folders: [...this.folders],
     };
+  }
+
+  /**
+   * "Clear offline files" from the cache page: cancel every in-flight download
+   * (each job still releases its own slot, so `activeCount` stays right), drop
+   * the queue, the manifest and the pins, and delete the blobs. A job that
+   * finishes after this sees a newer generation and writes nothing.
+   */
+  async clearAll(): Promise<void> {
+    this.generation += 1;
+    const cancellations = [...this.cancelWaiters].map((fn) => Promise.resolve(fn()));
+    this.queue = [];
+    this.status.clear();
+    this.manifest.clear();
+    this.folders.clear();
+    // A resumable owns its destination until pause settles. Deleting first can
+    // race a late write that recreates bytes after Clear has returned.
+    await Promise.allSettled(cancellations);
+    await FileSystem.deleteAsync(OFFLINE_DIR, { idempotent: true }).catch(() => {});
+    await Promise.allSettled([
+      SecureStore.deleteItemAsync(OFFLINE_KEY),
+      SecureStore.deleteItemAsync(OFFLINE_FOLDERS_KEY),
+    ]);
+    this.emit();
   }
 
   /**

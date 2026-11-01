@@ -72,7 +72,6 @@ func runBounded<T>(watchdog: TimeInterval = 15, _ op: @escaping () async -> T) -
 let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-r14-\(UUID().uuidString)", isDirectory: true)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 
 // NativeBackupEngine.ensureTables (the columns these statements touch).
 let schema = """
@@ -981,9 +980,10 @@ do {
   expect(classify(200, "application/json", nil, #"{"is_uploading":true,"is_trashed":false}"#) == "uploading", "o.c8 uploading")
   expect(classify(500, "application/json", nil, #"{"error":"internal"}"#) == "throws", "o.c9 500 throws")
   expect(classify(200, "application/json", nil, #"[]"#) == "throws", "o.c10 a JSON array throws")
+  expect(classify(200, "application/json", nil, #"{"is_uploading":true,"is_trashed":true}"#) == "completeInTrash", "o.c11 Trash wins over an unfinished upload")
 }
 
-// MARK: - (p) P2 item 3: a trashed file is not backed up
+// MARK: - (p) a trashed file is not backed up
 
 do {
   let r = resolveWith("p.db", answer: nil, trashed: true)
@@ -1285,11 +1285,14 @@ do {
 
 // MARK: - Report
 
+let exitCode: Int32
 if failures.isEmpty {
   print("KeptInFlightUploadTests: \(total) assertions, 0 failed")
-  exit(0)
+  exitCode = 0
 } else {
   for f in failures { print("FAIL: \(f)") }
   print("KeptInFlightUploadTests: \(failures.count) of \(total) assertions FAILED")
-  exit(1)
+  exitCode = 1
 }
+try? fm.removeItem(at: root)
+exit(exitCode)

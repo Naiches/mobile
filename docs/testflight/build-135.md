@@ -162,7 +162,7 @@ Already verified static in earlier builds. On this build, confirm the photo back
 
 | # | Step | Pass criterion |
 |---|---|---|
-| 9.1 | Settings → Security → "Set up two-factor authentication" → scan QR with 1Password / Authy / Google Authenticator | TOTP code generates correctly. Beebeeb accepts the code. Backup codes are saved. |
+| 9.1 | Settings → Security → "Set up two-factor authentication" → scan QR with an authenticator app such as 2FAS or Proton Authenticator | TOTP code generates correctly. Beebeeb accepts the code. Backup codes are saved. |
 | 9.2 | Sign out → sign in. Enter password. | 2FA prompt appears. Enter code. Login succeeds. |
 | 9.3 | Sign out → sign in. Enter password + 2FA. Pretend to lose phone — tap "Use backup code". Enter one of the saved backup codes. | Login succeeds. The used code is invalidated (can't be reused). |
 

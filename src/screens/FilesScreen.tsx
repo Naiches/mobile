@@ -6,7 +6,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import {
   ActivityIndicator,
   Alert,
-  Dimensions,
+  AppState,
   FlatList,
   Image,
   KeyboardAvoidingView,
@@ -18,6 +18,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
   type StyleProp,
   type TextStyle,
@@ -26,16 +27,17 @@ import { Swipeable } from 'react-native-gesture-handler';
 import { Ionicons } from '@expo/vector-icons';
 import { Icon } from '../components/Icon';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useFocusEffect, useIsFocused, useNavigation, useRoute } from '@react-navigation/native';
+import { useFocusEffect, useIsFocused, useNavigation, useRoute, type CompositeNavigationProp } from '@react-navigation/native';
 import { useAndroidFilesBack } from '../lib/use-android-files-back';
 import type { RouteProp } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import type { NativeBottomTabNavigationProp } from '@bottom-tabs/react-navigation';
 import * as Haptics from 'expo-haptics';
 import * as SecureStore from 'expo-secure-store';
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as DocumentPicker from 'expo-document-picker';
 import { lockFile, unlockFile } from '../lib/file-locks';
-import { openFilesEntry } from '../lib/open-lock-gate';
+import { createOpenFilesEntryGuard } from '../lib/open-lock-gate';
 import { lockedToastMessage } from '../lib/lock-copy';
 import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -62,6 +64,7 @@ import {
 import { UploadActivityCard } from '../components/UploadActivityCard';
 // Task 1685 fix 4 — bounded queue for fire-and-forget thumbnail generation.
 import { thumbnailUploadQueue } from '../lib/upload-queue';
+import { useDuplicateFile } from '../lib/use-duplicate-file';
 // Task 1685 fix 5 — throttled upload-progress state (≈4 Hz, stage transitions always pass).
 import { UPLOAD_PROGRESS_MIN_INTERVAL_MS, createProgressThrottle } from '../lib/upload-progress-throttle';
 // Task 1685 fix 6 — pre-upload dedupe: pure match/decision logic (unit-tested in upload-conflict.test.ts).
@@ -74,14 +77,14 @@ import {
   type ConflictResolution,
 } from '../lib/upload-conflict';
 // Task 1685 review should-fixes 1+2 — upload loop serialization + Resume-offer rule.
-import { canOfferResume, createUploadGate, type UploadGate } from '../lib/upload-gate';
-import type { UploadActivityState, UploadStage } from '../components/UploadActivityCard';
+import { canOfferResume } from '../lib/upload-gate';
+import type { UploadStage } from '../components/UploadActivityCard';
 import { useToast } from '../lib/toast-context';
 import SkeletonRow from '../components/SkeletonRow';
 import TrustDetailsSheet from '../components/TrustDetailsSheet';
 import FolderPickerModal, { type PickerFolder } from '../components/FolderPickerModal';
 import ExportProgressBanner, { type ExportProgressBannerHandle } from '../components/ExportProgressBanner';
-import { ApiError, listAllFiles, createFolder, deleteFile, trashFiles, renameFile, moveFile, uploadFile, friendlyError, getStorageUsage, createProofOfExistence, storageLocation, trustLocation, getUploadStatus, getApiUrl, getToken, abortUploadForFile, abandonFileUpload, getUploadResumeForFile, forgetUploadResume, resumeUploadFileId, registerUploadAbort, settleUploadSignal } from '../lib/api';
+import { ApiError, listAllFiles, listFilesPage, createFolder, deleteFile, restoreFile, renameFile, moveFile, uploadFile, friendlyError, getStorageUsage, createProofOfExistence, storageLocation, trustLocation, getUploadStatus, getApiUrl, getToken, abortUploadForFile, abandonFileUpload, getUploadResumeForFile, forgetUploadResume, trashFiles as trashFilesApi, trashFiles, resumeUploadFileId, registerUploadAbort, settleUploadSignal } from '../lib/api';
 import type { UploadResumeInfo } from '../lib/api';
 import { guessMimeType, fileCategory as fileCategoryFromMime } from '../lib/media';
 import { ensurePhotoPermission } from '../lib/photo-permissions';
@@ -95,7 +98,7 @@ import type { FileEntry, StorageUsage, ProofOfExistence, SyncNode } from '../lib
 import { storageLocationLabel, fileStorageCountry } from '../lib/storage-regions';
 import { loadFileStorageLocation } from '../lib/file-storage-location';
 import { rowNameDisplay } from '../lib/row-name';
-import type { RootStackParamList, TabParamList } from '../App';
+import type { FilesStackParamList, RootStackParamList, TabParamList } from '../App';
 import { useCrypto } from '../lib/crypto-context';
 import { decryptMetadata as decryptMetadataWithKey } from '../../modules/beebeeb-crypto';
 import { isRequestUpload } from '../lib/file-request-crypto';
@@ -109,13 +112,33 @@ import { createNewDocumentFile, decryptFolderNames, previewParamsForNewDocument 
 import { abandonTextFileUpload } from '../lib/text-file-save';
 import NewFileSheet, { type NewFileRequest } from '../components/NewFileSheet';
 import { useSync } from '../lib/sync-context';
-import { useSearchIndex } from '../lib/use-search-index';
+import { useFilesSharedState, useFilesTabBarVisibility } from '../lib/files-shared-state';
 import { decryptNamesInBackground } from '../lib/background-name-decrypt';
 import { onFilesDeleted } from '../lib/delete-cascade';
+import { itemActionOptions } from '../lib/file-action-options';
+import {
+  BACKUPS_PROTECTED_MESSAGE,
+  BACKUPS_PROTECTED_MOVE_MESSAGE,
+  isProtectedBackupsRoot,
+  partitionProtectedBackupsRoot,
+} from '../lib/protected-folders';
+import { useProtectedBackupsRootId } from '../lib/use-protected-backups-root';
+import { hideDeviceManifests, isDeviceManifest } from '../lib/hidden-system-files';
 import { loadNameCache, scheduleSaveNameCache, type NameCache } from '../lib/name-cache';
 import { accountEpoch } from '../lib/account-epoch';
 import { recordRuntimeTrace } from '../lib/runtime-trace';
+import { beginJsWorkPhase } from '../lib/js-event-loop-monitor';
+import { createManualUploadTrace } from '../lib/manual-upload-trace';
+import { reconcileCompletedUploadRows } from '../lib/upload-complete';
 import { offlineManager, type OfflineStatus } from '../lib/offline-manager';
+import NetInfo from '@react-native-community/netinfo';
+import {
+  computeFreshnessLine,
+  onDriveRefreshRequest,
+  shouldRunFreshnessRefresh,
+  FOREGROUND_MIN_BACKGROUND_MS,
+} from '../lib/drive-freshness';
+import type { ConnectionStatus } from '../lib/sync-client';
 import { useOfflineVersion } from '../lib/use-offline';
 import { cacheUploadedPreview, decryptToTempFile } from '../lib/native-decrypt';
 import { extensionForRaw } from '../lib/raw-format';
@@ -139,6 +162,7 @@ import {
 } from '../lib/account-state';
 import {
   appendFolderToBreadcrumbStack,
+  buildFolderRouteParams,
   filterSelfChildEntries,
   folderCacheKey,
   loadFolderWithCachedRows,
@@ -155,6 +179,24 @@ import {
   type SearchFilterKind,
 } from '../lib/search-filter';
 import { computeSearchStackBottomPadding, useKeyboardLayoutAnimation } from '../lib/useKeyboardLayoutAnimation';
+import { moveToTrashWithUndo } from '../lib/trash-with-undo';
+import {
+  hideOptimisticallyTrashed,
+  revealConfirmedOptimisticTrash,
+  revealOptimisticallyTrashed,
+  useOptimisticallyTrashedIds,
+} from '../lib/trash-optimistic';
+import {
+  adjustTrashCount,
+  notifyTrashChanged,
+  projectVisibleTopLevelTrashItems,
+  refreshTrashCount,
+  setTrashCounter,
+  shouldShowTrashRow,
+  trashRowLabel,
+  useTrashCount,
+} from '../lib/trash-count';
+import { fileRowSwipeHitSlop } from '../lib/file-row-swipe';
 
 // Tracks the currently open Swipeable so we can close it when another opens.
 let _openSwipeable: Swipeable | null = null;
@@ -309,6 +351,7 @@ function searchResultToFileEntry(result: SearchResult): FileEntry {
     mime_type: isFolder ? null : (result.entry.type || null),
     size_bytes: result.entry.size,
     is_folder: isFolder,
+    parent_id: result.entry.parent,
     chunk_count: 0,
     created_at: result.entry.created,
     updated_at: result.entry.modified,
@@ -342,6 +385,7 @@ function rowActionIcon(label: string): React.ComponentProps<typeof Ionicons>['na
     case 'Share': return 'link-outline';
     case 'Save to Files': return 'download-outline';
     case 'Save to Photos': return 'images-outline';
+    case 'Duplicate': return 'copy-outline';
     case 'Move to...': return 'folder-outline';
     case 'Make available offline':
     case 'Remove offline': return 'arrow-down-circle-outline';
@@ -703,7 +747,11 @@ const FileRowItem = React.memo(function FileRowItem({
   highlightQuery,
 }: FileRowItemProps) {
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const swipeableRef = useRef<Swipeable>(null);
+  // The root Backups folder is a system folder: no swipe-to-trash.
+  const isProtectedRoot = useProtectedBackupsRootId() === item.id.toLowerCase();
   const category = fileCategory(item);
   const [sharedLabel, setSharedLabel] = useState<string | null>(null);
   useEffect(() => {
@@ -745,7 +793,7 @@ const FileRowItem = React.memo(function FileRowItem({
   const renderRightActions = useCallback(() => (
     <View style={styles.swipeActions}>
       <TouchableOpacity
-        style={[styles.swipeAction, { backgroundColor: c.red }]}
+        style={[styles.swipeAction, accessibilityLayout && { width: Math.ceil(72 * Math.min(fontScale, 1.5)) }, { backgroundColor: c.red }]}
         activeOpacity={0.8}
         onPress={() => {
           swipeableRef.current?.close();
@@ -758,12 +806,12 @@ const FileRowItem = React.memo(function FileRowItem({
         <Text style={styles.swipeActionLabel}>Trash</Text>
       </TouchableOpacity>
     </View>
-  ), [c.red, item, onDelete, nameText]);
+  ), [accessibilityLayout, c.red, fontScale, item, onDelete, nameText]);
 
   const renderLeftActions = useCallback(() => (
     <View style={styles.swipeActions}>
       <TouchableOpacity
-        style={[styles.swipeAction, { backgroundColor: c.amber }]}
+        style={[styles.swipeAction, accessibilityLayout && { width: Math.ceil(72 * Math.min(fontScale, 1.5)) }, { backgroundColor: c.amber }]}
         activeOpacity={0.8}
         onPress={() => {
           swipeableRef.current?.close();
@@ -776,12 +824,16 @@ const FileRowItem = React.memo(function FileRowItem({
         <Text style={styles.swipeActionLabel}>Share</Text>
       </TouchableOpacity>
     </View>
-  ), [c.amber, item, onShare, nameText]);
+  ), [accessibilityLayout, c.amber, fontScale, item, onShare, nameText]);
 
   const rowContent = (
     <TouchableOpacity
       testID={testID}
-      style={[styles.fileRow, { borderBottomColor: c.line, backgroundColor: c.paper }]}
+      style={[
+        styles.fileRow,
+        accessibilityLayout && { minHeight: Math.ceil(24 + 42 * fontScale), alignItems: 'flex-start' },
+        { borderBottomColor: c.line, backgroundColor: c.paper },
+      ]}
       activeOpacity={0.6}
       onPress={() => selectMode ? onToggleSelect(item) : onPress(item)}
       onLongPress={selectMode ? undefined : () => onLongPress(item)}
@@ -810,7 +862,7 @@ const FileRowItem = React.memo(function FileRowItem({
               query={highlightQuery}
               style={[styles.fileName, { color: nameDisplay.kind === 'unavailable' ? c.ink3 : c.ink }, nameDisplay.kind === 'unavailable' && styles.nameUnavailable]}
               matchColor={c.amberDeep}
-              numberOfLines={2}
+              numberOfLines={accessibilityLayout ? undefined : 2}
             />
           )}
           {isShared && (
@@ -842,18 +894,21 @@ const FileRowItem = React.memo(function FileRowItem({
         </View>
         <Text style={[styles.fileMeta, { color: c.ink3 }]}>
           {(() => {
-            const sharedMessage = sharedOutcomeMessage(sharedKeyOutcome(item.id), sharedLabel);
-            if (sharedMessage) return sharedMessage;
             const loc = storageLocation(item.storage_pool_id);
             const locSuffix = loc.shortCode ? `  ·  ${loc.shortCode}` : '';
-            if (item.is_folder) return `${formatDate(item.updated_at)}${locSuffix}`;
+            // A v2 upload row's initial name is temporarily sealed under its
+            // client id. Describe that expected state before shared fallback
+            // can turn the transient mismatch into "Can't open" copy.
             if (isPendingUpload) return `Upload pending  ·  ${formatSize(item.size_bytes)}  ·  started ${formatDate(item.created_at)}${locSuffix}`;
+            const sharedMessage = sharedOutcomeMessage(sharedKeyOutcome(item.id), sharedLabel);
+            if (sharedMessage) return sharedMessage;
+            if (item.is_folder) return `${formatDate(item.updated_at)}${locSuffix}`;
             if (sortOrder === 'size-desc' || sortOrder === 'size-asc') return `${formatSize(item.size_bytes)}${locSuffix}`;
             return `${formatSize(item.size_bytes)}  ·  ${formatDate(item.updated_at)}${locSuffix}`;
           })()}
         </Text>
         {!item.is_folder && (
-          <Text style={[styles.cryptoMeta, { color: c.ink4 }]} numberOfLines={1}>
+          <Text style={[styles.cryptoMeta, { color: c.ink4 }]} numberOfLines={accessibilityLayout ? undefined : 1}>
             {isPendingUpload
               ? 'Waiting for encrypted chunks'
               : `AES-256-GCM · ${storageLocationLabel(fileStorageCountry(item))}`}
@@ -896,8 +951,9 @@ const FileRowItem = React.memo(function FileRowItem({
   return (
     <Swipeable
       ref={swipeableRef}
+      hitSlop={fileRowSwipeHitSlop(Platform.OS)}
       renderLeftActions={renderLeftActions}
-      renderRightActions={renderRightActions}
+      renderRightActions={isProtectedRoot ? undefined : renderRightActions}
       onSwipeableOpen={handleSwipeOpen}
       onSwipeableClose={handleSwipeClose}
       overshootLeft={false}
@@ -963,6 +1019,8 @@ const FileGridItem = React.memo(function FileGridItem({
   highlightQuery,
 }: FileGridItemProps) {
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const category = fileCategory(item);
   const [sharedLabel, setSharedLabel] = useState<string | null>(null);
   useEffect(() => {
@@ -987,19 +1045,20 @@ const FileGridItem = React.memo(function FileGridItem({
 
   const loc = storageLocation(item.storage_pool_id);
   const locSuffix = loc.shortCode ? ` · ${loc.shortCode}` : '';
-  const metaText = sharedOutcomeMessage(sharedKeyOutcome(item.id), sharedLabel) ?? (isFolder
-    ? `${formatDate(item.updated_at)}${locSuffix}`
-    : isPendingUpload
-      ? `Upload pending · ${formatSize(item.size_bytes)}${locSuffix}`
-    : (sortOrder === 'size-desc' || sortOrder === 'size-asc')
-      ? `${formatSize(item.size_bytes)}${locSuffix}`
-      : `${formatSize(item.size_bytes)} · ${formatDate(item.updated_at)}${locSuffix}`);
+  const metaText = isPendingUpload
+    ? `Upload pending · ${formatSize(item.size_bytes)}${locSuffix}`
+    : sharedOutcomeMessage(sharedKeyOutcome(item.id), sharedLabel) ?? (isFolder
+      ? `${formatDate(item.updated_at)}${locSuffix}`
+      : (sortOrder === 'size-desc' || sortOrder === 'size-asc')
+        ? `${formatSize(item.size_bytes)}${locSuffix}`
+        : `${formatSize(item.size_bytes)} · ${formatDate(item.updated_at)}${locSuffix}`);
 
   return (
     <TouchableOpacity
       testID={testID}
       style={[
         styles.gridCard,
+        accessibilityLayout && { minHeight: Math.ceil(130 * Math.min(fontScale, 1.7)) },
         {
           width: cardWidth,
           backgroundColor: isFolder ? c.amberBg : c.paper,
@@ -1037,7 +1096,7 @@ const FileGridItem = React.memo(function FileGridItem({
               query={highlightQuery}
               style={[styles.gridName, { color: nameDisplay.kind === 'unavailable' ? c.ink3 : c.ink }, nameDisplay.kind === 'unavailable' && styles.nameUnavailable]}
               matchColor={c.amberDeep}
-              numberOfLines={2}
+              numberOfLines={accessibilityLayout ? undefined : 2}
             />
           )}
           {isShared && (
@@ -1068,11 +1127,11 @@ const FileGridItem = React.memo(function FileGridItem({
             />
           )}
         </View>
-        <Text style={[styles.gridMeta, { color: c.ink3 }]} numberOfLines={1}>
+        <Text style={[styles.gridMeta, { color: c.ink3 }]} numberOfLines={accessibilityLayout ? undefined : 1}>
           {metaText}
         </Text>
         {!isFolder && (
-          <Text style={[styles.cryptoMetaGrid, { color: c.ink4 }]} numberOfLines={1}>
+          <Text style={[styles.cryptoMetaGrid, { color: c.ink4 }]} numberOfLines={accessibilityLayout ? undefined : 1}>
             {isPendingUpload ? 'Waiting for chunks' : `AES-256-GCM · ${storageLocationLabel(fileStorageCountry(item))}`}
           </Text>
         )}
@@ -1167,6 +1226,8 @@ interface ProofDetailModalProps {
 function ProofDetailModal({ proof, fileName, onClose, showToast }: ProofDetailModalProps) {
   const { colors: c } = useTheme();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [sharing, setSharing] = useState(false);
 
   // ISO timestamp + formatted local time
@@ -1226,10 +1287,10 @@ function ProofDetailModal({ proof, fileName, onClose, showToast }: ProofDetailMo
   return (
     <View style={[proofStyles.root, { backgroundColor: c.paper }]}>
       {/* Header */}
-      <View style={[proofStyles.header, { borderBottomColor: c.line, paddingTop: insets.top + 16 }]}>
+      <View style={[proofStyles.header, accessibilityLayout && proofStyles.headerAccessibility, { borderBottomColor: c.line, paddingTop: insets.top + 16 }]}>
         <View style={{ flex: 1 }}>
           <Text style={[proofStyles.title, { color: c.ink }]}>Proof of existence</Text>
-          <Text style={[proofStyles.subtitle, { color: c.ink3 }]} numberOfLines={1}>{fileName}</Text>
+          <Text style={[proofStyles.subtitle, { color: c.ink3 }]} numberOfLines={accessibilityLayout ? undefined : 1}>{fileName}</Text>
         </View>
         <TouchableOpacity onPress={onClose} accessibilityLabel="Close" style={proofStyles.closeBtn}>
           <Ionicons name="close" size={22} color={c.ink2} />
@@ -1303,6 +1364,7 @@ const proofStyles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     gap: 8,
   },
+  headerAccessibility: { alignItems: 'flex-start' },
   title: { fontSize: 20, fontWeight: '700' },
   subtitle: { fontSize: 12, marginTop: 2 },
   closeBtn: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
@@ -1355,19 +1417,82 @@ const proofStyles = StyleSheet.create({
 // Screen
 // ---------------------------------------------------------------------------
 
-type Nav = NativeStackNavigationProp<RootStackParamList>;
+type Nav = CompositeNavigationProp<
+  NativeStackNavigationProp<FilesStackParamList>,
+  CompositeNavigationProp<
+    NativeBottomTabNavigationProp<TabParamList>,
+    NativeStackNavigationProp<RootStackParamList>
+  >
+>;
+
+type FilesRoute =
+  | RouteProp<FilesStackParamList, 'Drive'>
+  | RouteProp<FilesStackParamList, 'Folder'>;
+const DRIVE_ROOT_PATH: BreadcrumbEntry[] = [{ id: null, name: 'Drive' }];
+
+/**
+ * "Offline · showing saved list" / "Reconnecting…" / "Updated N min ago": only when
+ * the list may not be current. Its own component so the 30 s clock (which only runs
+ * while no live stream vouches for the list) and the network listener do not
+ * re-render the whole screen.
+ */
+function FreshnessLine({
+  status,
+  syncedAt,
+  fetchedAt,
+}: {
+  status: ConnectionStatus;
+  syncedAt: number | null;
+  fetchedAt: number | null;
+}) {
+  const { colors: c } = useTheme();
+  const [online, setOnline] = useState(true);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    return NetInfo.addEventListener((st) => {
+      setOnline(st.isConnected !== false && st.isInternetReachable !== false);
+    });
+  }, []);
+  useEffect(() => {
+    if (status === 'connected') return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, [status]);
+  const line = computeFreshnessLine({
+    online,
+    syncStatus: status,
+    lastFreshAt: Math.max(fetchedAt ?? 0, syncedAt ?? 0) || null,
+    now,
+  });
+  if (!line) return null;
+  return (
+    <Text
+      testID="drive-freshness-line"
+      accessibilityLiveRegion="polite"
+      style={{ color: c.ink3, fontSize: 12, paddingHorizontal: spacing.lg, paddingBottom: 6 }}
+    >
+      {line.text}
+    </Text>
+  );
+}
 
 export default function FilesScreen() {
   const isFocused = useIsFocused();
   const navigation = useNavigation<Nav>();
-  const route = useRoute<RouteProp<TabParamList, 'Files'>>();
+  const route = useRoute<FilesRoute>();
   const insets = useSafeAreaInsets();
+  const { width: screenWidth, height: screenHeight, fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   // 1394 — GlassTabBar is now an absolute overlay; this screen's own flex
   // height extends behind it, so the list, FAB, upload card and select-mode
   // action bar all reserve this same shared inset themselves.
   const tabBarBottomInset = useTabBarBottomInset();
   const { colors: c, resolved: themeScheme } = useTheme();
   const { showToast } = useToast();
+  const setFilesTabBarHidden = useFilesTabBarVisibility();
+  const trashCount = useTrashCount();
+  const optimisticallyTrashedIds = useOptimisticallyTrashedIds();
   const { user, phraseVerified } = useAuth();
   const isAuthenticated = user !== null;
   // Task 1037: a needs_plan or lapsed account is read-only (the server
@@ -1381,11 +1506,30 @@ export default function FilesScreen() {
     return true;
   }, [accountGate]);
   const { backupProgress, includeVideos, isPhotoBackupEnabled } = useBackup();
+  const {
+    ready: searchIndexReady,
+    search: searchVault,
+    indexFile,
+    indexFiles,
+    getIndexedIds,
+    allEntries,
+    pinnedFolders,
+    setPinnedFolders,
+    upload,
+    setUpload,
+    uploadGateRef,
+    tabAction,
+    tabFolderId,
+    clearTabAction,
+  } = useFilesSharedState();
+  const openFilesEntryGuardRef = useRef<ReturnType<typeof createOpenFilesEntryGuard<FileEntry>> | null>(null);
+  if (openFilesEntryGuardRef.current === null) {
+    openFilesEntryGuardRef.current = createOpenFilesEntryGuard<FileEntry>();
+  }
 
-  // Navigation state: stack of folders
-  const [folderStack, setFolderStack] = useState<BreadcrumbEntry[]>([
-    { id: null, name: 'Drive' },
-  ]);
+  // Every folder is a native stack route. The path is route data for the
+  // breadcrumb only; changing folders never mutates component-local state.
+  const folderStack = route.name === 'Folder' ? route.params.path : DRIVE_ROOT_PATH;
   const currentFolder = folderStack[folderStack.length - 1];
 
   // Breadcrumb collapsed-path popover. A deep path collapses to "Drive … current";
@@ -1403,6 +1547,8 @@ export default function FilesScreen() {
   const filesCountRef = useRef(0);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // Last successful REST listing (epoch ms); the freshness line combines it with sync.
+  const [fetchedAt, setFetchedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [usage, setUsage] = useState<StorageUsage | null>(null);
   // True once a fetch (or a non-empty sync snapshot) has produced an
@@ -1480,13 +1626,10 @@ export default function FilesScreen() {
   // restores the tab bar exactly when the search bar itself disappears, and
   // hides it again exactly when the search bar reappears.
   useEffect(() => {
-    (navigation.setOptions as (options: unknown) => void)({
-      tabBarStyle: searchActive && !selectMode ? { display: 'none' } : undefined,
-    });
-  }, [navigation, searchActive, selectMode]);
-
-  // Pinned folders
-  const [pinnedFolders, setPinnedFolders] = useState<{ id: string; name: string }[]>([]);
+    if (!isFocused) return;
+    setFilesTabBarHidden(searchActive && !selectMode);
+    return () => setFilesTabBarHidden(false);
+  }, [searchActive, selectMode, isFocused, setFilesTabBarHidden]);
 
   // Offline state is owned by the process-wide offlineManager; this subscribes
   // the screen to its version counter so rows re-render on download progress.
@@ -1594,10 +1737,60 @@ export default function FilesScreen() {
   // and stays live (SSE pushes). Until then we fall back to listFiles().
   const sync = useSync();
 
-  // Encrypted search index — fetched on unlock, queried on every keystroke
-  // when the search bar is open. Powers the "in your vault" results hint
-  // below the search bar; also kept in sync after create, rename, move, and delete.
-  const { ready: searchIndexReady, search: searchVault, indexFile, getIndexedIds, allEntries } = useSearchIndex();
+  // The encrypted search index lives in FilesSharedProvider, above every
+  // native folder route, so pushes do not refetch or fork the vault index.
+  const backupsRootId = useProtectedBackupsRootId();
+
+  const countTrashItems = useCallback(
+    async () => {
+      void backupsRootId;
+      const page = await listFilesPage({ trashed: true });
+      if (page.next_cursor) return null;
+      const indexed = allEntries();
+      let namesComplete = true;
+      const projection = await projectVisibleTopLevelTrashItems(
+        page.files,
+        (id) => {
+          const node = sync.getNode(id);
+          if (node) return node.parent_id;
+          return indexed[id]?.parent;
+        },
+        (entry) => {
+          const raw = entry.name_encrypted ?? '';
+          if (!raw.startsWith('{')) return raw || null;
+          const cached = decryptedNamesRef.current[entry.id] ?? indexed[entry.id]?.name;
+          if (!cached) namesComplete = false;
+          return cached ?? null;
+        },
+      );
+      return namesComplete ? projection.count : null;
+    },
+    [allEntries, backupsRootId, sync.getNode],
+  );
+  useEffect(() => {
+    if (currentFolder.id !== null) return;
+    setTrashCounter(countTrashItems);
+    if (isFocused) void refreshTrashCount(countTrashItems);
+  }, [countTrashItems, currentFolder.id, isFocused]);
+  useEffect(() => {
+    if (!isFocused || currentFolder.id !== null) return;
+    // A sync tree update is the authoritative hand-off for a Preview-originated
+    // optimistic hide; it also keeps the root count current for other devices.
+    revealConfirmedOptimisticTrash();
+    const timer = setTimeout(notifyTrashChanged, 250);
+    return () => clearTimeout(timer);
+  }, [currentFolder.id, isFocused, sync.treeVersion]);
+  useEffect(() => {
+    if (isFocused && currentFolder.id === null) notifyTrashChanged();
+  }, [currentFolder.id, isFocused]);
+
+  // The internal backup manifest never shows (hidden-system-files.ts): a folder's parent comes from
+  // the sync tree, else from the search index.
+  const getNodeById = sync.getNode; // stable; the whole sync value changes on every sync event
+  const parentIdOf = useCallback(
+    (id: string): string | null | undefined => getNodeById(id)?.parent_id ?? allEntries()[id]?.parent,
+    [getNodeById, allEntries],
+  );
 
   // Task 0807 (Pillar 3): the unlock reconcile already decrypts the whole vault
   // into the search index — so seed decryptedNames from it as soon as it's ready.
@@ -1634,39 +1827,61 @@ export default function FilesScreen() {
       searchReconciledRef.current = false;
       return;
     }
-    if (!isFocused || loading || !searchIndexReady || !sync.ready || searchReconciledRef.current) return;
+    if (currentFolder.id !== null || !isFocused || loading || !searchIndexReady || !sync.ready || searchReconciledRef.current) return;
     searchReconciledRef.current = true;
 
     let cancelled = false;
     void (async () => {
-      const indexed = getIndexedIds();
-      const missing = sync
-        .allNodes()
-        .filter(
-          (n) => !n.is_trashed && !indexed.has(n.id) && (n.name_encrypted ?? '').startsWith('{'),
-        );
-      const byId = new Map(missing.map((node) => [node.id, node]));
+      const endScanPhase = beginJsWorkPhase('files.search-reconcile.scan');
+      let missing: SyncNode[];
+      let byId: Map<string, SyncNode>;
+      try {
+        const indexed = getIndexedIds();
+        missing = sync
+          .allNodes()
+          .filter(
+            (n) => !n.is_trashed && !indexed.has(n.id) && (n.name_encrypted ?? '').startsWith('{'),
+          );
+        byId = new Map(missing.map((node) => [node.id, node]));
+      } finally {
+        endScanPhase();
+      }
       try {
         await folderNamesReadyRef.current;
         const applied = await decryptNamesInBackground(
           missing.map((node) => ({ fileId: node.id, nameEncrypted: node.name_encrypted ?? '' })),
           decryptNames,
-          (item, metadata) => {
-            const node = byId.get(item.fileId);
-            if (!node || !metadata.name) return;
-            indexFile(node.id, {
-              name: metadata.name,
-              path: metadata.name,
-              type: node.is_folder ? 'folder' : (metadata.mimeType ?? ''),
-              size: node.size_bytes ?? 0,
-              parent: node.parent_id,
-              starred: false,
-              created: '',
-              modified: '',
-              tags: [],
-            });
-          },
+          () => {},
           () => cancelled,
+          undefined,
+          (batch) => {
+            const endIndexPhase = beginJsWorkPhase('files.search-reconcile.index');
+            try {
+              const updates: Array<{ fileId: string; entry: SearchIndexEntry }> = [];
+              for (const { item, result: metadata } of batch) {
+                const node = byId.get(item.fileId);
+                if (!node || !metadata.name) continue;
+                if (isDeviceManifest(metadata.name, node.parent_id, node.parent_id ? parentIdOf(node.parent_id) : null)) continue;
+                updates.push({
+                  fileId: node.id,
+                  entry: {
+                    name: metadata.name,
+                    path: metadata.name,
+                    type: node.is_folder ? 'folder' : (metadata.mimeType ?? ''),
+                    size: node.size_bytes ?? 0,
+                    parent: node.parent_id,
+                    starred: false,
+                    created: '',
+                    modified: '',
+                    tags: [],
+                  },
+                });
+              }
+              indexFiles(updates);
+            } finally {
+              endIndexPhase();
+            }
+          },
         );
         recordRuntimeTrace('files.search_reconcile', { candidates: missing.length, applied, cancelled });
       } catch {
@@ -1679,7 +1894,7 @@ export default function FilesScreen() {
       cancelled = true;
       searchReconciledRef.current = false;
     };
-  }, [isUnlocked, isFocused, loading, currentFolder.id, searchIndexReady, sync.ready, sync.allNodes, getIndexedIds, indexFile, decryptNames]);
+  }, [isUnlocked, isFocused, loading, currentFolder.id, searchIndexReady, sync.ready, sync.allNodes, getIndexedIds, indexFiles, decryptNames, parentIdOf]);
 
   // 0789 — Sort + "+" add menus are now the real iOS UIMenu pull-down (MenuView),
   // anchored under the button. Only the file-row long-press still routes through the
@@ -1703,7 +1918,8 @@ export default function FilesScreen() {
   // appendable mid-flight (Guus: "tijdens upload van file op ios kun je niet
   // extra files uploaden met + knop"). The old disabled-FAB decision is gone;
   // uploads simply queue up behind the running one.
-  const [upload, setUpload] = useState<UploadActivityState | null>(null);
+  // It lives in FilesSharedProvider so a queued upload and its card survive
+  // native folder pushes and pops.
 
   // Task 1685 fix 6 — resolves when the per-folder name effect below finishes
   // (cache/index seeds applied + decrypt batch applied). The pre-upload dedupe
@@ -1727,8 +1943,7 @@ export default function FilesScreen() {
   // gate; a pick made while busy is QUEUED behind the running loop and says so
   // with a toast. (The gate promise-chain never rejects: a task's own failure
   // is the task caller's to handle.)
-  const uploadGateRef = useRef<UploadGate | null>(null);
-  if (uploadGateRef.current === null) uploadGateRef.current = createUploadGate();
+  // `uploadGateRef` is shared by every folder route through the provider.
 
   // Task 1685 review should-fix 2 — fileId of the upload currently in flight,
   // set around every encryptedUpload and cleared when it settles. For a FRESH
@@ -1993,13 +2208,6 @@ export default function FilesScreen() {
     };
   }, [currentFolder.id, files, isUnlocked, decryptNames, getRequestContentKey]);
 
-  // Load pinned folders from SecureStore on mount
-  useEffect(() => {
-    SecureStore.getItemAsync('beebeeb_pinned_folders')
-      .then((raw) => { if (raw) setPinnedFolders(JSON.parse(raw) as { id: string; name: string }[]); })
-      .catch(() => {});
-  }, []);
-
   // Hydrate the offline manager's manifest on mount (idempotent).
   useEffect(() => {
     void offlineManager.init();
@@ -2012,11 +2220,6 @@ export default function FilesScreen() {
       .catch(() => {})
       .finally(() => setLockStateReady(true));
   }, []);
-
-  // Persist pinned folders whenever they change
-  useEffect(() => {
-    SecureStore.setItemAsync('beebeeb_pinned_folders', JSON.stringify(pinnedFolders)).catch(() => {});
-  }, [pinnedFolders]);
 
   // Load persisted view mode on mount
   useEffect(() => {
@@ -2098,6 +2301,18 @@ export default function FilesScreen() {
   // then reconciled by the sync derive below); otherwise we clear to an empty
   // list under the loading skeleton until authoritative data arrives.
   const folderFetchGenerationRef = useRef(0);
+  // Number of listing fetches currently running (a silent refresh never piles onto one).
+  const fetchesInFlightRef = useRef(0);
+  // Something other than a fetch (the sync tree, a cached folder) just supplied
+  // the rows for this folder. Any fetch still in flight is now stale and its
+  // `finally` will skip clearing the flags, so clear them here: otherwise the
+  // amber refresh spinner (or the skeleton, which has no pull-to-refresh) stays
+  // up for good.
+  const supersedeInFlightFetch = useCallback(() => {
+    folderFetchGenerationRef.current += 1;
+    setLoading(false);
+    setRefreshing(false);
+  }, []);
   const renderedFolderKeyRef = useRef(folderCacheKey(currentFolder.id));
   useLayoutEffect(() => {
     const key = folderCacheKey(currentFolder.id);
@@ -2154,15 +2369,17 @@ export default function FilesScreen() {
   // Fetch files
   // ------------------------------------------------------------------
 
-  const fetchFiles = useCallback(async (parentId: string | null, isRefresh = false) => {
+  const fetchFiles = useCallback(async (parentId: string | null, isRefresh = false, opts: { silent?: boolean } = {}) => {
     const generation = ++folderFetchGenerationRef.current;
+    fetchesInFlightRef.current += 1;
     const isRequestStillVisible = () =>
       generation === folderFetchGenerationRef.current &&
       shouldApplyFolderRequestToVisibleState(parentId, filesFolderKeyRef.current);
     const hasVisibleFiles = filesCountRef.current > 0;
     if (isRequestStillVisible()) {
       if (isRefresh || hasVisibleFiles) {
-        setRefreshing(true);
+        // A silent refresh (foreground, unlock, import) must not pop the pull spinner.
+        if (!opts.silent) setRefreshing(true);
       } else {
         setLoading(true);
       }
@@ -2201,13 +2418,18 @@ export default function FilesScreen() {
       const rendered = isRequestStillVisible() && applyFilesForFolder(parentId, result, { preserveCachedOnEmpty: false });
       endPerf({ count: result.length, source: 'folder' });
       recordRuntimeTrace('files.folder_load.complete', { parentId, generation, count: result.length, applied: rendered, elapsedMs: Date.now() - folderStartedAt });
-      if (rendered) setHasLoadedOnceTrue();
+      if (rendered) {
+        setHasLoadedOnceTrue();
+        setFetchedAt(Date.now());
+      }
     } catch (err) {
       endPerf({ error: true });
-      if (isRequestStillVisible() && !renderedCachedIndex) {
+      // A failed refresh keeps the rows already on screen (the freshness line says so).
+      if (isRequestStillVisible() && !renderedCachedIndex && !hasVisibleFiles) {
         setError(friendlyError(err));
       }
     } finally {
+      fetchesInFlightRef.current -= 1;
       if (isRequestStillVisible()) {
         setLoading(false);
         setRefreshing(false);
@@ -2274,7 +2496,7 @@ export default function FilesScreen() {
         const haveAuthoritativeData =
           liveNodes.length > 0 || (cachedFolderFiles?.length ?? 0) > 0 || folderResolvedInTree;
         if (haveAuthoritativeData) {
-          folderFetchGenerationRef.current += 1;
+          supersedeInFlightFetch();
           applyFilesForFolder(
             currentFolder.id,
             entriesFromNodes(liveNodes),
@@ -2302,11 +2524,11 @@ export default function FilesScreen() {
   // screen does NOT redundantly re-derive (which caused a race where only
   // a partial result replaced the full list).
   useEffect(() => {
-    if (!sync.ready || !unlockAttempted) return;
+    if (!isFocused || !sync.ready || !unlockAttempted) return;
     if (lastLoadedFolderRef.current !== currentFolder.id) return;
     const liveNodes = sync.children(currentFolder.id).filter((n) => !n.is_trashed);
     if (liveNodes.length > 0) {
-      folderFetchGenerationRef.current += 1;
+      supersedeInFlightFetch();
       applyFilesForFolder(
         currentFolder.id,
         entriesFromNodes(liveNodes),
@@ -2316,7 +2538,7 @@ export default function FilesScreen() {
     }
     // Re-derive whenever the tree mutates (treeVersion bumps on every op).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sync.treeVersion]);
+  }, [isFocused, sync.treeVersion]);
 
   // Belt-and-braces: on auth+unlock transition, ensure at least one fetch has
   // been kicked even if the focus effect was suppressed. Idempotent — the
@@ -2338,6 +2560,58 @@ export default function FilesScreen() {
     void fetchFiles(currentFolder.id, false);
   }, [isAuthenticated, unlockAttempted, currentFolder.id, fetchFiles]);
 
+  // ------------------------------------------------------------------
+  // One owner of "Drive is fresh": foreground, unlock and share-import all
+  // re-list the folder on screen through the same silent, throttled path.
+  // (Live changes and reconnect catch-up arrive through the sync tree.)
+  // ------------------------------------------------------------------
+  const currentFolderIdRef = useRef(currentFolder.id);
+  currentFolderIdRef.current = currentFolder.id;
+  const syncReadyRef = useRef(sync.ready);
+  syncReadyRef.current = sync.ready;
+  const fetchFilesRef = useRef(fetchFiles);
+  fetchFilesRef.current = fetchFiles;
+  const lastFreshnessRefreshAtRef = useRef<number | null>(null);
+  const freshnessRefresh = useCallback((reason: string) => {
+    if (!hasLoadedOnceRef.current) return; // first load is owned by the focus effect
+    // When sync is live, a foreground return is covered by its catch-up (changes arrive
+    // through the tree); only unlock and import need a REST listing.
+    if (reason === 'foreground' && syncReadyRef.current) return;
+    // One listing at a time: an import still goes through (it supersedes the running one).
+    if (reason !== 'share-import' && fetchesInFlightRef.current > 0) return;
+    const now = Date.now();
+    // An import finishing right after the foreground refresh must still land, so it skips the throttle.
+    if (reason !== 'share-import' && !shouldRunFreshnessRefresh({ lastRunAt: lastFreshnessRefreshAtRef.current, now })) return;
+    lastFreshnessRefreshAtRef.current = now;
+    recordRuntimeTrace('files.freshness_refresh', { reason, parentId: currentFolderIdRef.current });
+    void fetchFilesRef.current(currentFolderIdRef.current, true, { silent: true });
+  }, []);
+
+  useEffect(() => {
+    // Only a return from a real background period; 'inactive' alone is the Face ID
+    // sheet, Control Center or the app switcher peek.
+    let leftTheAppAt: number | null = null;
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'background' && leftTheAppAt === null) leftTheAppAt = Date.now();
+      if (next === 'active') {
+        if (leftTheAppAt !== null && Date.now() - leftTheAppAt >= FOREGROUND_MIN_BACKGROUND_MS) {
+          freshnessRefresh('foreground');
+        }
+        leftTheAppAt = null;
+      }
+    });
+    return () => sub.remove();
+  }, [freshnessRefresh]);
+
+  useEffect(() => onDriveRefreshRequest((reason) => freshnessRefresh(reason)), [freshnessRefresh]);
+
+  const wasUnlockedRef = useRef(isUnlocked);
+  useEffect(() => {
+    if (isUnlocked && !wasUnlockedRef.current) freshnessRefresh('unlock');
+    wasUnlockedRef.current = isUnlocked;
+  }, [isUnlocked, freshnessRefresh]);
+
+
   // Storage usage — fetched once on mount, refreshed alongside pull-to-refresh
   const fetchUsage = useCallback(async () => {
     try {
@@ -2356,22 +2630,49 @@ export default function FilesScreen() {
   // ------------------------------------------------------------------
 
   const navigateToFolder = useCallback((folder: FileEntry) => {
-    setSearchActive(false);
-    setSearchQuery('');
-    setFolderStack((prev) => appendFolderToBreadcrumbStack(prev, {
-      id: folder.id,
-      name: decryptedNames[folder.id] ?? displayName(folder),
-    }));
-  }, [decryptedNames]);
+    const name = decryptedNames[folder.id] ?? displayName(folder);
+    const params = searchActive
+      ? buildFolderRouteParams(
+          { id: folder.id, name, parentId: folder.parent_id ?? null },
+          allEntries(),
+        )
+      : {
+          folderId: folder.id,
+          name,
+          path: appendFolderToBreadcrumbStack(folderStack, { id: folder.id, name }),
+        };
+    navigation.push('Folder', params);
+  }, [allEntries, decryptedNames, folderStack, navigation, searchActive]);
 
   const navigateToBreadcrumb = useCallback((index: number) => {
-    setFolderStack((prev) => prev.slice(0, index + 1));
-  }, []);
+    const target = folderStack[index];
+    if (!target) return;
+    if (target.id === null) {
+      navigation.navigate('Drive', { action: 'root' });
+      return;
+    }
+
+    const routes = navigation.getState().routes;
+    const existingIndex = routes.findIndex((candidate) => (
+      candidate.name === 'Folder' && candidate.params?.folderId === target.id
+    ));
+    if (existingIndex >= 0) {
+      const popCount = routes.length - existingIndex - 1;
+      if (popCount > 0) navigation.pop(popCount);
+      return;
+    }
+
+    navigation.replace('Folder', {
+      folderId: target.id,
+      name: target.name,
+      path: folderStack.slice(0, index + 1),
+    });
+  }, [folderStack, navigation]);
 
   useAndroidFilesBack({
     selecting: selectMode,
     searching: searchActive,
-    folderDepth: folderStack.length,
+    folderDepth: 1,
     exitSelection: () => {
       setSelectMode(false);
       setSelectedIds(new Set());
@@ -2380,7 +2681,7 @@ export default function FilesScreen() {
       setSearchActive(false);
       setSearchQuery('');
     },
-    goToParent: () => setFolderStack((prev) => prev.slice(0, Math.max(1, prev.length - 1))),
+    goToParent: () => navigation.goBack(),
   });
 
   // Open the collapsed-breadcrumb popover, measuring the "…" chip so the popover
@@ -2427,6 +2728,7 @@ export default function FilesScreen() {
       abortUploadForFile(file.id);
       void abandonFileUpload(file.id).catch(() => {});
       await deleteFile(file.id);
+      void removeFromFileProviderCache([file.id]);
       setFiles((prev) => prev.filter((f) => f.id !== file.id));
       showToast({ type: 'success', message: 'Pending upload discarded' });
       fetchFiles(currentFolder.id, true);
@@ -2605,24 +2907,9 @@ export default function FilesScreen() {
       showToast({ type: 'info', message: 'Upload is still pending. Finish or retry the upload before opening this file.' });
       return false;
     }
-    if (file.is_uploading === false) return true;
-
-    try {
-      const status = await getUploadStatus(file.id);
-      if (status.is_uploading) {
-        const uploaded = status.uploaded_chunks.length;
-        showToast({
-          type: 'info',
-          message: `Upload is still pending (${uploaded}/${status.chunk_count} chunks stored).`,
-        });
-        return false;
-      }
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 400 && /upload already completed/i.test(err.message)) {
-        return true;
-      }
-      return true;
-    }
+    // Older cached and production rows omit this field for completed files.
+    // A tap must not wait on the upload-status endpoint before navigation;
+    // explicit pending rows are handled above and by openFilesEntry.
     return true;
   }, [showToast]);
 
@@ -2632,7 +2919,7 @@ export default function FilesScreen() {
         // Locked folders prompt inside openFilesEntry; locked files are gated
         // by PreviewScreen alone (a prompt here too asked for Face ID twice).
         // Keep ALL gating in open-lock-gate.ts — its test source-checks this body.
-        await openFilesEntry(file, {
+        await openFilesEntryGuardRef.current!(file, {
           navigateToFolder,
           handlePendingUpload,
           ensureFileReady,
@@ -2673,12 +2960,26 @@ export default function FilesScreen() {
     fetchFiles(currentFolder.id, true);
   }, [currentFolder.id, fetchFiles]);
 
+  // The same pull-to-refresh control for the list, its skeleton and the error
+  // view, so the gesture is never missing. Select mode drops it entirely.
+  const pullToRefreshControl = (
+    <RefreshControl
+      refreshing={refreshing}
+      onRefresh={handleRefresh}
+      tintColor={c.amber}
+      colors={[c.amber]}
+      // Without this the spinner appears underneath the floating header.
+      progressViewOffset={headerHeight}
+    />
+  );
+
   const handleReviewBackup = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     (navigation.navigate as any)('Tabs', { screen: 'Settings' });
   }, [navigation]);
 
   const pickAndUploadFile = useCallback(async () => {
+    const uploadTrace = createManualUploadTrace(recordRuntimeTrace);
     if (!phraseVerified) {
       Alert.alert(
         'Save your recovery phrase first',
@@ -2695,31 +2996,95 @@ export default function FilesScreen() {
         multiple: false,
       });
     } catch (err) {
+      uploadTrace.mark('picker_failed');
       Alert.alert('Error', friendlyError(err));
       return;
     }
-    if (picked.canceled || !picked.assets?.[0]) return;
+    if (picked.canceled || !picked.assets?.[0]) {
+      uploadTrace.mark('picker_cancelled');
+      return;
+    }
 
     const asset = picked.assets[0];
-
-    // ── Conflict check (task 1685 fix 6 — prompt, never silent) ────────────
-    // The old auto-version shortcut (same name + size differs → version with
-    // NO prompt) is gone: every conflict asks. Wait for the folder's decrypted
-    // names first — findConflict returns null when they lag, which used to
-    // mean the check silently passed.
-    await waitForFolderNames();
+    uploadTrace.mark('picker_return', { sizeBytes: asset.size ?? null });
     let uploadFileId = await generateFileId();   // new UUID by default
     let uploadFileName = asset.name;       // original name by default
     let v2InitNameEncrypted: string | undefined;
     // Task SF-0001 (mobile#259 review M9): the listed row the user chose to
     // overwrite; an add-only member's 403 falls back to a new file.
     let replacingExistingId: string | undefined;
+    const gate = uploadGateRef.current!;
+    const queued = gate.isBusy();
+    let optimisticRowId: string | null = null;
+    let optimisticReplacedExisting = false;
+
+    const showPendingRow = (id: string, name: string, showUploadCard = true) => {
+      const now = new Date().toISOString();
+      setFiles((prev) => {
+        const existingIndex = prev.findIndex((entry) => entry.id === id);
+        if (existingIndex >= 0) {
+          optimisticReplacedExisting = true;
+          return prev.map((entry, index) => index === existingIndex ? { ...entry, is_uploading: true } : entry);
+        }
+        return upsertFileEntry(prev, {
+          id,
+          name_encrypted: '',
+          mime_type: asset.mimeType ?? null,
+          size_bytes: asset.size ?? 0,
+          is_folder: false,
+          is_uploading: true,
+          chunk_count: 1,
+          created_at: now,
+          updated_at: now,
+          parent_id: currentFolder.id,
+        });
+      });
+      setDecryptedNames((prev) => ({ ...prev, [id]: name }));
+      if (showUploadCard) {
+        const loc = trustLocation(undefined);
+        setUpload({ fileName: name, stage: 1, percent: 0, place: loc.place, region: loc.region });
+      }
+      optimisticRowId = id;
+      uploadTrace.mark('row_visible');
+    };
+
+    const removePendingRow = (id: string) => {
+      setFiles((prev) => prev.filter((entry) => entry.id !== id));
+      setDecryptedNames((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      optimisticRowId = null;
+    };
+
+    if (queued) {
+      uploadTrace.mark('queued');
+      showToast({ type: 'info', message: 'Upload queued — it starts when the current one finishes.' });
+      showPendingRow(uploadFileId, uploadFileName, false);
+    } else {
+      showPendingRow(uploadFileId, uploadFileName);
+    }
+
+    // ── Conflict check (task 1685 fix 6 — prompt, never silent) ────────────
+    // The old auto-version shortcut (same name + size differs → version with
+    // NO prompt) is gone: every conflict asks. Wait for the folder's decrypted
+    // names first — findConflict returns null when they lag, which used to
+    // mean the check silently passed.
+    uploadTrace.mark('name_hydration_wait_start');
+    await waitForFolderNames();
+    uploadTrace.mark('name_hydration_wait_done');
 
     const existingFile = findConflict(asset.name);
     if (existingFile) {
+      if (optimisticRowId) removePendingRow(optimisticRowId);
       const uniqueName = getUniqueMobileName(asset.name, folderFileNames());
       const choice = await promptFileConflict(asset.name, existingFile.id, uniqueName);
-      if (choice.action === 'cancel') return;
+      if (choice.action === 'cancel') {
+        if (!queued) setUpload(null);
+        uploadTrace.mark('cancelled_at_conflict');
+        return;
+      }
       if (choice.action === 'overwrite') {
         // Reuse the existing file ID → server stores a new version of it
         uploadFileId = existingFile.id;
@@ -2729,6 +3094,7 @@ export default function FilesScreen() {
         // Keep both: upload under the suffixed name with a fresh ID
         uploadFileName = choice.finalName;
       }
+      showPendingRow(uploadFileId, uploadFileName, !queued);
     }
 
     // Task 1685 review should-fix 1 — the upload itself is the gated unit: the
@@ -2736,11 +3102,14 @@ export default function FilesScreen() {
     const runSingleFile = async (): Promise<void> => {
       const loc = trustLocation(undefined);
       setUpload({ fileName: uploadFileName, stage: 1, percent: 0, place: loc.place, region: loc.region });
+      if (optimisticRowId === null) showPendingRow(uploadFileId, uploadFileName);
+      uploadTrace.mark('queue_start');
       // Task 1685 fix 5 — surface progress at ≈4 Hz, not per native poll tick:
       // setUpload re-renders this 5,400-line screen + its FlatList per call.
       const allowProgress = createProgressThrottle(UPLOAD_PROGRESS_MIN_INTERVAL_MS);
       activeUploadFileIdRef.current = uploadFileId;
       try {
+        uploadTrace.mark('encrypted_upload_start');
         const uploaded = await uploadReplacingOrAdding(replacingExistingId, uploadFileId, generateFileId, (targetFileId, replacing) => encryptedUpload({
           fileId: targetFileId,
           uri: asset.uri,
@@ -2752,6 +3121,7 @@ export default function FilesScreen() {
           encryptMetadataFn: encryptMetadata,
           masterKeyHandleId: getMasterKeyHandleId(),
           onProgress: (progress) => {
+            uploadTrace.progress(progress);
             if (!allowProgress.allow(progress)) return;
             const percent = progress.bytesTotal > 0
               ? Math.round((progress.bytesUploaded / progress.bytesTotal) * 100)
@@ -2775,45 +3145,93 @@ export default function FilesScreen() {
             });
           },
         }));
-        const finalLoc = trustLocation(uploaded.storage_pool_id, uploaded);
+        uploadTrace.mark('complete_done');
+        uploadTrace.mark('shared_key_outcome_done', {
+          outcome: sharedKeyOutcome(uploaded.id) ?? 'clear',
+        });
+        const completed: FileEntry = {
+          ...uploaded,
+          mime_type: uploaded.mime_type ?? asset.mimeType ?? null,
+          parent_id: uploaded.parent_id === undefined ? currentFolder.id : uploaded.parent_id,
+          is_uploading: false,
+        };
+        const finalLoc = trustLocation(completed.storage_pool_id, completed);
         setUpload({ fileName: uploadFileName, stage: 'done', percent: 100, place: finalLoc.place, region: finalLoc.region });
-        const seedPreview = queueRawUploadedPreview(uploaded.id, uploadFileName, asset.mimeType, asset.uri, uploaded.size_bytes);
-        setFiles((prev) => upsertFileEntry(prev, uploaded));
+        const pendingId = optimisticRowId;
+        const seedPreview = queueRawUploadedPreview(completed.id, uploadFileName, asset.mimeType, asset.uri, completed.size_bytes);
+        setFiles((prev) => reconcileCompletedUploadRows(prev, pendingId, completed, optimisticReplacedExisting));
+        setDecryptedNames((prev) => {
+          const next = { ...prev, [completed.id]: uploadFileName };
+          if (pendingId && pendingId !== completed.id && !optimisticReplacedExisting) delete next[pendingId];
+          return next;
+        });
+        optimisticRowId = completed.id;
+        uploadTrace.mark('local_row_complete');
         // Add to the encrypted search index so the new file is searchable
-        // across the whole vault from the very next keystroke.
-        indexFile(uploaded.id, toSearchIndexEntry(uploaded, uploadFileName, currentFolder.id));
+        // across the whole vault from the next keystroke. Let React commit the
+        // completed row before cloning the index for this background update.
+        setTimeout(() => {
+          indexFile(completed.id, toSearchIndexEntry(completed, uploadFileName, currentFolder.id));
+          uploadTrace.mark('search_index_done');
+        }, 0);
+        void syncDecryptedEntriesToFileProvider(
+          [completed],
+          { [completed.id]: uploadFileName },
+          currentFolder.id,
+        ).then((count) => {
+          uploadTrace.mark('file_provider_done', { count });
+        }).catch((err) => {
+          uploadTrace.mark('file_provider_failed', { errorName: err instanceof Error ? err.name : typeof err });
+        });
+        void loadFileIndex({ force: true }).then((result) => {
+          uploadTrace.mark('file_index_revalidate_done', {
+            source: result.source,
+            count: result.files?.length ?? 0,
+          });
+        }).catch((err) => {
+          uploadTrace.mark('file_index_revalidate_failed', { errorName: err instanceof Error ? err.name : typeof err });
+        });
         // Fire-and-forget: generate + upload medium and large encrypted thumbnails for media files.
         // Task 1685 fix 4 — bounded: both variants go through the shared 2-slot
         // queue, so a burst of manual uploads can't stack unbounded full-image
         // decodes (the bulk-crash class of task 1669).
         void Promise.allSettled([
           seedPreview,
-          thumbnailUploadQueue.run(() => generateAndUploadThumbnail(uploaded.id, asset.uri, asset.mimeType ?? null, getFileKeyBytes)),
-          thumbnailUploadQueue.run(() => generateAndUploadThumbnail(uploaded.id, asset.uri, asset.mimeType ?? null, getFileKeyBytes, 'small')),
-          thumbnailUploadQueue.run(() => generateAndUploadThumbnail(uploaded.id, asset.uri, asset.mimeType ?? null, getFileKeyBytes, 'large')),
-        ]);
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          thumbnailUploadQueue.run(() => generateAndUploadThumbnail(completed.id, asset.uri, asset.mimeType ?? null, getFileKeyBytes)),
+          thumbnailUploadQueue.run(() => generateAndUploadThumbnail(completed.id, asset.uri, asset.mimeType ?? null, getFileKeyBytes, 'small')),
+          thumbnailUploadQueue.run(() => generateAndUploadThumbnail(completed.id, asset.uri, asset.mimeType ?? null, getFileKeyBytes, 'large')),
+        ]).then((results) => {
+          uploadTrace.mark('thumbnails_done', { rejected: results.filter((result) => result.status === 'rejected').length });
+        });
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         donateSiriShortcut('upload');
         showToast({ type: 'success', message: `"${uploadFileName}" stored in ${finalLoc.place}` });
-        fetchFiles(currentFolder.id, true);
+        void fetchFiles(currentFolder.id, true, { silent: true }).then(() => {
+          uploadTrace.mark('refresh_done');
+        });
+        uploadTrace.mark('post_upload_scheduled');
         // Hold the "Stored · Key stayed here" flash briefly before clearing.
         setTimeout(() => setUpload((cur) => (cur && cur.stage === 'done' ? null : cur)), 1800);
       } catch (err) {
+        uploadTrace.mark('failed', { errorName: err instanceof Error ? err.name : typeof err });
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
         // Task 1037: a trial that lapsed while the app was open shows up here
         // first. Re-read the account so the banner and backup follow.
         if (err instanceof ApiError && isAccountRefusalCode(err.code)) requestAccountStateRefresh();
         showToast({ type: 'error', message: `Upload failed: ${friendlyError(err)}` });
         setUpload(null);
+        if (optimisticRowId) {
+          if (optimisticReplacedExisting) {
+            setFiles((prev) => prev.map((entry) => entry.id === optimisticRowId ? { ...entry, is_uploading: false } : entry));
+          } else {
+            removePendingRow(optimisticRowId);
+          }
+        }
       } finally {
         activeUploadFileIdRef.current = null;
       }
     };
 
-    const gate = uploadGateRef.current!;
-    if (gate.isBusy()) {
-      showToast({ type: 'info', message: 'Upload queued — it starts when the current one finishes.' });
-    }
     void gate.run(runSingleFile).catch(() => {
       // The single-file path toasts its own failure; this only guards the gate.
     });
@@ -3122,21 +3540,31 @@ export default function FilesScreen() {
   // 0789 — the "+" FAB opens the native iOS UIMenu pull-down (see addMenuActions /
   // onAddAction below, declared once the four upload handlers are in scope).
 
-  // Quick action / deep-link landing: route.params.action is set by the App
-  // shortcut handler (beebeeb://upload, beebeeb://search, beebeeb://scan,
-  // beebeeb://recent) and by the Files tab reselect handler. Trigger the
-  // right surface and clear the param so subsequent focuses don't re-fire it.
+  // Quick-action / deep-link landing. The tab param is transferred to the
+  // Drive route first when a pushed folder is focused; Drive then owns the
+  // one-shot action. A same-tab re-press therefore pops the native stack,
+  // while a normal Back from a search result leaves Drive's query untouched.
+  const driveRouteAction = route.name === 'Drive' ? route.params?.action : undefined;
+  const driveRouteFolderId = route.name === 'Drive' ? route.params?.folderId : undefined;
   useEffect(() => {
-    const action = route.params?.action;
+    if (!isFocused) return;
+    const action = driveRouteAction ?? tabAction;
     if (!action) return;
-    navigation.setParams({ action: undefined });
+    const folderId = driveRouteAction ? driveRouteFolderId : tabFolderId;
+    if (tabAction) clearTabAction();
+
+    if (route.name !== 'Drive') {
+      navigation.navigate('Drive', { action, folderId });
+      return;
+    }
+
+    navigation.setParams({ action: undefined, folderId: undefined });
     if (action === 'root') {
       setSearchActive(false);
       setSearchQuery('');
       setRecentFilterActive(false);
       setSelectMode(false);
       setSelectedIds(new Set());
-      setFolderStack([{ id: null, name: 'Drive' }]);
     } else if (action === 'upload') {
       pickAndUploadFile();
     } else if (action === 'search') {
@@ -3148,8 +3576,24 @@ export default function FilesScreen() {
       openDocumentScanner();
     } else if (action === 'recent') {
       setRecentFilterActive(true);
+    } else if (action === 'folder' && folderId) {
+      const entry = allEntries()[folderId];
+      const name = entry?.name || 'Folder';
+      navigation.push('Folder', buildFolderRouteParams({ id: folderId, name }, allEntries()));
     }
-  }, [route.params?.action, navigation, pickAndUploadFile, openDocumentScanner]);
+  }, [
+    allEntries,
+    clearTabAction,
+    driveRouteAction,
+    driveRouteFolderId,
+    isFocused,
+    navigation,
+    openDocumentScanner,
+    pickAndUploadFile,
+    route.name,
+    tabAction,
+    tabFolderId,
+  ]);
 
   const submitNewFolder = useCallback(async (rawName: string) => {
     const trimmed = rawName.trim();
@@ -3341,6 +3785,23 @@ export default function FilesScreen() {
     navigation.navigate('Preview', previewParamsForNewDocument(uploaded, req));
   }, [isUnlocked, currentFolder.id, freshFolderNames, encryptChunk, encryptMetadata, getMasterKeyHandleId, indexFile, fetchFiles, navigation, showToast]);
 
+  // Duplicate: the copy is made on the phone (lib/duplicate-file.ts).
+  const { duplicate: duplicateFileOnPhone, progressSheet: duplicateProgressSheet } = useDuplicateFile({
+    onShow: (parentId) => {
+      fetchFiles(parentId, true);
+      navigation.getParent<NativeBottomTabNavigationProp<TabParamList>>()?.setParams({
+        action: parentId ? 'folder' : 'root',
+        folderId: parentId,
+      });
+    },
+    onDuplicated: (entry, name, parentId) => {
+      if ((currentFolder.id ?? null) !== parentId) return;
+      setFiles((prev) => upsertFileEntry(prev, entry));
+      setDecryptedNames((prev) => ({ ...prev, [entry.id]: name }));
+      indexFile(entry.id, toSearchIndexEntry(entry, name, parentId));
+    },
+  });
+
   // 0789 — "+" add menu as native iOS UIMenu items, with trailing SF Symbols.
   // (Placed after all four upload handlers are declared.)
   // 0791 — `imageColor` MUST be set explicitly. On the New Architecture the
@@ -3432,6 +3893,84 @@ export default function FilesScreen() {
     setSelectedIds(new Set());
   }, []);
 
+  const moveEntriesToTrash = useCallback((entries: FileEntry[], singleName?: string) => {
+    const uniqueEntries = uniqueFileEntries(entries);
+    const ids = uniqueEntries.map((entry) => entry.id);
+    if (ids.length === 0) return;
+
+    const subtreeByRoot = new Map(ids.map((id) => [
+      id,
+      Array.from(new Set([id, ...sync.collectSubtreeIds([id])])),
+    ]));
+    const snapshotEntries = new Map<string, FileEntry>();
+    for (const entry of uniqueEntries) snapshotEntries.set(entry.id, entry);
+    for (const subtreeIds of subtreeByRoot.values()) {
+      for (const id of subtreeIds) {
+        if (snapshotEntries.has(id)) continue;
+        const node = sync.getNode(id);
+        if (node) snapshotEntries.set(id, syncNodeToFileEntry(node));
+      }
+    }
+    const indexedBeforeTrash = allEntries();
+    const expandRoots = (rootIds: string[]) => Array.from(new Set(rootIds.flatMap((id) => subtreeByRoot.get(id) ?? [id])));
+
+    void moveToTrashWithUndo(ids, {
+      trashFiles: trashFilesApi,
+      restoreFile,
+      removeFromFileProviderCache,
+      restoreFileProviderCache: async (restoredIds) => {
+        const restoredSubtree = expandRoots(restoredIds);
+        const restoredEntries = restoredSubtree.map((id) => snapshotEntries.get(id)).filter((entry): entry is FileEntry => !!entry);
+        const restoredNames: Record<string, string> = {};
+        for (const id of restoredSubtree) {
+          const name = decryptedNames[id] ?? indexedBeforeTrash[id]?.name;
+          if (name) restoredNames[id] = name;
+        }
+        await syncDecryptedEntriesToFileProvider(restoredEntries, restoredNames);
+      },
+      showToast,
+      openTrash: () => navigation.navigate('Trash'),
+      hide: hideOptimisticallyTrashed,
+      unhide: revealOptimisticallyTrashed,
+      collectSubtreeIds: expandRoots,
+      onTrashed: async (subtreeIds) => {
+        const gone = new Set(subtreeIds);
+        setFiles((prev) => prev.filter((entry) => !gone.has(entry.id)));
+        await onFilesDeleted(subtreeIds, { subtree: true, kind: 'trash' });
+        revealOptimisticallyTrashed(subtreeIds);
+      },
+      onMissing: async (missingIds) => {
+        const goneIds = expandRoots(missingIds);
+        const gone = new Set(goneIds);
+        setFiles((prev) => prev.filter((entry) => !gone.has(entry.id)));
+        await onFilesDeleted(goneIds, { subtree: true });
+        revealOptimisticallyTrashed(goneIds);
+      },
+      onRestored: (restoredIds) => {
+        const restoredSubtree = expandRoots(restoredIds);
+        const currentParent = currentFolder.id ?? null;
+        const rowsForCurrentFolder = restoredSubtree
+          .map((id) => snapshotEntries.get(id))
+          .filter((entry): entry is FileEntry => !!entry && (entry.parent_id ?? null) === currentParent);
+        if (rowsForCurrentFolder.length > 0) {
+          setFiles((prev) => uniqueFileEntries([...rowsForCurrentFolder, ...prev]));
+        }
+        for (const id of restoredSubtree) {
+          const indexed = indexedBeforeTrash[id];
+          if (indexed) indexFile(id, indexed);
+        }
+        revealOptimisticallyTrashed(restoredSubtree);
+      },
+      refreshAfterRestore: () => {
+        void fetchFiles(currentFolder.id, true, { silent: true });
+      },
+      changeTrashCount: adjustTrashCount,
+      notifyTrashChanged,
+      singleName,
+      trace: recordRuntimeTrace,
+    });
+  }, [allEntries, currentFolder.id, decryptedNames, fetchFiles, indexFile, navigation, showToast, sync]);
+
   const toggleSelect = useCallback((item: FileEntry) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setSelectedIds((prev) => {
@@ -3451,53 +3990,38 @@ export default function FilesScreen() {
 
   const handleBatchTrash = useCallback(() => {
     if (selectedIds.size === 0) return;
+    // The root Backups folder is a system folder: the rest of the selection still goes through.
+    const { allowed: trashableIds, skippedProtected } = partitionProtectedBackupsRoot([...selectedIds]);
+    if (trashableIds.length === 0) {
+      showToast({ type: 'info', message: BACKUPS_PROTECTED_MESSAGE });
+      return;
+    }
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    const count = selectedIds.size;
+    const count = trashableIds.length;
     Alert.alert(
       'Move to Trash',
-      `${count} item${count === 1 ? '' : 's'} will be moved to Trash.`,
+      `${count} item${count === 1 ? '' : 's'} will be moved to Trash.${skippedProtected ? `\n\n${BACKUPS_PROTECTED_MESSAGE}` : ''}`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Move to Trash',
           style: 'destructive',
-          onPress: async () => {
-            try {
-              const ids = [...selectedIds];
-              // Task 1683f: cancel any in-flight upload for the selected files
-              // before the rows go away (best-effort server abandon each).
-              for (const id of ids) {
-                abortUploadForFile(id);
-                void abandonFileUpload(id).catch(() => {});
-              }
-              const result = await trashFiles(ids);
-              const trashedIds = new Set([...result.trashed, ...result.already_trashed]);
-              setFiles((prev) => prev.filter((f) => !trashedIds.has(f.id)));
-              // 0818 — fan the delete out to EVERY derived store, expanding any
-              // trashed folder to its full subtree (the old per-id unindex missed
-              // descendants + 4 of the 6 stores).
-              const subtree = sync.collectSubtreeIds([...trashedIds]);
-              void onFilesDeleted(subtree, { subtree: true });
-              // Drop the trashed rows from the iOS File Provider cache so they
-              // disappear from Files.app immediately (not just from this view).
-              void removeFromFileProviderCache(subtree);
-              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              exitSelectMode();
-              if (result.missing.length > 0 || trashedIds.size < ids.length) {
-                Alert.alert(
-                  'Some items were not moved',
-                  'Beebeeb refreshed the folder because a few selected items were already gone or unavailable.',
-                );
-                void fetchFiles(currentFolder.id, true);
-              }
-            } catch (err) {
-              Alert.alert('Error', friendlyError(err));
+          onPress: () => {
+            for (const id of trashableIds) {
+              abortUploadForFile(id);
+              void abandonFileUpload(id).catch(() => {});
             }
+            const selectedEntries = [...selectedIds]
+              .map((id) => files.find((entry) => entry.id === id) ?? sync.getNode(id))
+              .map((entry) => entry && 'is_trashed' in entry ? syncNodeToFileEntry(entry) : entry)
+              .filter((entry): entry is FileEntry => !!entry);
+            exitSelectMode();
+            moveEntriesToTrash(selectedEntries);
           },
         },
       ],
     );
-  }, [currentFolder.id, exitSelectMode, fetchFiles, selectedIds, sync]);
+  }, [exitSelectMode, files, moveEntriesToTrash, selectedIds, showToast, sync]);
 
   const handleBatchShare = useCallback(() => {
     if (selectedIds.size === 0) return;
@@ -3634,7 +4158,9 @@ export default function FilesScreen() {
   const performMove = useCallback(async (targetId: string | null) => {
     const picker = movePicker;
     if (!picker || moveBusy) return;
-    const ids = picker.ids;
+    // Defence in depth: the protected Backups root never moves, whatever opened the picker.
+    const ids = partitionProtectedBackupsRoot(picker.ids).allowed;
+    if (ids.length === 0) { setMovePicker(null); return; }
     const destName = targetId === null
       ? 'Drive'
       : picker.folders.find((f) => f.id === targetId)?.name ?? 'folder';
@@ -3701,8 +4227,19 @@ export default function FilesScreen() {
 
   const handleBatchMove = useCallback(() => {
     if (selectedIds.size === 0) return;
-    void openMovePicker([...selectedIds]);
-  }, [selectedIds, openMovePicker]);
+    // The root Backups folder cannot be moved: the rest of the selection still can.
+    const { allowed: movableIds, skippedProtected } = partitionProtectedBackupsRoot([...selectedIds]);
+    if (skippedProtected) {
+      showToast({
+        type: 'info',
+        message: movableIds.length === 0
+          ? BACKUPS_PROTECTED_MOVE_MESSAGE
+          : `${BACKUPS_PROTECTED_MOVE_MESSAGE} Moving the rest.`,
+      });
+    }
+    if (movableIds.length === 0) return;
+    void openMovePicker(movableIds);
+  }, [selectedIds, openMovePicker, showToast]);
 
   const handleSearchToggle = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -3721,10 +4258,8 @@ export default function FilesScreen() {
 
   const navigateToPinned = useCallback((pf: { id: string; name: string }) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    setSearchActive(false);
-    setSearchQuery('');
-    setFolderStack([{ id: null, name: 'Drive' }, { id: pf.id, name: pf.name }]);
-  }, []);
+    navigation.push('Folder', buildFolderRouteParams(pf, allEntries()));
+  }, [allEntries, navigation]);
 
   const togglePin = useCallback((item: FileEntry, name: string) => {
     setPinnedFolders((prev) => {
@@ -3747,6 +4282,7 @@ export default function FilesScreen() {
   // for recursive offline (0794).
   const nodesByParent = useMemo(() => {
     const map = new Map<string | null, SyncNode[]>();
+    if (!isFocused) return map;
     for (const n of sync.allNodes()) {
       if (n.is_trashed) continue;
       const list = map.get(n.parent_id) ?? [];
@@ -3755,7 +4291,7 @@ export default function FilesScreen() {
     }
     return map;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sync, sync.treeVersion]);
+  }, [isFocused, sync, sync.treeVersion]);
 
   const folderDescendantFileIds = useCallback((folderId: string): string[] => {
     const out: string[] = [];
@@ -3831,12 +4367,14 @@ export default function FilesScreen() {
     // 'Send via Constellation' is intentionally hidden — Constellation crypto is v1 mock
     // (random bytes instead of real X25519 ECDH). Re-enable when real per-transfer
     // encryption is implemented. See task 0093.
-    const fileOptions = ['Rename', 'Preview', 'Share', 'Save to Files'];
-    if (isMedia) fileOptions.push('Save to Photos');
-    fileOptions.push('Move to...', offlineLabel, 'Create proof', lockLabel, 'Move to Trash', 'Details');
-    const options = item.is_folder
-      ? ['Rename', 'Open', 'Share', 'Move to...', offlineLabel, 'Delete', pinLabel, lockLabel, 'Details', 'Cancel']
-      : [...fileOptions, 'Cancel'];
+    const options = itemActionOptions({
+      isFolder: item.is_folder === true,
+      isMedia,
+      isProtectedRoot: isProtectedBackupsRoot(item.id),
+      offlineLabel,
+      pinLabel,
+      lockLabel,
+    });
     const destructiveIndex = options.indexOf(item.is_folder ? 'Delete' : 'Move to Trash');
     const cancelIndex = options.length - 1;
 
@@ -4079,20 +4617,7 @@ export default function FilesScreen() {
           {
             text: 'Move to Trash',
             style: 'destructive',
-            onPress: async () => {
-              try {
-                await deleteFile(item.id);
-                setFiles((prev) => prev.filter((f) => f.id !== item.id));
-                // 0818 — cascade the delete to every derived store; expand the
-                // folder's subtree so descendants aren't orphaned.
-                const subtree = sync.collectSubtreeIds([item.id]);
-                void onFilesDeleted(subtree, { subtree: item.is_folder });
-                void removeFromFileProviderCache(subtree);
-                showToast({ type: 'info', message: `"${name}" moved to Trash` });
-              } catch (err) {
-                Alert.alert('Error', friendlyError(err));
-              }
-            },
+            onPress: () => moveEntriesToTrash([item], name),
           },
         ],
       );
@@ -4107,24 +4632,10 @@ export default function FilesScreen() {
           {
             text: 'Move to Trash',
             style: 'destructive',
-            onPress: async () => {
-              try {
-                // Task 1683f: trash cancels an in-flight upload for this file —
-                // abort the engine (native or JS loop) and best-effort abandon
-                // the server session before the row goes away.
-                abortUploadForFile(item.id);
-                void abandonFileUpload(item.id).catch(() => {});
-                await deleteFile(item.id);
-                setFiles((prev) => prev.filter((f) => f.id !== item.id));
-                // 0818 — cascade the delete to every derived store; expand the
-                // folder's subtree so descendants aren't orphaned.
-                const subtree = sync.collectSubtreeIds([item.id]);
-                void onFilesDeleted(subtree, { subtree: item.is_folder });
-                void removeFromFileProviderCache(subtree);
-                showToast({ type: 'info', message: `"${name}" moved to Trash` });
-              } catch (err) {
-                Alert.alert('Error', friendlyError(err));
-              }
+            onPress: () => {
+              abortUploadForFile(item.id);
+              void abandonFileUpload(item.id).catch(() => {});
+              moveEntriesToTrash([item], name);
             },
           },
         ],
@@ -4182,6 +4693,10 @@ export default function FilesScreen() {
     };
 
     const dispatchAction = (option: string) => {
+      if (isProtectedBackupsRoot(item.id) && ['Rename', 'Move to...', 'Delete', 'Move to Trash'].includes(option)) {
+        showToast({ type: 'info', message: BACKUPS_PROTECTED_MESSAGE });
+        return;
+      }
       switch (option) {
         case 'Rename': promptRename(); return;
         case 'Open':
@@ -4208,6 +4723,21 @@ export default function FilesScreen() {
         case 'Save to Files': void saveToFiles(); return;
         case 'Save to Photos': void saveToGallery(); return;
         case 'Move to...': void promptMove(); return;
+        case 'Duplicate':
+          void (async () => {
+            if (!(await ensureFileReady(item))) return;
+            void duplicateFileOnPhone({
+              id: item.id,
+              name,
+              mimeType: itemMimeType ?? null,
+              sizeBytes: item.size_bytes ?? null,
+              chunkCount: item.chunk_count ?? null,
+              parentId: item.parent_id ?? null,
+              isFolder: item.is_folder === true,
+              requestKey: isRequestUpload(item) ? () => getRequestContentKey(item) : undefined,
+            });
+          })();
+          return;
         case 'Make available offline':
         case 'Remove offline':
           if (item.is_folder) void toggleFolderOffline(item);
@@ -4291,17 +4821,30 @@ export default function FilesScreen() {
     encryptMetadata,
     mimeTypeFor,
     ensureFileReady,
+    duplicateFileOnPhone,
+    getRequestContentKey,
+    moveEntriesToTrash,
   ]);
 
   // Filtered + sorted file list
   const vaultSearchMatches = useMemo(() => {
     const query = searchQuery.trim();
     if (!query) return [];
-    return searchVault(query);
-  }, [searchQuery, searchVault, searchIndexReady]);
+    return searchVault(query).filter(
+      (match) => !isDeviceManifest(match.entry.name, match.entry.parent, match.entry.parent ? parentIdOf(match.entry.parent) : null),
+    );
+  }, [searchQuery, searchVault, searchIndexReady, parentIdOf, backupsRootId]);
+
+  // Rows the user may see: the listing without the internal backup manifest. Drive rows, search,
+  // Recents and the "Recent files" filter all start from this, never from `files`.
+  const visibleFiles = useMemo(
+    () => hideDeviceManifests(files, (f) => decryptedNames[f.id], parentIdOf)
+      .filter((entry) => !optimisticallyTrashedIds.has(entry.id)),
+    [files, decryptedNames, parentIdOf, backupsRootId, optimisticallyTrashedIds],
+  );
 
   const displayedFiles = useMemo(() => {
-    let result = uniqueFileEntries(files);
+    let result = uniqueFileEntries(visibleFiles);
     if (recentFilterActive) {
       const cutoff = Date.now() - 24 * 60 * 60 * 1000;
       result = result.filter((f) => !f.is_folder && new Date(f.updated_at).getTime() >= cutoff);
@@ -4317,7 +4860,7 @@ export default function FilesScreen() {
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       const seen = new Set<string>();
-      const vaultResults = vaultSearchMatches.map((match) => {
+      const vaultResults = vaultSearchMatches.filter((match) => !optimisticallyTrashedIds.has(match.id)).map((match) => {
         seen.add(match.id);
         return searchResultToFileEntry(match);
       });
@@ -4342,7 +4885,32 @@ export default function FilesScreen() {
       result = localFallback;
     }
     return applySortOrder(applyKindFilter(result), sortOrder, decryptedNames);
-  }, [files, searchQuery, decryptedNames, sortOrder, vaultSearchMatches, recentFilterActive, searchActive, searchFilterKind, withDecryptedMime]);
+  }, [files, searchQuery, decryptedNames, sortOrder, vaultSearchMatches, recentFilterActive, searchActive, searchFilterKind, withDecryptedMime, visibleFiles, optimisticallyTrashedIds]);
+
+  const showTrashEntry = shouldShowTrashRow({
+    isRoot: currentFolder.id === null,
+    selectMode,
+    searchActive,
+  });
+  const renderTrashEntry = useCallback(() => {
+    if (!showTrashEntry) return null;
+    const label = trashRowLabel(trashCount);
+    return (
+      <TouchableOpacity
+        testID="drive-trash-row"
+        accessibilityRole="button"
+        accessibilityLabel={label}
+        onPress={() => navigation.navigate('Trash')}
+        style={[styles.trashRow, { borderTopColor: c.line }]}
+      >
+        <View style={[styles.trashRowIcon, { backgroundColor: c.paper2 }]}>
+          <Ionicons name="trash-outline" size={19} color={c.ink2} />
+        </View>
+        <Text style={[styles.trashRowLabel, { color: c.ink }]}>{label}</Text>
+        <Ionicons name="chevron-forward" size={16} color={c.ink4} />
+      </TouchableOpacity>
+    );
+  }, [c, navigation, showTrashEntry, trashCount]);
 
   // ------------------------------------------------------------------
   // Render helpers
@@ -4368,7 +4936,7 @@ export default function FilesScreen() {
             accessibilityLabel={`Navigate to ${root.name}`}
             accessibilityRole="button"
           >
-            <Text style={[styles.breadcrumbText, { color: c.amberDeep }]} numberOfLines={1}>
+            <Text style={[styles.breadcrumbText, { color: c.amberDeep }]} numberOfLines={accessibilityLayout ? 2 : 1}>
               {root.name}
             </Text>
           </TouchableOpacity>
@@ -4392,7 +4960,7 @@ export default function FilesScreen() {
           <Text
             testID={`breadcrumb-crumb-${folderStack.length - 1}`}
             style={[styles.breadcrumbText, { color: c.ink, fontWeight: '600', flexShrink: 1 }]}
-            numberOfLines={1}
+            numberOfLines={accessibilityLayout ? 2 : 1}
             ellipsizeMode="tail"
           >
             {current.name}
@@ -4436,7 +5004,7 @@ export default function FilesScreen() {
                     { color: c.amberDeep },
                     isLast && { color: c.ink, fontWeight: '600' },
                   ]}
-                  numberOfLines={1}
+                  numberOfLines={accessibilityLayout ? 2 : 1}
                 >
                   {entry.name}
                 </Text>
@@ -4450,11 +5018,11 @@ export default function FilesScreen() {
 
   // 3 most recently modified non-folder files — reuses the existing files array
   const recentFiles = useMemo(() => (
-    uniqueFileEntries(files)
+    uniqueFileEntries(visibleFiles)
       .filter((f) => !f.is_folder)
       .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
       .slice(0, 3)
-  ), [files]);
+  ), [visibleFiles]);
   const backupPendingCount = backupProgress.pending ?? 0;
   const showBackupContinueBanner =
     isPhotoBackupEnabled &&
@@ -4484,7 +5052,11 @@ export default function FilesScreen() {
             return (
               <TouchableOpacity
                 key={item.id}
-                style={[styles.recentCard, { backgroundColor: c.paper2, borderColor: c.line }]}
+                style={[
+                  styles.recentCard,
+                  accessibilityLayout && { width: Math.min(screenWidth - spacing.xl * 2, 220), minHeight: Math.ceil(105 * Math.min(fontScale, 1.6)) },
+                  { backgroundColor: c.paper2, borderColor: c.line },
+                ]}
                 onPress={() => openFile(item)}
                 activeOpacity={0.7}
                 accessibilityLabel={`Open recent file ${name}`}
@@ -4498,13 +5070,13 @@ export default function FilesScreen() {
                   lockStateReady={lockStateReady}
                 />
                 {name ? (
-                  <Text style={[styles.recentName, { color: c.ink }]} numberOfLines={1}>
+                  <Text style={[styles.recentName, { color: c.ink }]} numberOfLines={accessibilityLayout ? 3 : 1}>
                     {name}
                   </Text>
                 ) : (
                   <View style={{ height: 12, width: 80, borderRadius: 3, backgroundColor: c.line, marginTop: 4 }} />
                 )}
-                <Text style={[styles.recentDate, { color: c.ink4 }]} numberOfLines={1}>
+                <Text style={[styles.recentDate, { color: c.ink4 }]} numberOfLines={accessibilityLayout ? 2 : 1}>
                   {formatDate(item.updated_at)}
                 </Text>
               </TouchableOpacity>
@@ -4528,14 +5100,14 @@ export default function FilesScreen() {
           {pinnedFolders.map((pf) => (
             <TouchableOpacity
               key={pf.id}
-              style={[styles.pinnedChip, { borderColor: c.amber, backgroundColor: c.amberBg }]}
+              style={[styles.pinnedChip, accessibilityLayout && { maxWidth: Math.min(screenWidth - spacing.xl * 2, 260) }, { borderColor: c.amber, backgroundColor: c.amberBg }]}
               onPress={() => navigateToPinned(pf)}
               activeOpacity={0.7}
               accessibilityLabel={`Open pinned folder ${pf.name}`}
               accessibilityRole="button"
             >
               <Icon name="folder" size={13} color={c.amberDeep} />
-              <Text style={[styles.pinnedChipText, { color: c.amberDeep }]} numberOfLines={1}>
+              <Text style={[styles.pinnedChipText, { color: c.amberDeep }]} numberOfLines={accessibilityLayout ? 2 : 1}>
                 {pf.name}
               </Text>
             </TouchableOpacity>
@@ -4562,6 +5134,10 @@ export default function FilesScreen() {
   }, [navigation, decryptedNames, mimeTypeFor, ensureFileReady]);
 
   const handleSwipeDelete = useCallback((item: FileEntry) => {
+    if (isProtectedBackupsRoot(item.id)) {
+      showToast({ type: 'info', message: BACKUPS_PROTECTED_MESSAGE });
+      return;
+    }
     const name = decryptedNames[item.id] ?? displayName(item);
     Alert.alert(
       'Move to Trash',
@@ -4571,25 +5147,15 @@ export default function FilesScreen() {
         {
           text: 'Move to Trash',
           style: 'destructive',
-          onPress: async () => {
-            try {
-              // Task 1683f: trash cancels an in-flight upload for this file.
-              abortUploadForFile(item.id);
-              void abandonFileUpload(item.id).catch(() => {});
-              await deleteFile(item.id);
-              setFiles((prev) => prev.filter((f) => f.id !== item.id));
-              // 0818 — cascade to every derived store, subtree-expanded.
-              const subtree = sync.collectSubtreeIds([item.id]);
-              void onFilesDeleted(subtree, { subtree: item.is_folder });
-              void removeFromFileProviderCache(subtree);
-            } catch (err) {
-              Alert.alert('Error', friendlyError(err));
-            }
+          onPress: () => {
+            abortUploadForFile(item.id);
+            void abandonFileUpload(item.id).catch(() => {});
+            moveEntriesToTrash([item], name);
           },
         },
       ],
     );
-  }, [decryptedNames, sync]);
+  }, [decryptedNames, moveEntriesToTrash, showToast]);
 
   // Long-press enters multi-select with the pressed row already selected,
   // matching the runbook expectation. The previous ActionSheet (rename,
@@ -4669,13 +5235,12 @@ export default function FilesScreen() {
   ), [decryptedNames, unavailableNameIds, withDecryptedMime, openFile, handleLongPress, handleSwipeShare, handleSwipeDelete, openTrust, selectMode, selectedIds, toggleSelect, sortOrder, offlineStatusFor, proofs, lockedFileIds, lockStateReady, isShowingSearchResults, searchHighlightQuery, fileRowTestId]);
 
   // Grid sizing — 3 columns, evenly spaced, responsive to screen width
-  const GRID_COLUMNS = 3;
+  const GRID_COLUMNS = accessibilityLayout ? 1 : 3;
   const GRID_GAP = 10;
-  const screenWidth = Dimensions.get('window').width;
   const gridCardWidth = useMemo(() => {
     const totalGutter = spacing.lg * 2 + GRID_GAP * (GRID_COLUMNS - 1);
     return Math.floor((screenWidth - totalGutter) / GRID_COLUMNS);
-  }, [screenWidth]);
+  }, [GRID_COLUMNS, screenWidth]);
 
   const renderFileGrid = useCallback(({ item }: { item: FileEntry }) => (
     <FileGridItem
@@ -4787,7 +5352,7 @@ export default function FilesScreen() {
       >
       {/* Header — select mode vs normal mode */}
       {selectMode ? (
-        <View style={styles.header}>
+        <View style={[styles.header, accessibilityLayout && styles.headerAccessibility]}>
           <TouchableOpacity testID="select-mode-cancel" onPress={exitSelectMode} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
             <Text style={{ color: c.amberDeep, fontSize: 16, fontWeight: '500' }}>Cancel</Text>
           </TouchableOpacity>
@@ -4804,7 +5369,7 @@ export default function FilesScreen() {
           </TouchableOpacity>
         </View>
       ) : (
-        <View style={styles.header}>
+        <View style={[styles.header, accessibilityLayout && styles.headerAccessibility]}>
           {folderStack.length > 1 && !searchActive && (
             // 1341 — was a flat backgroundColor: c.paper2 / borderColor: c.line
             // circle (styles.backButton radius 15). This is a floating chrome
@@ -4819,7 +5384,7 @@ export default function FilesScreen() {
             // bounds, so an inner pressable's hitSlop would be clipped to the
             // fixed 30×30 circle instead of extending the touch target.
             <TouchableOpacity
-              onPress={() => navigateToBreadcrumb(folderStack.length - 2)}
+              onPress={() => navigation.goBack()}
               hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
               accessibilityRole="button"
               accessibilityLabel="Back"
@@ -4837,11 +5402,11 @@ export default function FilesScreen() {
             actions={folderTitleMenuActions}
             shouldOpenOnLongPress
             themeVariant={themeScheme}
-            style={styles.titleMenu}
+            style={[styles.titleMenu, accessibilityLayout && { minHeight: Math.ceil(34 * fontScale), justifyContent: 'center' }]}
           >
             <Text
               style={[styles.title, { color: c.ink }]}
-              numberOfLines={1}
+              numberOfLines={accessibilityLayout ? 2 : 1}
               ellipsizeMode="tail"
               accessibilityLabel={currentFolder.name}
             >
@@ -4849,7 +5414,7 @@ export default function FilesScreen() {
             </Text>
           </MenuView>
           <View style={{ flex: 1 }} />
-          {!searchActive && files.length > 0 && (
+          {!searchActive && visibleFiles.length > 0 && (
             <TouchableOpacity
               testID="select-mode-enter"
               onPress={() => enterSelectMode()}
@@ -4978,6 +5543,7 @@ export default function FilesScreen() {
             )}
             style={[
               styles.storageBanner,
+              accessibilityLayout && styles.bannerAccessibility,
               {
                 backgroundColor: isFull ? c.red : c.amberBg,
                 borderColor: isFull ? c.red : c.amber,
@@ -4991,7 +5557,7 @@ export default function FilesScreen() {
             />
             <Text
               style={[styles.storageBannerText, { color: isFull ? '#fff' : c.ink }]}
-              numberOfLines={1}
+              numberOfLines={accessibilityLayout ? undefined : 1}
             >
               {message}
             </Text>
@@ -5003,20 +5569,20 @@ export default function FilesScreen() {
       })()}
 
       {showBackupContinueBanner && (
-        <View style={[styles.backupContinueBanner, { backgroundColor: c.paper2, borderColor: c.line }]}>
+        <View style={[styles.backupContinueBanner, accessibilityLayout && styles.bannerAccessibility, { backgroundColor: c.paper2, borderColor: c.line }]}>
           <View style={[styles.backupContinueIcon, { backgroundColor: c.amberBg }]}>
             <Ionicons name="cloud-upload-outline" size={17} color={c.amberDeep} />
           </View>
-          <View style={styles.backupContinueTextWrap}>
-            <Text style={[styles.backupContinueTitle, { color: c.ink }]} numberOfLines={1}>
+          <View style={[styles.backupContinueTextWrap, accessibilityLayout && { flexBasis: '70%' }]}>
+            <Text style={[styles.backupContinueTitle, { color: c.ink }]} numberOfLines={accessibilityLayout ? undefined : 1}>
               Backup waiting
             </Text>
-            <Text style={[styles.backupContinueSubtitle, { color: c.ink3 }]} numberOfLines={1}>
+            <Text style={[styles.backupContinueSubtitle, { color: c.ink3 }]} numberOfLines={accessibilityLayout ? undefined : 1}>
               {backupPendingCount.toLocaleString()} {backupItemLabel} waiting
             </Text>
           </View>
           <TouchableOpacity
-            style={[styles.backupContinueButton, { backgroundColor: c.amber }]}
+            style={[styles.backupContinueButton, accessibilityLayout && { height: undefined, minHeight: 44, paddingVertical: 10 }, { backgroundColor: c.amber }]}
             onPress={handleReviewBackup}
             activeOpacity={0.75}
             accessibilityRole="button"
@@ -5035,6 +5601,7 @@ export default function FilesScreen() {
           ~40pt banner, never FilesScreen or its FlatList. That isolation is the
           whole point: it is what makes the restored "Downloading N% / Decrypting
           X/Y (N%)" progress crash-safe on a 3 GB export (1177/#188 regression). */}
+      {duplicateProgressSheet}
       {exporting && !selectMode && (
         <ExportProgressBanner ref={exportBannerRef} name={exporting.name} />
       )}
@@ -5068,7 +5635,7 @@ export default function FilesScreen() {
             style={styles.searchFiltersWrap}
           >
             <View
-              style={styles.searchFiltersRow}
+              style={[styles.searchFiltersRow, accessibilityLayout && { flexWrap: 'wrap' }]}
               testID="search-filters"
               accessibilityRole="tablist"
               accessibilityLabel="Filter search results"
@@ -5090,6 +5657,7 @@ export default function FilesScreen() {
                     hitSlop={{ top: 8, bottom: 8, left: 0, right: 0 }}
                     style={[
                       styles.searchFilterItem,
+                      accessibilityLayout && { flexBasis: '45%' },
                       selected
                         ? [
                             actionBarMaterial.bubbleShadow,
@@ -5102,7 +5670,7 @@ export default function FilesScreen() {
                     ]}
                   >
                     <Text
-                      numberOfLines={1}
+                      numberOfLines={accessibilityLayout ? undefined : 1}
                       style={[
                         styles.searchFilterLabel,
                         {
@@ -5149,23 +5717,38 @@ export default function FilesScreen() {
 
       {/* Breadcrumbs (only show when navigated into a folder, not during search or select) */}
       {folderStack.length > 1 && !searchActive && !selectMode && renderBreadcrumbs()}
+      {/* Freshness line: only when the list may not be current. Lives inside the
+          floating header so the list's top padding and the pull spinner's offset
+          (both headerHeight) grow with it instead of being covered. */}
+      {!selectMode && !searchActive ? (
+        <FreshnessLine status={sync.status} syncedAt={sync.lastSyncAt} fetchedAt={fetchedAt} />
+      ) : null}
       </View>{/* end headerArea */}
 
       {/* Content */}
       {error ? (
         // The header floats, so every content branch needs the same top inset.
-        <View style={{ flex: 1, paddingTop: headerHeight }}>{renderError()}</View>
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={{ flexGrow: 1, paddingTop: headerHeight }}
+          refreshControl={selectMode ? undefined : pullToRefreshControl}
+        >
+          {renderError()}
+        </ScrollView>
       ) : loading && !refreshing ? (
-        <View style={{ paddingTop: headerHeight }}>
+        <ScrollView
+          contentContainerStyle={{ paddingTop: headerHeight }}
+          refreshControl={selectMode ? undefined : pullToRefreshControl}
+        >
           {[0, 1, 2, 3, 4].map((i) => <SkeletonRow key={i} />)}
-        </View>
+        </ScrollView>
       ) : (
         <FlatList
           // 1338 step a — search-results anchor only while actually showing
           // search matches; undefined during normal browsing (unchanged then).
           testID={isShowingSearchResults ? 'search-results' : undefined}
           // FlatList does not allow numColumns to change at runtime — remount with a key
-          key={viewMode}
+          key={`${viewMode}-${GRID_COLUMNS}`}
           data={displayedFiles}
           keyExtractor={(item) => item.id}
           renderItem={viewMode === 'grid' ? renderFileGrid : renderFileRow}
@@ -5174,6 +5757,7 @@ export default function FilesScreen() {
           numColumns={viewMode === 'grid' ? GRID_COLUMNS : 1}
           columnWrapperStyle={viewMode === 'grid' ? styles.gridRow : undefined}
           ListEmptyComponent={renderEmpty}
+          ListFooterComponent={renderTrashEntry}
           // 1313 — pinned/recent/banner moved OUT of the static flow and into
           // the list, so the whole content column scrolls under the floating
           // header. Passed as an element rather than a component so React
@@ -5196,16 +5780,7 @@ export default function FilesScreen() {
           }
           onScroll={(e) => setIsScrolled(e.nativeEvent.contentOffset.y > 0)}
           scrollEventThrottle={100}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={selectMode ? undefined : handleRefresh}
-              tintColor={c.amber}
-              colors={[c.amber]}
-              // Without this the spinner appears underneath the floating header.
-              progressViewOffset={headerHeight}
-            />
-          }
+          refreshControl={selectMode ? undefined : pullToRefreshControl}
           contentContainerStyle={[
             displayedFiles.length === 0 ? styles.emptyList : undefined,
             viewMode === 'grid' ? styles.gridContent : undefined,
@@ -5369,10 +5944,10 @@ export default function FilesScreen() {
           // overlay bar no longer does, so this floats the same shared inset
           // above it instead of landing underneath/behind the capsule.
           style={[styles.actionBar, { bottom: tabBarBottomInset }]}
-          contentStyle={styles.actionBarRow}
+          contentStyle={[styles.actionBarRow, accessibilityLayout && { flexWrap: 'wrap' }]}
         >
           <TouchableOpacity
-            style={styles.actionBarButton}
+            style={[styles.actionBarButton, accessibilityLayout && { flexBasis: '50%' }]}
             onPress={handleBatchShare}
             disabled={selectedIds.size === 0}
           >
@@ -5380,7 +5955,7 @@ export default function FilesScreen() {
             <Text style={[styles.actionBarLabel, { color: selectedIds.size === 0 ? actionBarMaterial.labelMuted : actionBarMaterial.label }]}>Share</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            style={styles.actionBarButton}
+            style={[styles.actionBarButton, accessibilityLayout && { flexBasis: '50%' }]}
             onPress={() => void handleBatchMove()}
             disabled={selectedIds.size === 0}
           >
@@ -5388,7 +5963,7 @@ export default function FilesScreen() {
             <Text style={[styles.actionBarLabel, { color: selectedIds.size === 0 ? actionBarMaterial.labelMuted : actionBarMaterial.label }]}>Move</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            style={styles.actionBarButton}
+            style={[styles.actionBarButton, accessibilityLayout && { flexBasis: '50%' }]}
             onPress={handleBatchTrash}
             disabled={selectedIds.size === 0}
           >
@@ -5417,11 +5992,12 @@ export default function FilesScreen() {
           style={[styles.fab, { bottom: tabBarBottomInset + FAB_BOTTOM_GAP, backgroundColor: c.amber }]}
         >
           <View
+            collapsable={false}
             style={styles.fabInner}
             accessibilityLabel="Add file or folder"
             accessibilityRole="button"
           >
-            <Text style={[styles.fabText, { color: c.ink }]}>+</Text>
+            <Ionicons name="add" size={28} color={c.ink} />
           </View>
         </MenuView>
       )}
@@ -5530,10 +6106,8 @@ export default function FilesScreen() {
           onPress={() => setBreadcrumbPopoverOpen(false)}
         />
         {breadcrumbAnchor ? (() => {
-          const screenW = Dimensions.get('window').width;
-          const screenH = Dimensions.get('window').height;
-          const popW = Math.min(300, screenW - 24);
-          const left = Math.max(8, Math.min(breadcrumbAnchor.x - 10, screenW - popW - 8));
+          const popW = Math.min(accessibilityLayout ? screenWidth - 24 : 300, screenWidth - 24);
+          const left = Math.max(8, Math.min(breadcrumbAnchor.x - 10, screenWidth - popW - 8));
           const top = breadcrumbAnchor.y + breadcrumbAnchor.height + 4;
           const middle = folderStack.slice(1, folderStack.length - 1);
           return (
@@ -5543,7 +6117,7 @@ export default function FilesScreen() {
                 { backgroundColor: c.paper, borderColor: c.line, width: popW, left, top },
               ]}
             >
-              <ScrollView style={{ maxHeight: screenH * 0.5 }} bounces={false}>
+              <ScrollView style={{ maxHeight: screenHeight * 0.5 }} bounces={false}>
                 {middle.map((entry, i) => {
                   const stackIndex = i + 1;
                   const indent = Math.min(i, 2);
@@ -5569,7 +6143,7 @@ export default function FilesScreen() {
                       />
                       <Text
                         style={[styles.breadcrumbPopoverLabel, { color: c.ink }]}
-                        numberOfLines={1}
+                        numberOfLines={accessibilityLayout ? 2 : 1}
                         ellipsizeMode="tail"
                       >
                         {entry.name}
@@ -5622,6 +6196,7 @@ const styles = StyleSheet.create({
   // Header
   headerArea: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 },
   header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: spacing.lg, paddingVertical: spacing.sm, gap: 8 },
+  headerAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   selectTitle: { flex: 1, fontSize: 16, fontWeight: '600', textAlign: 'center' },
   // 1341 — the 30×30 circle itself is now a GlassCircle (glass-recipe.ts),
   // which centers its own children; the outer TouchableOpacity (rendered
@@ -5728,6 +6303,17 @@ const styles = StyleSheet.create({
   actionBarLabel: { fontSize: 10, fontWeight: '600' },
 
   // File list
+  trashRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    minHeight: 56,
+    marginTop: 8,
+    paddingHorizontal: spacing.lg,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  trashRowIcon: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center' },
+  trashRowLabel: { flex: 1, fontSize: 14, fontWeight: '600' },
   fileRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: spacing.lg, borderBottomWidth: 1, gap: 12 },
   fileInfo: { flex: 1, minWidth: 0 },
   fileNameRow: { flexDirection: 'row', alignItems: 'center', gap: 4, minWidth: 0 },
@@ -5830,6 +6416,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     gap: 8,
   },
+  bannerAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   storageBannerText: { flex: 1, fontSize: 12, fontWeight: '500' },
   // Task 1037 — lapsed (read-only) account banner. Same shape as the storage
   // banner, but the text wraps: the deletion date must never be truncated.
@@ -5904,8 +6491,6 @@ const styles = StyleSheet.create({
     ...cssShadow(6, 18, '#F5B800', 0.30),
   },
   fabInner: { width: '100%', height: '100%', alignItems: 'center', justifyContent: 'center' },
-  fabText: { fontSize: 28, fontWeight: '600', marginTop: -2 },
-
   sharedBadge: { marginLeft: 4 },
 
   // Android new-folder modal

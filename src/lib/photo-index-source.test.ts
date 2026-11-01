@@ -154,7 +154,7 @@ describe('Photos focus refresh — /files/index burst (task 1959)', () => {
     // cache (as sync-client.ts persistCacheNow does), keeping the hash it
     // found — so the cache is current without the server being asked.
     for (let i = 0; i < 50; i += 1) {
-      const out = await getPhotoCandidates(undefined, new Set());
+      const out = await getPhotoCandidates(undefined);
       expect(out.length).toBeGreaterThanOrEqual(2);
       // the upload of file i completes; the server's hash moves on
       serverHash = `h-after-${i}`;
@@ -165,16 +165,16 @@ describe('Photos focus refresh — /files/index burst (task 1959)', () => {
   });
 
   test('the fresh-window result still shows the files the sync client added', async () => {
-    await getPhotoCandidates(undefined, new Set());
+    await getPhotoCandidates(undefined);
     cache = { ...cache!, files: [...cache!.files, photo('fresh-upload')], storedAt: cache!.storedAt + 1, seq: 7 };
-    const out = await getPhotoCandidates(undefined, new Set());
+    const out = await getPhotoCandidates(undefined);
     expect(out.map((f) => f.id).sort()).toEqual(['a', 'b', 'fresh-upload']);
     expect(indexCalls.length).toBe(1);
   });
 
   test('overlapping focuses while a request is in flight share it (5 callers, 1 request)', async () => {
     holdIndex = true;
-    const calls = Array.from({ length: 5 }, () => getPhotoCandidates(undefined, new Set()));
+    const calls = Array.from({ length: 5 }, () => getPhotoCandidates(undefined));
     await new Promise((r) => setTimeout(r, 5));
     holdIndex = false;
     releaseAll();
@@ -184,8 +184,8 @@ describe('Photos focus refresh — /files/index burst (task 1959)', () => {
   });
 
   test('pull-to-refresh (force) still asks the server, with the cached hash', async () => {
-    await getPhotoCandidates(undefined, new Set());
-    await getPhotoCandidates(undefined, new Set(), { force: true });
+    await getPhotoCandidates(undefined);
+    await getPhotoCandidates(undefined, { force: true });
     expect(indexCalls).toEqual([undefined, 'h1']);
   });
 });
@@ -193,7 +193,7 @@ describe('Photos focus refresh — /files/index burst (task 1959)', () => {
 describe('Photos index across an account switch (task 1959 round 2)', () => {
   test('a Photos load whose account signed out mid-request gets neither the old rows nor a media-list fallback under the new session', async () => {
     holdIndex = true;
-    const forA = getPhotoCandidates(undefined, new Set());
+    const forA = getPhotoCandidates(undefined);
     forA.catch(() => {});
     await new Promise((r) => setTimeout(r, 2));
     // clearToken(): the account epoch moves first; the cache clear follows.
@@ -211,51 +211,51 @@ describe('Photos index across an account switch (task 1959 round 2)', () => {
 
 describe('a photo uploaded inside the revalidation window (task 1959 round 4, Codex P1)', () => {
   test('uploaded by this device (JS uploader): shows on the next focus, no extra request', async () => {
-    await getPhotoCandidates(undefined, new Set());
+    await getPhotoCandidates(undefined);
     // finalizeUpload records what it sent on init, before the complete call.
     uploads?.rememberUploadClassification('own-1', true);
     arrive('own-1');
-    const out = await getPhotoCandidates(undefined, new Set());
+    const out = await getPhotoCandidates(undefined);
     expect(ids(out)).toEqual(['a', 'b', 'own-1']);
     expect(indexCalls.length).toBe(1);
   });
 
   test('uploaded by this device\'s backup engine (backup_assets photo row): shows on the next focus, no extra request', async () => {
-    await getPhotoCandidates(undefined, new Set());
+    await getPhotoCandidates(undefined);
     backupAssetTypes.set('cam-1', 'photo');
     arrive('cam-1');
-    const out = await getPhotoCandidates(undefined, new Set());
+    const out = await getPhotoCandidates(undefined);
     expect(ids(out)).toEqual(['a', 'b', 'cam-1']);
     expect(indexCalls.length).toBe(1);
   });
 
   test('uploaded by another device: shows on the next focus, after ONE revalidation with the hash', async () => {
-    await getPhotoCandidates(undefined, new Set());
+    await getPhotoCandidates(undefined);
     arrive('foreign-1');
-    const out = await getPhotoCandidates(undefined, new Set());
+    const out = await getPhotoCandidates(undefined);
     expect(ids(out)).toEqual(['a', 'b', 'foreign-1']);
     expect(indexCalls).toEqual([undefined, 'h1']);
     // It is in the server snapshot now: later focuses ask nothing.
     for (let i = 0; i < 10; i += 1) {
-      expect(ids(await getPhotoCandidates(undefined, new Set()))).toEqual(['a', 'b', 'foreign-1']);
+      expect(ids(await getPhotoCandidates(undefined))).toEqual(['a', 'b', 'foreign-1']);
     }
     expect(indexCalls.length).toBe(2);
   });
 
   test('a known non-media upload (contacts backup) stays out, and costs no request', async () => {
-    await getPhotoCandidates(undefined, new Set());
+    await getPhotoCandidates(undefined);
     backupAssetTypes.set('vcf-1', 'contact');
     arrive('vcf-1');
-    const out = await getPhotoCandidates(undefined, new Set());
+    const out = await getPhotoCandidates(undefined);
     expect(ids(out)).toEqual(['a', 'b']);
     expect(indexCalls.length).toBe(1);
   });
 
   test('nothing new: 20 focuses, one request; new FOLDERS only (ensureBackupFolders): still one', async () => {
-    for (let i = 0; i < 10; i += 1) await getPhotoCandidates(undefined, new Set());
+    for (let i = 0; i < 10; i += 1) await getPhotoCandidates(undefined);
     arrive('folder-1', { is_folder: true });
     arrive('folder-2', { is_folder: true });
-    for (let i = 0; i < 10; i += 1) await getPhotoCandidates(undefined, new Set());
+    for (let i = 0; i < 10; i += 1) await getPhotoCandidates(undefined);
     expect(indexCalls.length).toBe(1);
     expect(backupLookups).toBe(0);
   });
@@ -263,7 +263,7 @@ describe('a photo uploaded inside the revalidation window (task 1959 round 4, Co
   test('BURST, realistic rows: 50 uploads by this device, a focus after each, cost ONE request and every photo shows at once', async () => {
     let expected = 2;
     for (let i = 0; i < 50; i += 1) {
-      const out = await getPhotoCandidates(undefined, new Set());
+      const out = await getPhotoCandidates(undefined);
       expect(out.length).toBe(expected);
       // Half through the JS uploader, half through the backup engine.
       if (i % 2 === 0) uploads?.rememberUploadClassification(`up-${i}`, true);
@@ -271,13 +271,13 @@ describe('a photo uploaded inside the revalidation window (task 1959 round 4, Co
       arrive(`up-${i}`);
       expected += 1;
     }
-    expect((await getPhotoCandidates(undefined, new Set())).length).toBe(52);
+    expect((await getPhotoCandidates(undefined)).length).toBe(52);
     expect(indexCalls.length).toBe(1);
   });
 
   test('another device uploading: one request per arrival, not per focus (3 arrivals across 12 focuses = 1 + 3)', async () => {
     for (let i = 0; i < 12; i += 1) {
-      await getPhotoCandidates(undefined, new Set());
+      await getPhotoCandidates(undefined);
       if (i === 2 || i === 5 || i === 8) arrive(`foreign-${i}`);
     }
     expect(indexCalls.length).toBe(4);

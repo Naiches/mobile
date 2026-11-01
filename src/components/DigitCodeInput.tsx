@@ -19,7 +19,7 @@
  * distributed across boxes in `handleChange`.
  */
 import React, { useEffect, useImperativeHandle, useMemo, useRef } from 'react';
-import { Platform, StyleSheet, TextInput, View } from 'react-native';
+import { Platform, StyleSheet, TextInput, useWindowDimensions, View } from 'react-native';
 import { useTheme } from '../lib/theme-context';
 import { fonts, radii } from '../theme';
 
@@ -54,6 +54,8 @@ export const DigitCodeInput = React.forwardRef<DigitCodeInputHandle, DigitCodeIn
     ref,
   ) {
     const { colors: c } = useTheme();
+    const { fontScale } = useWindowDimensions();
+    const accessibilityLayout = fontScale >= 1.3;
     const refs = useRef<Array<TextInput | null>>([]);
 
     const digits = useMemo(() => {
@@ -73,7 +75,7 @@ export const DigitCodeInput = React.forwardRef<DigitCodeInputHandle, DigitCodeIn
           box: {
             flexGrow: 1,
             flexBasis: 32,
-            height: 48,
+            minHeight: 48,
             borderWidth: 1,
             borderRadius: radii.md,
             borderColor: c.line,
@@ -85,6 +87,13 @@ export const DigitCodeInput = React.forwardRef<DigitCodeInputHandle, DigitCodeIn
             fontFamily: fonts.mono,
             paddingHorizontal: 0,
             paddingVertical: 0,
+          },
+          boxAccessibility: {
+            flexGrow: 0,
+            flexShrink: 0,
+            flexBasis: Math.max(44, Math.ceil(28 * fontScale)),
+            minHeight: Math.ceil(34 * fontScale),
+            paddingVertical: 8,
           },
           boxFilled: {
             borderColor: c.line2,
@@ -99,7 +108,7 @@ export const DigitCodeInput = React.forwardRef<DigitCodeInputHandle, DigitCodeIn
             opacity: 0.6,
           },
         }),
-      [c],
+      [accessibilityLayout, c, fontScale],
     );
 
     useImperativeHandle(
@@ -195,6 +204,7 @@ export const DigitCodeInput = React.forwardRef<DigitCodeInputHandle, DigitCodeIn
               }}
               style={[
                 styles.box,
+                accessibilityLayout && styles.boxAccessibility,
                 filled && styles.boxFilled,
                 !filled && isFocusTarget && styles.boxFocus,
                 invalid && styles.boxInvalid,

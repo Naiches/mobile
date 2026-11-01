@@ -25,6 +25,7 @@ import {
   ActivityIndicator,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -121,8 +122,10 @@ export function InfoSheet({
   focus = 'info',
 }: InfoSheetProps) {
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
   const { colors: c } = useTheme();
   const { decryptMetadata } = useCrypto();
+  const largeText = fontScale >= 1.35;
 
   const [parentId, setParentId] = useState<string | null | undefined>(undefined);
   /** Task 1592 — `undefined` while loading, `null` when unknown (row hidden). */
@@ -248,7 +251,7 @@ export function InfoSheet({
   const folderLabel = resolveFolderLabel(parentId, folderName);
   const shareLabel = shareCount === undefined ? '…' : shareCount === null ? null : formatShareStatus(shareCount);
 
-  const styles = useMemo(() => infoSheetStyles(c), [c]);
+  const styles = useMemo(() => infoSheetStyles(c, largeText), [c, largeText]);
   const locationLabel = storageLocationLabel(fileCountry);
 
   return (
@@ -258,7 +261,7 @@ export function InfoSheet({
       zIndex={INFO_SHEET_Z_INDEX}
       // The top chrome (close / title / ⋯, zIndex above the sheet) stays
       // usable, so even the large detent stops below it.
-      topClearance={insets.top + PREVIEW_CHROME_CLEARANCE}
+      topClearance={insets.top + PREVIEW_CHROME_CLEARANCE * Math.max(1, fontScale)}
       detents={['half', 'default', 'large']}
       initialDetent="default"
       contentStyle={styles.body}
@@ -276,7 +279,7 @@ export function InfoSheet({
         onContentSizeChange={scrollToVersionsIfPending}
         testID="preview-info-scroll"
       >
-        <Text style={styles.title} numberOfLines={2}>{filename}</Text>
+        <Text style={styles.title} numberOfLines={largeText ? undefined : 2}>{filename}</Text>
         <Text style={styles.subline}>{subline}</Text>
 
         <View style={styles.encBox}>
@@ -293,15 +296,15 @@ export function InfoSheet({
           <Text style={styles.errorText}>{metaError}</Text>
         ) : (
           <View style={styles.kvBlock}>
-            <KvRow styles={styles} label="Modified" value={modifiedLabel ?? (metaLoading ? '…' : '—')} />
-            <KvRow styles={styles} label="Folder" value={folderLabel} />
+            <KvRow styles={styles} largeText={largeText} label="Modified" value={modifiedLabel ?? (metaLoading ? '…' : '—')} />
+            <KvRow styles={styles} largeText={largeText} label="Folder" value={folderLabel} />
             {shareLabel != null && (
-              <KvRow styles={styles} label="Shared" value={shareLabel} testID="preview-info-shared" />
+              <KvRow styles={styles} largeText={largeText} label="Shared" value={shareLabel} testID="preview-info-shared" />
             )}
             {extraRows.map((row) => (
-              <KvRow styles={styles} key={row.label} label={row.label} value={row.value} mono={row.mono} />
+              <KvRow styles={styles} largeText={largeText} key={row.label} label={row.label} value={row.value} mono={row.mono} />
             ))}
-            <KvRow styles={styles} label="Stored in" value={locationLabel} testID="preview-info-stored-in" />
+            <KvRow styles={styles} largeText={largeText} label="Stored in" value={locationLabel} testID="preview-info-stored-in" />
           </View>
         )}
 
@@ -337,12 +340,14 @@ export function InfoSheet({
 
 function KvRow({
   styles,
+  largeText,
   label,
   value,
   mono,
   testID,
 }: {
   styles: ReturnType<typeof infoSheetStyles>;
+  largeText: boolean;
   label: string;
   value: string;
   mono?: boolean;
@@ -351,12 +356,17 @@ function KvRow({
   return (
     <View style={styles.kvRow} testID={testID}>
       <Text style={styles.kvLabel}>{label}</Text>
-      <Text style={[styles.kvValue, mono && styles.kvMono]} numberOfLines={2}>{value}</Text>
+      <Text
+        style={[styles.kvValue, mono && styles.kvMono]}
+        numberOfLines={largeText ? undefined : 2}
+      >
+        {value}
+      </Text>
     </View>
   );
 }
 
-function infoSheetStyles(c: Colors) {
+function infoSheetStyles(c: Colors, largeText: boolean) {
   return StyleSheet.create({
     // Task 1586 — the sheet itself (full width, bottom attached, top corners
     // at GLASS_RADII.sheet, the home-indicator inset inside it, the draggable
@@ -372,15 +382,22 @@ function infoSheetStyles(c: Colors) {
     kvRow: {
       minHeight: 40,
       paddingVertical: 10,
-      flexDirection: 'row',
-      alignItems: 'baseline',
+      flexDirection: largeText ? 'column' : 'row',
+      alignItems: largeText ? 'stretch' : 'baseline',
       justifyContent: 'space-between',
-      gap: 16,
+      gap: largeText ? 4 : 16,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: c.line,
     },
     kvLabel: { fontSize: 13, color: c.ink2 },
-    kvValue: { flex: 1, textAlign: 'right', fontSize: 13, fontWeight: '500', color: c.ink },
+    kvValue: {
+      flex: largeText ? 0 : 1,
+      alignSelf: largeText ? 'stretch' : undefined,
+      textAlign: largeText ? 'left' : 'right',
+      fontSize: 13,
+      fontWeight: '500',
+      color: c.ink,
+    },
     kvMono: { fontFamily: fonts.mono, fontSize: 12 },
     title: { fontSize: 18, fontWeight: '700', color: c.ink, letterSpacing: -0.2 },
     subline: {
@@ -413,8 +430,9 @@ function infoSheetStyles(c: Colors) {
     },
     versionsBlock: { gap: 6 },
     versionRow: {
-      flexDirection: 'row',
+      flexDirection: largeText ? 'column' : 'row',
       justifyContent: 'space-between',
+      gap: largeText ? 4 : 0,
       paddingVertical: 8,
       paddingHorizontal: 10,
       borderRadius: radii.sm,

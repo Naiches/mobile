@@ -58,7 +58,7 @@ mock.module('./account-refusal-poll', () => ({
     return { stop() {}, setActive() {} };
   },
 }));
-const calls = { getBackupProgress: 0, enablePhotoBackup: [] as Array<[string, string]>, disablePhotoBackup: 0 };
+const calls = { getBackupProgress: 0, enablePhotoBackup: [] as Array<[string, string]>, disablePhotoBackup: 0, runContactsBackupNow: 0 };
 
 function full25() {
   // A FRESH object with identical fields on every read, like the native bridge.
@@ -139,8 +139,14 @@ mock.module('../../modules/beebeeb-crypto', () => ({
   enablePhotoBackup: async (token: string, userId: string) => { calls.enablePhotoBackup.push([token, userId]); },
   enableContactsBackup: async () => { auxiliaryEnables.push('contacts'); },
   enableCalendarBackup: async () => { auxiliaryEnables.push('calendar'); },
+  prepareContactsBackup: async () => {},
+  prepareCalendarBackup: async () => {},
   resumeContactsBackup: async () => {},
   resumeCalendarBackup: async () => {},
+  getContactsBackupStatus: async () => ({}),
+  getCalendarBackupStatus: async () => ({}),
+  runContactsBackupNow: async () => { calls.runContactsBackupNow += 1; },
+  runCalendarBackupNow: async () => {},
   getBackupProgress: async () => {
     calls.getBackupProgress += 1;
     if (holdReads) return new Promise((r) => { heldReads.push(r); });
@@ -483,4 +489,19 @@ describe('PR 217 stale read-only gate during auxiliary refusal recovery', () => 
       expect(calls.enablePhotoBackup).toEqual([]);
     });
   }
+});
+
+
+describe('Back up now and the Contacts export', () => {
+  test('Back up now runs the contacts export; the album-selection path skips it', async () => {
+    store.set(backupPrefKey('beebeeb_camera_backup', USER_A), 'true');
+    await mount();
+    await act(async () => { await latest!.toggleContactsBackup(); });
+    await settle();
+    calls.runContactsBackupNow = 0;
+    await act(async () => { await latest!.triggerBackupNow(); });
+    expect(calls.runContactsBackupNow).toBe(1);
+    await act(async () => { await latest!.triggerBackupNow({ skipCategories: true }); });
+    expect(calls.runContactsBackupNow).toBe(1);
+  });
 });

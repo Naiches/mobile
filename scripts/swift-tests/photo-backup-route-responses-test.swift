@@ -128,7 +128,8 @@ for status in [400, 401, 403, 405, 409, 410, 429, 500, 502, 503] {
   expect(outcome(r) == .failed(statusCode: status), "mark \(status) with a NotFound-looking body: failure")
 }
 expect(PhotoBackupServerResponses.MarkOutcome.marked.recordsServerMark, "marked records server_marked_at")
-expect(PhotoBackupServerResponses.MarkOutcome.fileGone.recordsServerMark, "file gone records server_marked_at (done)")
+expect(!PhotoBackupServerResponses.MarkOutcome.fileGone.recordsServerMark, "file gone is terminal for marking but records no server association")
+expect(PhotoBackupServerResponses.MarkOutcome.fileGone.requiresReupload, "file gone requeues the photo backup")
 expect(!PhotoBackupServerResponses.MarkOutcome.failed(statusCode: 404).recordsServerMark, "a failed 404 records nothing")
 
 // MARK: - Stub transport (URLProtocol): replies per path + ?id=
@@ -201,9 +202,18 @@ func markOnServer(_ db: OpaquePointer, assetId: String, fileId: String, timeout:
     contentType: http?.value(forHTTPHeaderField: "Content-Type"),
     data: data
   )
-  guard outcome.recordsServerMark else { return false }
-  BackupManifestStore.recordServerMarked(db, assetId: assetId, fileId: fileId, nowMs: now)
-  return true
+  switch outcome {
+  case .marked:
+    BackupManifestStore.recordServerMarked(db, assetId: assetId, fileId: fileId, nowMs: now)
+    return true
+  case .fileGone:
+    switch BackupManifestStore.requeueRemoteGone(db, assetId: assetId, fileId: fileId, nowMs: now) {
+    case .requeued, .alreadySettled: return true
+    case .failed: return false
+    }
+  case .failed:
+    return false
+  }
 }
 
 // MARK: - SQLite fixtures
@@ -211,7 +221,6 @@ func markOnServer(_ db: OpaquePointer, assetId: String, fileId: String, timeout:
 let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-routes-\(UUID().uuidString)", isDirectory: true)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 
 let schema = """
 CREATE TABLE IF NOT EXISTS backup_assets (
@@ -416,7 +425,9 @@ do {
   expect(flushed?.candidates == 3 && flushed?.marked == 2,
          "sign-out flush: 3 candidates, 2 done (200 + API 404) (got \(String(describing: flushed?.candidates))/\(String(describing: flushed?.marked)))")
   expect(marked(db, "m-ok"), "mark 200: server_marked_at set")
-  expect(marked(db, "m-gone"), "mark 404 with the API NotFound body: done, server_marked_at set")
+  expect(!marked(db, "m-gone"), "mark 404 with the API NotFound body: no stale server mark")
+  expect(text(db, "SELECT status || ':' || COALESCE(remote_file_id, 'nil') FROM backup_assets WHERE local_asset_id = 'm-gone'")
+         == "pending_reupload:nil", "mark 404 with the API NotFound body: the missing copy is queued again")
   expect(!marked(db, "m-proxy"), "mark 404 with an HTML body: NO server_marked_at")
   expect(StubRoutes.hitCount("\(markPath)?id=m-proxy") == 2, "the HTML 404 was retried (2 attempts), not taken as done")
 
@@ -471,13 +482,30 @@ for (label, reply) in foreign404s {
   exsqlite3_close_v2(db)
 }
 
+// A late 404 for an old file id is already settled: it must not clobber the
+// newer upload or stop the mark loop before later rows.
+do {
+  let db = manifest("mark-late-404.db")
+  insertUnmarked(db, "m-late", file: "f-new", order: 1)
+  let result = BackupManifestStore.requeueRemoteGone(
+    db, assetId: "m-late", fileId: "f-old", nowMs: now
+  )
+  expect(result == .alreadySettled, "late mark 404 is an already-settled CAS miss")
+  expect(text(db, "SELECT status || ':' || remote_file_id FROM backup_assets WHERE local_asset_id = 'm-late'")
+         == "uploaded:f-new", "late mark 404 leaves the newer upload untouched")
+  exsqlite3_close_v2(db)
+}
+
 // MARK: - Report
 
+let exitCode: Int32
 if failures.isEmpty {
   print("PhotoBackupRouteResponsesTests: \(total) assertions, 0 failed")
-  exit(0)
+  exitCode = 0
 } else {
   for f in failures { print("FAIL: \(f)") }
   print("PhotoBackupRouteResponsesTests: \(failures.count) of \(total) assertions FAILED")
-  exit(1)
+  exitCode = 1
 }
+try? fm.removeItem(at: root)
+exit(exitCode)

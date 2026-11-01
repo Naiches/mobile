@@ -5,6 +5,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -64,6 +65,8 @@ export default function ThumbnailWorkerScreen() {
   const navigation = useNavigation<Nav>();
   const insets = useSafeAreaInsets();
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   const [stats, setStats] = useState<QueueStats | null>(null);
   const [workers, setWorkers] = useState<WorkerSlot[]>(
@@ -202,7 +205,7 @@ export default function ThumbnailWorkerScreen() {
         contentContainerStyle={{ padding: 16, paddingBottom: insets.bottom + 40 }}
       >
         {/* Big numbers */}
-        <View style={styles.bigNumbers}>
+        <View style={[styles.bigNumbers, accessibilityLayout && styles.bigNumbersAccessibility]}>
           <Text style={[styles.bigNumber, { color: c.ink }]}>{completed.toLocaleString()}</Text>
           <Text style={[styles.bigNumberDivider, { color: c.ink3 }]}>/</Text>
           <Text style={[styles.bigTotal, { color: c.ink3 }]}>{total.toLocaleString()}</Text>
@@ -233,14 +236,17 @@ export default function ThumbnailWorkerScreen() {
         <Text style={[styles.sectionTitle, { color: c.ink3 }]}>Active workers</Text>
         <View style={[styles.card, { backgroundColor: c.paper2, borderColor: c.line }]}>
           {workers.map((w) => (
-            <View key={w.slot} style={styles.workerRow}>
+            <View key={w.slot} style={[styles.workerRow, accessibilityLayout && styles.workerRowAccessibility]}>
               <View style={[styles.slotBadge, { backgroundColor: w.fileId ? c.amber : c.line }]}>
                 <Text style={[styles.slotText, { color: w.fileId ? '#16110a' : c.ink4 }]}>
                   {w.slot + 1}
                 </Text>
               </View>
               <View style={styles.workerInfo}>
-                <Text style={[styles.workerFileId, { color: w.fileId ? c.ink : c.ink4 }]} numberOfLines={1}>
+                <Text
+                  style={[styles.workerFileId, { color: w.fileId ? c.ink : c.ink4 }]}
+                  numberOfLines={accessibilityLayout ? undefined : 1}
+                >
                   {w.fileId ? w.fileId.slice(0, 8) : '—'}
                 </Text>
                 <Text style={[styles.workerStage, { color: c.ink3 }]}>
@@ -255,16 +261,16 @@ export default function ThumbnailWorkerScreen() {
         {/* Tally card */}
         <Text style={[styles.sectionTitle, { color: c.ink3 }]}>Tally</Text>
         <View style={[styles.card, { backgroundColor: c.paper2, borderColor: c.line }]}>
-          <View style={styles.statGrid}>
-            <View style={[styles.statBox, { backgroundColor: c.paper, borderColor: c.line }]}>
+          <View style={[styles.statGrid, accessibilityLayout && styles.statGridAccessibility]}>
+            <View style={[styles.statBox, accessibilityLayout && styles.statBoxAccessibility, { backgroundColor: c.paper, borderColor: c.line }]}>
               <Text style={[styles.statValue, { color: c.green }]}>{(stats?.succeeded ?? 0).toLocaleString()}</Text>
               <Text style={[styles.statLabel, { color: c.ink3 }]}>Updated</Text>
             </View>
-            <View style={[styles.statBox, { backgroundColor: c.paper, borderColor: c.line }]}>
+            <View style={[styles.statBox, accessibilityLayout && styles.statBoxAccessibility, { backgroundColor: c.paper, borderColor: c.line }]}>
               <Text style={[styles.statValue, { color: c.amber }]}>{(stats?.failedRetry ?? 0).toLocaleString()}</Text>
               <Text style={[styles.statLabel, { color: c.ink3 }]}>Retrying</Text>
             </View>
-            <View style={[styles.statBox, { backgroundColor: c.paper, borderColor: c.line }]}>
+            <View style={[styles.statBox, accessibilityLayout && styles.statBoxAccessibility, { backgroundColor: c.paper, borderColor: c.line }]}>
               <Text style={[styles.statValue, { color: c.red }]}>{(stats?.failedPerm ?? 0).toLocaleString()}</Text>
               <Text style={[styles.statLabel, { color: c.ink3 }]}>Failed</Text>
             </View>
@@ -281,8 +287,11 @@ export default function ThumbnailWorkerScreen() {
               {permFailures.map((failure, index) => (
                 <View key={failure.fileId}>
                   {index > 0 ? <View style={[styles.divider, { backgroundColor: c.line }]} /> : null}
-                  <View style={styles.failureRow}>
-                    <Text style={[styles.failureFileId, { color: c.ink3 }]} numberOfLines={1}>
+                  <View style={[styles.failureRow, accessibilityLayout && styles.failureRowAccessibility]}>
+                    <Text
+                      style={[styles.failureFileId, { color: c.ink3 }]}
+                      numberOfLines={accessibilityLayout ? undefined : 1}
+                    >
                       {failure.fileId.slice(0, 16)}…
                     </Text>
                     <TouchableOpacity
@@ -351,7 +360,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
   },
   iconButton: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
-  title: { fontSize: 18, fontWeight: '800' },
+  title: { flex: 1, fontSize: 18, fontWeight: '800', textAlign: 'center' },
   scroll: { flex: 1 },
   sectionTitle: {
     fontSize: 12,
@@ -368,6 +377,7 @@ const styles = StyleSheet.create({
     gap: 6,
     marginBottom: 10,
   },
+  bigNumbersAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   bigNumber: { fontSize: 36, fontWeight: '900' },
   bigNumberDivider: { fontSize: 28, fontWeight: '400' },
   bigTotal: { fontSize: 28, fontWeight: '400', flex: 1 },
@@ -376,9 +386,12 @@ const styles = StyleSheet.create({
   progressFill: { height: '100%', borderRadius: 999 },
   throughputLine: { fontSize: 12, lineHeight: 17, marginBottom: 4 },
   workerRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  workerRowAccessibility: { alignItems: 'flex-start' },
   slotBadge: {
-    width: 26,
-    height: 26,
+    minWidth: 26,
+    minHeight: 26,
+    paddingHorizontal: 5,
+    paddingVertical: 3,
     borderRadius: 6,
     alignItems: 'center',
     justifyContent: 'center',
@@ -388,11 +401,14 @@ const styles = StyleSheet.create({
   workerFileId: { fontSize: 13, fontWeight: '700' },
   workerStage: { fontSize: 11 },
   statGrid: { flexDirection: 'row', gap: 8 },
+  statGridAccessibility: { flexDirection: 'column' },
   statBox: { flex: 1, borderWidth: 1, borderRadius: 10, padding: 10 },
+  statBoxAccessibility: { flex: 0, width: '100%' },
   statValue: { fontSize: 20, fontWeight: '900' },
   statLabel: { fontSize: 11, fontWeight: '700', marginTop: 2 },
   divider: { height: StyleSheet.hairlineWidth, marginVertical: 4 },
   failureRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  failureRowAccessibility: { alignItems: 'stretch', flexDirection: 'column' },
   failureFileId: { flex: 1, fontSize: 12, fontFamily: 'JetBrainsMono-Regular' },
   retryButton: {
     paddingHorizontal: 12,
@@ -410,6 +426,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
   },
   primaryButtonText: { fontSize: 15, fontWeight: '900' },
   secondaryButton: {
@@ -418,6 +436,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
-  secondaryButtonText: { fontSize: 14, fontWeight: '700' },
+  secondaryButtonText: { fontSize: 14, fontWeight: '700', textAlign: 'center' },
 });

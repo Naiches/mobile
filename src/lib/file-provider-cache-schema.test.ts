@@ -14,7 +14,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -122,6 +122,7 @@ describe('task 1722 (f): the forced reset works on the database a fresh install 
     const vacuum = bracedBody(MODULE_SWIFT, 'private func vacuumRetryingOnceOnBusy(');
     const reset = bracedBody(MODULE_SWIFT, 'private func resetFileProviderCacheDatabase(at url: URL) -> Bool {');
     const dir = mkdtempSync(join(tmpdir(), 'bb-1722-schema-'));
+    try {
     const source = join(dir, 'main.swift');
     writeFileSync(source, `
 import Foundation
@@ -231,5 +232,8 @@ print("cache-schema harness: \\(count) cases passed")
       console.log(readFileSync(output, 'utf8'));
     }
     expect(readFileSync(output, 'utf8')).toContain('cache-schema harness: 10 cases passed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 150_000);
 });

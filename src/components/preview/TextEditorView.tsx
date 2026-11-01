@@ -55,6 +55,7 @@ import {
   TextInput,
   TextInputSelectionChangeEventData,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -189,6 +190,8 @@ export function TextEditorView({
   bottomInset = 0,
   topInset = 0,
 }: TextEditorViewProps) {
+  const { fontScale } = useWindowDimensions();
+  const scaledLineHeight = LINE_HEIGHT * fontScale;
   const isMarkdown = language === 'markdown';
   const [history, setHistory] = useState<EditorHistory>(() =>
     initHistory({ text: initialText, selection: { start: 0, end: 0 } }),
@@ -214,8 +217,13 @@ export function TextEditorView({
   const lines = useMemo(() => splitLogicalLines(history.present.text), [history.present.text]);
   const lineCount = lines.length;
   const [textWidth, setTextWidth] = useState(0);
-  const [wraps, setWraps] = useState<{ width: number; byText: ReadonlyMap<string, number> }>(() => ({
+  const [wraps, setWraps] = useState<{
+    width: number;
+    fontScale: number;
+    byText: ReadonlyMap<string, number>;
+  }>(() => ({
     width: 0,
+    fontScale: 0,
     byText: new Map(),
   }));
   // Measurements arrive as one native event per line; buffer them and apply
@@ -241,14 +249,18 @@ export function TextEditorView({
         pendingWraps.current = [];
         setWraps((prev) => {
           // A width change invalidates every cached count (rotation, split view).
-          let byText = prev.width === textWidth ? prev.byText : new Map<string, number>();
+          let byText = prev.width === textWidth && prev.fontScale === fontScale
+            ? prev.byText
+            : new Map<string, number>();
           for (const [t, w] of batch) byText = withWrapCount(byText, t, w);
           byText = retainWrapCounts(byText, measuredLinesRef.current);
-          return byText === prev.byText && prev.width === textWidth ? prev : { width: textWidth, byText };
+          return byText === prev.byText && prev.width === textWidth && prev.fontScale === fontScale
+            ? prev
+            : { width: textWidth, fontScale, byText };
         });
       });
     },
-    [textWidth],
+    [fontScale, textWidth],
   );
   const measuredLines = useMemo(
     () => (textWidth > 0 ? uniqueLinesToMeasure(lines, MAX_MEASURED_LINES) : []),
@@ -259,16 +271,22 @@ export function TextEditorView({
     () =>
       computeGutterLayout(
         lines,
-        wraps.width === textWidth ? wraps.byText : new Map<string, number>(),
-        LINE_HEIGHT,
+        wraps.width === textWidth && wraps.fontScale === fontScale
+          ? wraps.byText
+          : new Map<string, number>(),
+        scaledLineHeight,
       ),
-    [lines, wraps, textWidth],
+    [fontScale, lines, scaledLineHeight, wraps, textWidth],
   );
   const handleInputLayout = useCallback((e: LayoutChangeEvent) => {
     const w = Math.max(0, e.nativeEvent.layout.width - INPUT_PADDING_H * 2);
     setTextWidth((prev) => (prev === w ? prev : w));
   }, []);
   const totalDigits = Math.max(2, String(lineCount).length);
+  const gutterWidth = Math.max(
+    GUTTER_WIDTH * Math.max(1, fontScale),
+    (totalDigits + 1) * 7.2 * fontScale,
+  );
   const clampedGutterOffset = useMemo(
     () =>
       clampGutterOffset(
@@ -276,7 +294,7 @@ export function TextEditorView({
         // Visual rows, not logical lines: the TextInput's real scrollable
         // height includes every soft wrap (task 1578).
         gutterLayout.visualRowCount,
-        LINE_HEIGHT,
+        scaledLineHeight,
         contentPadding.paddingTop,
         contentPadding.paddingBottom,
         gutterViewportHeight,
@@ -284,6 +302,7 @@ export function TextEditorView({
     [
       gutterOffset,
       gutterLayout.visualRowCount,
+      scaledLineHeight,
       contentPadding.paddingTop,
       contentPadding.paddingBottom,
       gutterViewportHeight,
@@ -375,7 +394,10 @@ export function TextEditorView({
     >
       <View style={styles.body}>
         <View
-          style={[styles.gutterClip, { paddingTop: contentPadding.paddingTop }]}
+          style={[
+            styles.gutterClip,
+            { width: gutterWidth, paddingTop: contentPadding.paddingTop },
+          ]}
           pointerEvents="none"
           onLayout={(e) => {
             const h = e.nativeEvent.layout.height;
@@ -414,13 +436,13 @@ export function TextEditorView({
         />
         {textWidth > 0 && (
           <View
-            style={[styles.measureColumn, { width: textWidth }]}
+            style={[styles.measureColumn, { left: gutterWidth + INPUT_PADDING_H, width: textWidth }]}
             pointerEvents="none"
             accessibilityElementsHidden
             importantForAccessibility="no-hide-descendants"
           >
             {measuredLines.map((t) => (
-              <MeasureLine key={t} text={t} onWraps={handleWraps} />
+              <MeasureLine key={`${fontScale}:${t}`} text={t} onWraps={handleWraps} />
             ))}
           </View>
         )}
@@ -552,7 +574,7 @@ const styles = StyleSheet.create({
   },
   accKey: {
     minWidth: 36,
-    height: 32,
+    minHeight: 32,
     borderRadius: 6,
     backgroundColor: '#30363d',
     alignItems: 'center',

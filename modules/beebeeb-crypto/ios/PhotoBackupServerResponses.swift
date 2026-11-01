@@ -102,7 +102,7 @@ enum PhotoBackupServerResponses {
     /// 2xx: the server's map has the association.
     case marked
     /// 404 with the API's NotFound body: the file is gone or not this
-    /// account's. Nothing to map; done.
+    /// account's. Its exact manifest association must be requeued.
     case fileGone
     /// Anything else. Not recorded; retried later, kept through sign-out.
     case failed(statusCode: Int)
@@ -110,10 +110,14 @@ enum PhotoBackupServerResponses {
     /// Whether `server_marked_at` may be set for the row.
     var recordsServerMark: Bool {
       switch self {
-      case .marked, .fileGone: return true
-      case .failed: return false
+      case .marked: return true
+      case .fileGone, .failed: return false
       }
     }
+
+    /// The mark target vanished after upload completed. The mark request is
+    /// settled, but the photo itself must go back to the upload queue.
+    var requiresReupload: Bool { self == .fileGone }
   }
 
   static func markOutcome(statusCode: Int, contentType: String?, data: Data) -> MarkOutcome {
@@ -133,9 +137,8 @@ enum PhotoBackupServerResponses {
   enum ExistingUpload: Equatable {
     /// 2xx, `is_uploading` false, not in the Trash: the upload is complete.
     case complete
-    /// 2xx, `is_uploading` false, `is_trashed` true: complete, but the file
-    /// is in the Trash, so the photo is NOT backed up (server 2036, round 13
-    /// m4). The resolution and the flush neither promote nor mark it.
+    /// 2xx, `is_uploading` false, `is_trashed` true: the completed copy is
+    /// retained in Trash but does not count as backed up.
     case completeInTrash
     /// 2xx, `is_uploading` true: the upload never completed.
     case uploading
@@ -177,8 +180,11 @@ enum PhotoBackupServerResponses {
           let isTrashed = jsonBool(object["is_trashed"]) else {
       throw UnexpectedResponse(statusCode: statusCode, reason: "unexpected files/{id} body")
     }
-    if isUploading { return .uploading }
-    return isTrashed ? .completeInTrash : .complete
+    // Trash never counts as a live backup, even if a swept/abandoned upload
+    // row still says it is uploading. The caller restages under a new file id
+    // and leaves the old Trash copy untouched.
+    if isTrashed { return .completeInTrash }
+    return isUploading ? .uploading : .complete
   }
 
   /// A JSON `true` / `false` only (JSONSerialization also bridges the numbers

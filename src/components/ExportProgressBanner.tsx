@@ -1,5 +1,5 @@
 import React, { forwardRef, useImperativeHandle, useRef, useState } from 'react';
-import { View, Text, ActivityIndicator, StyleSheet } from 'react-native';
+import { View, Text, ActivityIndicator, StyleSheet, useWindowDimensions } from 'react-native';
 import type { PreviewLoadProgressEvent } from '../../modules/beebeeb-crypto';
 import { useTheme } from '../lib/theme-context';
 import { radii, spacing } from '../theme';
@@ -64,6 +64,8 @@ function ExportProgressBannerImpl(
   ref: React.Ref<ExportProgressBannerHandle>,
 ) {
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [progress, setProgressState] = useState<InternalProgress>(INITIAL);
 
   // Throttle bookkeeping lives in refs so it never triggers a render itself.
@@ -125,15 +127,29 @@ function ExportProgressBannerImpl(
 
   return (
     <View
-      style={[styles.banner, { backgroundColor: c.paper2, borderColor: c.line }]}
+      style={[
+        styles.banner,
+        accessibilityLayout && styles.bannerAccessibility,
+        { backgroundColor: c.paper2, borderColor: c.line },
+      ]}
       accessibilityLabel={`Exporting ${name}, ${detail}`}
     >
-      <ActivityIndicator size="small" color={c.amber} />
+      <ActivityIndicator
+        size="small"
+        color={c.amber}
+        style={accessibilityLayout && styles.indicatorAccessibility}
+      />
       <View style={styles.textCol}>
-        <Text style={[styles.name, { color: c.ink2 }]} numberOfLines={1}>
+        <Text
+          style={[styles.name, { color: c.ink2 }]}
+          numberOfLines={accessibilityLayout ? undefined : 1}
+        >
           Exporting {name}
         </Text>
-        <Text style={[styles.detail, { color: c.amberDeep }]} numberOfLines={1}>
+        <Text
+          style={[styles.detail, { color: c.amberDeep }]}
+          numberOfLines={accessibilityLayout ? undefined : 1}
+        >
           {detail}
         </Text>
       </View>
@@ -152,6 +168,12 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     borderWidth: 1,
     gap: 10,
+  },
+  bannerAccessibility: {
+    alignItems: 'flex-start',
+  },
+  indicatorAccessibility: {
+    marginTop: 2,
   },
   textCol: { flex: 1 },
   name: { fontSize: 13, fontWeight: '500' },

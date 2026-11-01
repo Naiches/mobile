@@ -8,6 +8,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
@@ -31,6 +32,8 @@ export default function TwoFactorChallengeScreen() {
   const { partialToken } = route.params;
   const { refreshAuth } = useAuth();
   const { colors: c, resolved } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [code, setCode] = useState('');
   const [useBackup, setUseBackup] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -92,17 +95,19 @@ export default function TwoFactorChallengeScreen() {
           marginTop: spacing.md,
         },
         input: {
-          height: 44,
+          minHeight: 44,
           borderWidth: 1,
           borderColor: c.line,
           borderRadius: radii.md,
           paddingHorizontal: spacing.md,
+          paddingVertical: spacing.sm,
           fontSize: 14,
           color: c.ink,
           backgroundColor: c.paper,
         },
         button: {
-          height: 44,
+          minHeight: 44,
+          paddingVertical: spacing.md,
           backgroundColor: c.ink,
           borderRadius: radii.md,
           alignItems: 'center',
@@ -112,6 +117,8 @@ export default function TwoFactorChallengeScreen() {
         buttonDisabled: { opacity: 0.6 },
         buttonText: { color: c.paper, fontSize: 14, fontWeight: '600' },
         footerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: spacing.lg },
+        footerRowAccessibility: { flexDirection: 'column', alignItems: 'stretch', gap: spacing.md },
+        footerButtonAccessibility: { minHeight: 44, justifyContent: 'center' },
         cancelLink: { fontSize: 13, color: c.ink3, fontWeight: '600' },
         footerLink: { fontSize: 13, color: c.amberDeep, fontWeight: '600' },
       }),
@@ -167,7 +174,7 @@ export default function TwoFactorChallengeScreen() {
       style={styles.root}
     >
       <ScrollView
-        contentContainerStyle={styles.scrollContent}
+        contentContainerStyle={[styles.scrollContent, accessibilityLayout && { justifyContent: 'flex-start' }]}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         showsVerticalScrollIndicator={false}
@@ -236,8 +243,9 @@ export default function TwoFactorChallengeScreen() {
             <Text style={styles.buttonText}>Verify</Text>
           )}
         </TouchableOpacity>
-        <View style={styles.footerRow}>
+        <View style={[styles.footerRow, accessibilityLayout && styles.footerRowAccessibility]}>
           <TouchableOpacity
+            style={accessibilityLayout && styles.footerButtonAccessibility}
             onPress={handleCancel}
             disabled={loading}
             accessibilityRole="button"
@@ -247,6 +255,7 @@ export default function TwoFactorChallengeScreen() {
             <Text style={styles.cancelLink}>Cancel</Text>
           </TouchableOpacity>
           <TouchableOpacity
+            style={accessibilityLayout && styles.footerButtonAccessibility}
             onPress={() => {
               setUseBackup(!useBackup);
               setCode('');

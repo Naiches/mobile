@@ -36,7 +36,6 @@ let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-\(UUID().uuidString)", isDirectory: true)
 let sqliteDir = root.appendingPathComponent("SQLite", isDirectory: true)
 try! fm.createDirectory(at: sqliteDir, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 let dbPath = sqliteDir.appendingPathComponent("beebeeb-backup.db").path
 
 // The engine's schema (NativeBackupEngine.ensureTables) — every column the
@@ -283,7 +282,7 @@ do {
          "acct-B's uploaded row is NOT 'already backed up' for acct-A")
   expect(text(db, "SELECT remote_file_id FROM backup_assets WHERE local_asset_id='b-up'") == nil,
          "acct-B's file id is dropped from acct-A's manifest")
-  expect(text(db, "SELECT status FROM backup_assets WHERE local_asset_id='b-del'") == "pending_upload",
+  expect(text(db, "SELECT status FROM backup_assets WHERE local_asset_id='b-del'") == "pending_reupload",
          "acct-B's remote_deleted row is re-queued for acct-A")
   expect(text(db, "SELECT status FROM backup_assets WHERE local_asset_id='b-staged'") == "uploading",
          "a staged row is left to purgeMismatchedStagedAssets")
@@ -295,6 +294,20 @@ do {
 
   let again: (adopted: Int, requeued: Int)? = BackupManifestStore.claim(db, accountId: "acct-A", nowMs: 2_000)
   expect(again?.adopted == 0 && again?.requeued == 0, "claim is idempotent")
+  exsqlite3_close_v2(db)
+}
+
+// Older builds marked a user-trashed backup `remote_deleted` and cleared its
+// file id. On upgrade, the account-bound claim must revive that local photo.
+do {
+  let db = newManifest("legacy-remote-deleted.db")
+  insert(db, "trashed-copy", status: "remote_deleted", owner: "acct-A")
+  let result = BackupManifestStore.claim(db, accountId: "acct-A", nowMs: 3_000)
+  expect(result?.requeued == 1, "legacy remote_deleted row is counted as requeued")
+  expect(text(db, "SELECT status FROM backup_assets WHERE local_asset_id='trashed-copy'") == "pending_reupload",
+         "legacy remote_deleted row enters the upload queue")
+  expect(BackupManifestStore.freshPendingIds(db)?.contains("trashed-copy") == true,
+         "legacy remote_deleted photo is visible to the next server check and drain")
   exsqlite3_close_v2(db)
 }
 
@@ -913,11 +926,49 @@ do {
 
 // MARK: - Report
 
+// MARK: - 13. A PhotoKit scope is exact and removals leave no queued work
+
+do {
+  let db = open(root.appendingPathComponent("photo-scope-removals.db").path)
+  exec(db, schema)
+  BackupManifestStore.migrate(db)
+  insert(db, "still-here", status: "pending_upload")
+  insert(db, "deleted-pending", status: "pending_upload")
+  insert(db, "deleted-staged", status: "staged_upload", staged: "file-staged")
+  insert(db, "deleted-uploaded", status: "uploaded", remote: "file-live", owner: "acct-A")
+
+  expect(BackupManifestStore.updateSelectionScope(
+    db,
+    allowedAssetIds: ["still-here"],
+    hasAlbumSelection: false
+  ), "r2-e02.1: a full-library scan applies its exact PhotoKit scope")
+  expect(text(db, "SELECT status FROM backup_assets WHERE local_asset_id = 'deleted-pending'") == "local_missing",
+         "r2-e02.2: a deleted pending photo leaves the queue")
+  expect(text(db, "SELECT status FROM backup_assets WHERE local_asset_id = 'deleted-staged'") == "local_missing",
+         "r2-e02.3: a deleted staged photo leaves the queue")
+  expect(scalar(db, "SELECT selected_for_backup FROM backup_assets WHERE local_asset_id = 'deleted-pending'") == 0,
+         "r2-e02.4: a deleted photo leaves visible counts")
+  expect(text(db, "SELECT status FROM backup_assets WHERE local_asset_id = 'deleted-uploaded'") == "uploaded",
+         "r2-e02.5: removing the local photo never deletes its backed-up copy")
+
+  expect(BackupManifestStore.markLocalAssetsMissing(
+    db,
+    localAssetIds: ["still-here"],
+    nowMs: now
+  ) == 1, "r2-e02.6: an incremental PhotoKit removal is recorded")
+  expect(text(db, "SELECT status FROM backup_assets WHERE local_asset_id = 'still-here'") == "local_missing",
+         "r2-e02.7: the incremental removal leaves no pending row")
+  exsqlite3_close_v2(db)
+}
+
+let exitCode: Int32
 if failures.isEmpty {
   print("BackupManifestStoreTests: \(total) assertions, 0 failed")
-  exit(0)
+  exitCode = 0
 } else {
   for f in failures { print("FAIL: \(f)") }
   print("BackupManifestStoreTests: \(failures.count) of \(total) assertions FAILED")
-  exit(1)
+  exitCode = 1
 }
+try? fm.removeItem(at: root)
+exit(exitCode)

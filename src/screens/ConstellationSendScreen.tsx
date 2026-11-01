@@ -26,9 +26,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
+  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
@@ -70,6 +72,8 @@ export default function ConstellationSendScreen() {
   const navigation = useNavigation<Nav>();
   const route = useRoute<RouteProps>();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const { fileId, fileName } = route.params;
 
   const [phase, setPhase] = useState<Phase>('initializing');
@@ -263,7 +267,11 @@ export default function ConstellationSendScreen() {
         />
       </View>
 
-      <View style={styles.footer}>
+      <ScrollView
+        style={[styles.footerScroll, accessibilityLayout && styles.footerScrollAccessibility]}
+        contentContainerStyle={styles.footer}
+        showsVerticalScrollIndicator={false}
+      >
         {phase === 'initializing' && (
           <Text style={styles.status}>Preparing transfer…</Text>
         )}
@@ -294,7 +302,7 @@ export default function ConstellationSendScreen() {
             </Text>
             <View style={styles.buttonRow}>
               <TouchableOpacity
-                style={styles.primaryButton}
+                style={[styles.primaryButton, accessibilityLayout && styles.buttonAccessibility]}
                 onPress={handleApprove}
                 activeOpacity={0.8}
                 accessibilityRole="button"
@@ -302,7 +310,7 @@ export default function ConstellationSendScreen() {
                 <Text style={styles.primaryButtonText}>Codes match — Send</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={styles.outlineButton}
+                style={[styles.outlineButton, accessibilityLayout && styles.buttonAccessibility]}
                 onPress={handleReject}
                 activeOpacity={0.7}
                 accessibilityRole="button"
@@ -327,7 +335,7 @@ export default function ConstellationSendScreen() {
               The other device has the file. Server copy is being deleted.
             </Text>
             <TouchableOpacity
-              style={styles.primaryButton}
+              style={[styles.primaryButton, accessibilityLayout && styles.buttonAccessibility]}
               onPress={handleClose}
               activeOpacity={0.8}
               accessibilityRole="button"
@@ -341,7 +349,7 @@ export default function ConstellationSendScreen() {
           <>
             <Text style={styles.title}>Transfer cancelled</Text>
             <TouchableOpacity
-              style={styles.outlineButton}
+              style={[styles.outlineButton, accessibilityLayout && styles.buttonAccessibility]}
               onPress={handleClose}
               activeOpacity={0.7}
               accessibilityRole="button"
@@ -356,7 +364,7 @@ export default function ConstellationSendScreen() {
             <Text style={styles.title}>Something went wrong</Text>
             <Text style={styles.status}>{errorText ?? 'Please try again.'}</Text>
             <TouchableOpacity
-              style={styles.outlineButton}
+              style={[styles.outlineButton, accessibilityLayout && styles.buttonAccessibility]}
               onPress={handleClose}
               activeOpacity={0.7}
               accessibilityRole="button"
@@ -365,7 +373,7 @@ export default function ConstellationSendScreen() {
             </TouchableOpacity>
           </>
         )}
-      </View>
+      </ScrollView>
     </View>
   );
 }
@@ -416,6 +424,13 @@ const styles = StyleSheet.create({
   },
   webviewContainer: {
     backgroundColor: darkColors.darkBg,
+  },
+  footerScroll: {
+    flexGrow: 0,
+    flexShrink: 1,
+  },
+  footerScrollAccessibility: {
+    maxHeight: '65%',
   },
   footer: {
     alignItems: 'center',
@@ -470,6 +485,7 @@ const styles = StyleSheet.create({
     color: darkColors.ink3,
     letterSpacing: 0.5,
     marginBottom: 4,
+    textAlign: 'center',
   },
   codeText: {
     fontSize: 28,
@@ -477,6 +493,7 @@ const styles = StyleSheet.create({
     color: darkColors.amber,
     fontFamily: fonts.mono,
     letterSpacing: 4,
+    textAlign: 'center',
   },
   disclaimer: {
     fontSize: 11,
@@ -512,6 +529,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: darkColors.black,
     letterSpacing: 0.5,
+    textAlign: 'center',
   },
   outlineButton: {
     paddingHorizontal: spacing.xl,
@@ -527,5 +545,10 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: darkColors.ink2,
     letterSpacing: 0.5,
+    textAlign: 'center',
+  },
+  buttonAccessibility: {
+    width: '100%',
+    minWidth: 0,
   },
 });

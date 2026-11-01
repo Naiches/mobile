@@ -31,6 +31,17 @@ import { ONBOARDING_SCHEMA_HEADER, isOnboardingErrorCode, sameOriginPath } from 
 import { describeApiEnvironment, type ApiEnvironment } from './api-environment';
 export type { ApiEnvironment, ApiEnvironmentKind } from './api-environment';
 import { normalizeNotificationPreferences, type NotificationPreferences } from './notification-prefs';
+import { normalizeCompletedUpload } from './upload-complete';
+import {
+  DEFAULT_SCREEN_REQUEST_TIMEOUT_MS,
+  fetchWithDeadline,
+  readResponseArrayBufferWithDeadline,
+  readResponseJsonWithDeadline,
+  RequestTimeoutError,
+  settleWithDeadline,
+  TRANSFER_REQUEST_TIMEOUT_MS,
+  UPLOAD_CONTROL_REQUEST_TIMEOUT_MS,
+} from './fetch-deadline';
 // Task 1594 fix 4: the unlocked key's owner, sent on authenticated mutations.
 import { expectedUserHeaders, isMutatingMethod } from './expected-user';
 // Task 1589 — recognizing a swept v2 upload session + the typed error for a
@@ -69,6 +80,7 @@ function resolveBaseUrl(): string {
 const BASE_URL = resolveBaseUrl();
 const TOKEN_KEY = 'beebeeb_session_token';
 const DEVICE_CONFIRMATION_SECRET_KEY = 'beebeeb_device_confirmation_secret';
+const SESSION_STORAGE_TIMEOUT_MS = 2_000;
 
 const MOBILE_IOS_BACKUP_CLIENT_SESSION_KEY = 'beebeeb_mobile_ios_backup_client_session_id';
 const MOBILE_IOS_BACKUP_SESSION_NAME = 'iPhone Camera Roll Backup';
@@ -110,21 +122,21 @@ const tokenStore = {
     if (Platform.OS === 'web') {
       return typeof window === 'undefined' ? null : window.localStorage.getItem(key);
     }
-    return SecureStore.getItemAsync(key);
+    return settleWithDeadline(() => SecureStore.getItemAsync(key), SESSION_STORAGE_TIMEOUT_MS);
   },
   async set(key: string, value: string): Promise<void> {
     if (Platform.OS === 'web') {
       if (typeof window !== 'undefined') window.localStorage.setItem(key, value);
       return;
     }
-    await SecureStore.setItemAsync(key, value);
+    await settleWithDeadline(() => SecureStore.setItemAsync(key, value), SESSION_STORAGE_TIMEOUT_MS);
   },
   async remove(key: string): Promise<void> {
     if (Platform.OS === 'web') {
       if (typeof window !== 'undefined') window.localStorage.removeItem(key);
       return;
     }
-    await SecureStore.deleteItemAsync(key);
+    await settleWithDeadline(() => SecureStore.deleteItemAsync(key), SESSION_STORAGE_TIMEOUT_MS);
   },
 };
 
@@ -320,6 +332,8 @@ export class ApiError extends Error {
      * other error.
      */
     public details?: { country?: string },
+    /** Parsed server error payload, retained for endpoints whose 409 is a partial result. */
+    public responseBody?: unknown,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -665,6 +679,20 @@ async function headers(auth = true, extra?: Record<string, string>): Promise<Req
   return { headers: h, authSnapshot };
 }
 
+async function boundedResponseJson<T>(
+  response: Response,
+  timeoutMs: number = DEFAULT_SCREEN_REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  try {
+    return await readResponseJsonWithDeadline<T>(response, timeoutMs);
+  } catch (error) {
+    if (error instanceof RequestTimeoutError) {
+      throw new ApiError(0, 'The server took too long to finish its response. Please try again.');
+    }
+    throw error;
+  }
+}
+
 // Writer-provenance (task 1436, the mobile half of 1392): the app version the
 // server records on every object_versions row it writes (server PR #23 / task
 // 1369). Uses the installed binary version, shared with
@@ -692,23 +720,31 @@ async function request<T>(
   body?: unknown,
   auth = true,
   extraHeaders?: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<T> {
   let res: Response;
   let authSnapshot: RequestAuthSnapshot | null = null;
   try {
-    const requestHeaders = await headers(auth, extraHeaders);
+    const requestHeaders = await settleWithDeadline(
+      () => headers(auth, extraHeaders),
+      DEFAULT_SCREEN_REQUEST_TIMEOUT_MS,
+    );
     authSnapshot = requestHeaders.authSnapshot;
     // Task 1594 fix 4 (server 1554): name the account the unlocked master key
     // belongs to on every authenticated MUTATION, so the server refuses (409
     // account_mismatch) a write whose session is not that account. Mutations
     // only, exactly like web (packages/shared/src/api/request.ts).
     if (auth && isMutatingMethod(method)) Object.assign(requestHeaders.headers, expectedUserHeaders());
-    res = await rateLimitedFetch(`${BASE_URL}${path}`, {
+    res = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}${path}`, {
       method,
       headers: requestHeaders.headers,
       body: body ? JSON.stringify(body) : undefined,
-    });
-  } catch (_err) {
+      signal,
+    }, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
+  } catch (err) {
+    if (err instanceof RequestTimeoutError) {
+      throw new ApiError(0, 'The server took too long to respond. Please try again.');
+    }
     throw new ApiError(0, 'Could not reach the server. Check your connection and try again.');
   }
 
@@ -730,7 +766,8 @@ async function request<T>(
   }
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
+    const err: Record<string, any> = await boundedResponseJson<Record<string, any>>(res)
+      .catch((): Record<string, any> => ({ error: res.statusText }));
 
     // 403 account_deleted (server task 1403): a typed body carrying both
     // retention dates, distinct from the generic 401 wrong-credentials path
@@ -795,6 +832,13 @@ async function request<T>(
         // Task 2237c L10/L11 (contract-2237-format-l7.md): the shared-folder key-write refusals.
         err.error === 'upgrade_required' ||
         err.error === 'invalid_format' ||
+        // Account deletion request: a missing 2FA code is its own screen state.
+        // (A wrong code, `invalid_totp_code`, stays code-less like the other 2FA screens: callers read the 400.)
+        err.error === 'totp_code_required' ||
+        err.error === 'deletion_needs_email_confirmation' ||
+        // Permanent-delete conflicts are actionable states in the Trash flow.
+        err.error === 'has_live_descendants' ||
+        err.error === 'not_trashed' ||
         // Task 2237c task 9: link creation branches on these (re-mint, re-register, the 20-links and nested lines).
         isFolderLinkServerCode(err.error)
         ? err.error
@@ -803,6 +847,7 @@ async function request<T>(
       undefined,
       undefined,
       strictRefusalDetails(res.status, err),
+      err,
     );
   }
 
@@ -823,7 +868,7 @@ async function request<T>(
   // don't reject on an empty res.json().
   if (res.status === 204) return undefined as T;
 
-  return res.json() as Promise<T>;
+  return boundedResponseJson<T>(res);
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,11 +1063,11 @@ export async function confirmAction(password: string): Promise<ConfirmActionResp
   //    expired session (the password is not proven until finish) → re-auth.
   let startRes: Response;
   try {
-    startRes = await rateLimitedFetch(`${BASE_URL}/api/v1/auth/confirm-opaque-start`, {
+    startRes = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/auth/confirm-opaque-start`, {
       method: 'POST',
       headers: authHeaders,
       body: JSON.stringify({ client_message: uint8ToBase64(loginStart.message) }),
-    });
+    }, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
   } catch (_err) {
     throw new ApiError(0, 'Could not reach the server. Check your connection and try again.');
   }
@@ -1031,7 +1076,8 @@ export async function confirmAction(password: string): Promise<ConfirmActionResp
   //    409 { opaque_unavailable: true }. Fall back to the plaintext path, which
   //    still works for these accounts (incl. the session-freshness fallback).
   if (startRes.status === 409) {
-    const body = (await startRes.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = await readResponseJsonWithDeadline<Record<string, unknown>>(startRes, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
+      .catch((): Record<string, unknown> => ({}));
     if (body.opaque_unavailable === true) {
       return confirmActionPlaintext(password, token);
     }
@@ -1057,20 +1103,19 @@ export async function confirmAction(password: string): Promise<ConfirmActionResp
   }
 
   if (!startRes.ok) {
-    const body = (await startRes
-      .json()
-      .catch(() => ({ error: startRes.statusText }))) as Record<string, unknown>;
+    const body = await readResponseJsonWithDeadline<Record<string, unknown>>(startRes, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
+      .catch((): Record<string, unknown> => ({ error: startRes.statusText }));
     throw new ApiError(
       startRes.status,
       (body.message ?? body.error ?? startRes.statusText) as string,
     );
   }
 
-  const startBody = (await startRes.json()) as {
+  const startBody = await readResponseJsonWithDeadline<{
     server_message: string;
     server_state: string;
     ksf_version: number;
-  };
+  }>(startRes, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
 
   // 4. OPAQUE login finish (native), threading the account's KSF version so the
   //    client stretches with the matching KSF (0 = legacy Identity, 1 = Argon2id
@@ -1096,14 +1141,14 @@ export async function confirmAction(password: string): Promise<ConfirmActionResp
   //    + the round-tripped server state. Direct fetch for the same reason as start.
   let finishRes: Response;
   try {
-    finishRes = await rateLimitedFetch(`${BASE_URL}/api/v1/auth/confirm-opaque-finish`, {
+    finishRes = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/auth/confirm-opaque-finish`, {
       method: 'POST',
       headers: authHeaders,
       body: JSON.stringify({
         client_message: uint8ToBase64(loginFinishMessage),
         server_state: startBody.server_state,
       }),
-    });
+    }, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
   } catch (_err) {
     throw new ApiError(0, 'Could not reach the server. Check your connection and try again.');
   }
@@ -1115,15 +1160,14 @@ export async function confirmAction(password: string): Promise<ConfirmActionResp
     throw new IncorrectPasswordError();
   }
   if (!finishRes.ok) {
-    const body = (await finishRes
-      .json()
-      .catch(() => ({ error: finishRes.statusText }))) as Record<string, unknown>;
+    const body = await readResponseJsonWithDeadline<Record<string, unknown>>(finishRes, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
+      .catch((): Record<string, unknown> => ({ error: finishRes.statusText }));
     throw new ApiError(
       finishRes.status,
       (body.message ?? body.error ?? finishRes.statusText) as string,
     );
   }
-  return finishRes.json() as Promise<ConfirmActionResponse>;
+  return readResponseJsonWithDeadline<ConfirmActionResponse>(finishRes, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
 }
 
 /**
@@ -1144,14 +1188,14 @@ async function confirmActionPlaintext(
 ): Promise<ConfirmActionResponse> {
   let res: Response;
   try {
-    res = await rateLimitedFetch(`${BASE_URL}/api/v1/auth/confirm`, {
+    res = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/auth/confirm`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({ password }),
-    });
+    }, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
   } catch (_err) {
     throw new ApiError(0, 'Could not reach the server. Check your connection and try again.');
   }
@@ -1161,7 +1205,8 @@ async function confirmActionPlaintext(
     //   - "session_too_old_for_confirmation": session is OK but older than the
     //     step-up freshness window — re-typing the password cannot fix it.
     //   - everything else: the password was wrong.
-    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = await readResponseJsonWithDeadline<Record<string, unknown>>(res, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
+      .catch((): Record<string, unknown> => ({}));
     if (body.error === 'session_too_old_for_confirmation') {
       throw new SessionTooOldForConfirmationError(
         (body.message as string | undefined) ?? undefined,
@@ -1170,13 +1215,14 @@ async function confirmActionPlaintext(
     throw new IncorrectPasswordError();
   }
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
+    const err: Record<string, any> = await boundedResponseJson<Record<string, any>>(res, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
+      .catch((): Record<string, any> => ({ error: res.statusText }));
     // Task 1540 continuation (PR #108): prefer the server's human-readable
     // `message` over the machine `error` code, same as request() (finding
     // 7) — this direct-fetch path had the two swapped.
     throw new ApiError(res.status, err.message ?? err.error ?? res.statusText);
   }
-  return res.json() as Promise<ConfirmActionResponse>;
+  return readResponseJsonWithDeadline<ConfirmActionResponse>(res, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
 }
 
 export type DeviceOwnerConfirmationMethod = 'biometric' | 'device_passcode' | 'device_owner';
@@ -1588,15 +1634,16 @@ async function putBinaryBytes(url: string, token: string | null, bytes: Uint8Arr
     }
   }
 
-  const res = await rateLimitedFetch(url, {
+  const res = await fetchWithDeadline(rateLimitedFetch, url, {
     method: 'PUT',
     headers,
     body: bytesToBlob(bytes),
-  });
+  }, TRANSFER_REQUEST_TIMEOUT_MS);
   return {
     ok: res.ok,
     status: res.status,
-    error: async () => res.json().catch(() => ({ error: res.statusText })),
+    error: async () => readResponseJsonWithDeadline<{ error?: string }>(res, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
+      .catch(() => ({ error: res.statusText })),
   };
 }
 
@@ -1667,14 +1714,15 @@ async function uploadFileSimple(
     const form = new FormData();
     form.append('metadata', JSON.stringify(metadata));
     form.append('chunk_0', fileBlob);
-    return rateLimitedFetch(`${BASE_URL}/api/v1/files/upload`, {
+    return fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/files/upload`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, ...expectedUserHeaders() },
       body: form,
-    });
+    }, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS);
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
+    const err = await boundedResponseJson<Record<string, any>>(res, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
+      .catch(() => ({ error: res.statusText }));
     // Task 1594 round 2 (F5) / round 3 (T5): route account_mismatch the same
     // as request(), guarded against a session that has since moved on.
     await throwUploadError(
@@ -1689,7 +1737,7 @@ async function uploadFileSimple(
   }
 
   onProgress?.({ phase: 'finalizing', chunksTotal: 1, chunksUploaded: 1, bytesTotal: fileBlob.size, bytesUploaded: fileBlob.size });
-  return res.json() as Promise<FileEntry>;
+  return boundedResponseJson<FileEntry>(res, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS);
 }
 
 /**
@@ -1880,7 +1928,7 @@ export async function uploadEncryptedChunked(params: {
   // ── Step 1: Init — register the file/upload session ────────────────────
   if (protocol === 'v1') {
     initialNameEncrypted = await resolveNameEncrypted(fileId)
-    const initRes = await rateLimitedFetch(`${BASE_URL}/api/v1/files/upload/init`, {
+    const initRes = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/files/upload/init`, {
       method: 'POST',
       // Writer-provenance headers (task 1436) — this call creates the
       // object_versions row the server records them on.
@@ -1898,16 +1946,17 @@ export async function uploadEncryptedChunked(params: {
         chunk_count: chunkCount,
         created_at: createdAt ?? null,
       }),
-    })
+    }, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
     if (!initRes.ok) {
-      const err = (await initRes.json().catch(() => ({ error: initRes.statusText }))) as { error?: string; message?: string }
+      const err = await boundedResponseJson<{ error?: string; message?: string }>(initRes, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
+        .catch(() => ({ error: initRes.statusText }))
       const refusal = firstInitRefusal(initRes.status, err)
       if (refusal) throw refusal
       // Task 1594 round 2 (F5) / round 3 (T5): route account_mismatch the
       // same as request(), guarded against a session that has since moved on.
       await throwUploadError(initRes.status, err, initRes.statusText, authSnapshot)
     }
-    const init = (await initRes.json()) as { file_id: string }
+    const init = await boundedResponseJson<{ file_id: string }>(initRes, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
     initCountry.note(init)
     // Task SF-0001 (2275 L13/A7): the v1 init also names the id it created —
     // it must be the one this client sent, never a substitute. On a mismatch
@@ -2006,7 +2055,11 @@ export async function uploadEncryptedChunked(params: {
       protocol,
     })
 
-    return finalizeUpload({ protocol, serverFileId, uploadSessionId, token, authSnapshot, resolveNameEncrypted, initialNameEncrypted, resumeKey, isMedia })
+    return finalizeUpload({
+      protocol, serverFileId, uploadSessionId, token, authSnapshot,
+      resolveNameEncrypted, initialNameEncrypted, resumeKey, isMedia,
+      plaintextSizeBytes, chunkCount, parentId, createdAt,
+    })
   }
 
   // Task 1589: a heartbeat while a v2 upload is active covers the GAP between
@@ -2097,6 +2150,10 @@ async function finalizeUpload(params: {
   resumeKey?: string
   /** The `is_media` this upload sent on init (absent → false, as sent). */
   isMedia?: boolean
+  plaintextSizeBytes: number
+  chunkCount: number
+  parentId?: string | null
+  createdAt?: string
 }): Promise<FileEntry> {
   const { protocol, serverFileId, uploadSessionId, token, authSnapshot, resolveNameEncrypted, initialNameEncrypted, resumeKey } = params
   // Task 1959 round 4: remember the classification this device sent, BEFORE
@@ -2107,13 +2164,14 @@ async function finalizeUpload(params: {
   const completePath = protocol === 'v2' && uploadSessionId
     ? `/api/v1/uploads/${uploadSessionId}/complete`
     : `/api/v1/files/${serverFileId}/upload/complete`
-  const completeRes = await rateLimitedFetch(`${BASE_URL}${completePath}`, {
+  const completeRes = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}${completePath}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, ...expectedUserHeaders(), 'Content-Type': 'application/json', ...(await uploadDeviceHeader()) },
     body: JSON.stringify({}),
-  })
+  }, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
   if (!completeRes.ok) {
-    const err = await completeRes.json().catch(() => ({ error: completeRes.statusText })) as { error?: string; message?: string }
+    const err = await boundedResponseJson<{ error?: string; message?: string }>(completeRes, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
+      .catch(() => ({ error: completeRes.statusText }))
     // Task 1589: the lease sweeper reclaimed this session between the last
     // chunk PUT and complete — signal the caller's re-init path instead of
     // surfacing a generic failure. v1 has no session/lease, so this only
@@ -2125,22 +2183,28 @@ async function finalizeUpload(params: {
     // as request(), guarded against a session that has since moved on.
     await throwUploadError(completeRes.status, err, 'Finalize failed', authSnapshot)
   }
-  const completed = await completeRes.json() as FileEntry
+  const completedPayload = await boundedResponseJson<Partial<FileEntry> & {
+    status?: string
+    already_completed?: boolean
+  }>(completeRes, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
   // Task SF-0001 (2275 L13/A7): the completion answer names the item it
   // finalized. It must be the id this client proposed — nothing is renamed,
   // published or treated as a destination under any other id. The server has
   // finished by now, so the sentence says so (mobile#259 review M6).
-  assertEchoedItemId(serverFileId, completed.id, 'completion')
+  assertEchoedItemId(serverFileId, completedPayload.id, 'completion')
   let shouldClearResumeState = true
+  let finalNameEncrypted = completedPayload.name_encrypted ?? initialNameEncrypted
   if (protocol === 'v2') {
-    const finalNameEncrypted = await resolveNameEncrypted(serverFileId)
-    if (finalNameEncrypted !== initialNameEncrypted) {
-      const patched = await patchCompletedUploadNameEncrypted(serverFileId, finalNameEncrypted)
-      if (patched) {
-        completed.name_encrypted = finalNameEncrypted
-      } else {
+    const resolvedFinalName = await resolveNameEncrypted(serverFileId)
+    if (resolvedFinalName !== initialNameEncrypted) {
+      const patched = await patchCompletedUploadNameEncrypted(serverFileId, resolvedFinalName)
+      if (!patched) {
         shouldClearResumeState = false
+      } else {
+        finalNameEncrypted = resolvedFinalName
       }
+    } else {
+      finalNameEncrypted = resolvedFinalName
     }
   }
   if (shouldClearResumeState) {
@@ -2149,7 +2213,14 @@ async function finalizeUpload(params: {
     // the row never offers a resume that has nothing to resume.
     forgetUploadResumeSoon(serverFileId)
   }
-  return completed
+  return normalizeCompletedUpload(completedPayload, {
+    id: serverFileId,
+    nameEncrypted: finalNameEncrypted,
+    sizeBytes: params.plaintextSizeBytes,
+    chunkCount: params.chunkCount,
+    parentId: params.parentId,
+    createdAt: params.createdAt,
+  })
 }
 
 /**
@@ -2376,7 +2447,9 @@ export async function uploadEncryptedFileNative(params: {
       protocol: 'v2',
     })
     return finalizeUpload({
-      protocol: 'v2', serverFileId, uploadSessionId, token, authSnapshot, resolveNameEncrypted, initialNameEncrypted, resumeKey, isMedia,
+      protocol: 'v2', serverFileId, uploadSessionId, token, authSnapshot,
+      resolveNameEncrypted, initialNameEncrypted, resumeKey, isMedia,
+      plaintextSizeBytes, chunkCount: plan.chunkCount, parentId, createdAt,
     })
   }
 
@@ -2554,11 +2627,11 @@ export function clampHeartbeatIntervalSecs(intervalSecs: number, leaseSeconds?: 
  * same as every other authenticated mutation.
  */
 async function sendUploadHeartbeat(uploadSessionId: string, token: string | null): Promise<void> {
-  const res = await rateLimitedFetch(`${BASE_URL}/api/v1/uploads/${uploadSessionId}/heartbeat`, {
+  const res = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/uploads/${uploadSessionId}/heartbeat`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, ...expectedUserHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify({}),
-  })
+  }, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
   if (!res.ok) {
     // Not thrown: a heartbeat is a best-effort renewal, not part of the
     // upload's own success/failure path (mirrors the desktop client's
@@ -2575,13 +2648,18 @@ async function sendUploadHeartbeat(uploadSessionId: string, token: string | null
  */
 function startUploadHeartbeatPulse(uploadSessionId: string, token: string | null, intervalSecs: number, leaseSeconds?: number): () => void {
   const intervalMs = clampHeartbeatIntervalSecs(intervalSecs, leaseSeconds) * 1000
+  let heartbeatInFlight = false
   const timer = setInterval(() => {
-    sendUploadHeartbeat(uploadSessionId, token).catch((err) => {
-      console.warn('[upload] heartbeat failed (best-effort)', {
-        uploadSessionId,
-        error: err instanceof Error ? err.message : String(err),
+    if (heartbeatInFlight) return
+    heartbeatInFlight = true
+    sendUploadHeartbeat(uploadSessionId, token)
+      .catch((err) => {
+        console.warn('[upload] heartbeat failed (best-effort)', {
+          uploadSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        })
       })
-    })
+      .finally(() => { heartbeatInFlight = false })
   }, intervalMs)
   return () => clearInterval(timer)
 }
@@ -2639,7 +2717,7 @@ async function initUploadV2(params: {
 }): Promise<UploadV2InitResponse | null> {
   const chunkSizeBytes = params.chunkSizeBytes ?? CHUNK_SIZE
   const chunkCount = params.chunkCount ?? Math.max(1, Math.ceil(params.fileSizeBytes / CHUNK_SIZE))
-  const res = await rateLimitedFetch(`${BASE_URL}/api/v1/uploads/init`, {
+  const res = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/uploads/init`, {
     method: 'POST',
     // Writer-provenance headers (task 1436) — this call creates the
     // object_versions row the server records them on.
@@ -2658,17 +2736,18 @@ async function initUploadV2(params: {
       created_at: params.createdAt ?? null,
       base_version_number: params.baseVersionNumber,
     }),
-  })
+  }, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
   if (res.status === 404 || res.status === 405) return null
   if (!res.ok) {
-    const err = (await res.json().catch(() => ({ error: res.statusText }))) as { error?: string; message?: string }
+    const err = await boundedResponseJson<{ error?: string; message?: string }>(res, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
+      .catch(() => ({ error: res.statusText }))
     const refusal = params.firstInit ? firstInitRefusal(res.status, err) : null
     if (refusal) throw refusal
     // Task 1594 round 2 (F5) / round 3 (T5): route account_mismatch the same
     // as request(), guarded against a session that has since moved on.
     await throwUploadError(res.status, err, res.statusText, params.authSnapshot)
   }
-  const data = await res.json() as UploadV2InitResponse
+  const data = await boundedResponseJson<UploadV2InitResponse>(res, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
   // Task SF-0001 (2275 L13/A7): when this client proposed an id, the answer
   // must name that same id. Checked here, at the wire, so every caller
   // (JS loop, native path, takeover re-init) is covered by construction. On a
@@ -3020,7 +3099,7 @@ async function uploadFileChunked(
   // Step 1: Init upload — server creates the file record
   // MIME type is encrypted inside name_encrypted; the server has no
   // plaintext mime_type column.
-  const initRes = await rateLimitedFetch(`${BASE_URL}/api/v1/files/upload/init`, {
+  const initRes = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/files/upload/init`, {
     method: 'POST',
     // Writer-provenance headers (task 1436) — this call creates the
     // object_versions row the server records them on.
@@ -3031,14 +3110,18 @@ async function uploadFileChunked(
       size_bytes: metadata.size_bytes,
       chunk_count: chunkCount,
     }),
-  });
+  }, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS);
   if (!initRes.ok) {
-    const err = await initRes.json().catch(() => ({ error: initRes.statusText }));
+    const err = await readResponseJsonWithDeadline<{ error?: string; message?: string }>(initRes, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
+      .catch(() => ({ error: initRes.statusText }));
     // Task 1594 round 2 (F5) / round 3 (T5): route account_mismatch the same
     // as request(), guarded against a session that has since moved on.
     await throwUploadError(initRes.status, err, initRes.statusText, authSnapshot);
   }
-  const { file_id } = (await initRes.json()) as { file_id: string; chunk_count: number };
+  const { file_id } = await readResponseJsonWithDeadline<{ file_id: string; chunk_count: number }>(
+    initRes,
+    UPLOAD_CONTROL_REQUEST_TIMEOUT_MS,
+  );
 
   // Step 2: Upload each chunk sequentially
   for (let i = 0; i < chunkCount; i++) {
@@ -3046,13 +3129,14 @@ async function uploadFileChunked(
     const end = Math.min(start + CHUNK_SIZE, totalSize);
     const chunk = fileBlob.slice(start, end);
 
-    const chunkRes = await rateLimitedFetch(`${BASE_URL}/api/v1/files/${file_id}/chunks/${i}`, {
+    const chunkRes = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/files/${file_id}/chunks/${i}`, {
       method: 'PUT',
       headers: { Authorization: `Bearer ${token}`, ...expectedUserHeaders(), 'Content-Type': 'application/octet-stream' },
       body: chunk,
-    });
+    }, TRANSFER_REQUEST_TIMEOUT_MS);
     if (!chunkRes.ok) {
-      const err = await chunkRes.json().catch(() => ({ error: chunkRes.statusText }));
+      const err = await readResponseJsonWithDeadline<{ error?: string; message?: string }>(chunkRes, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
+        .catch(() => ({ error: chunkRes.statusText }));
       // Task 1594 round 2 (F5) / round 3 (T5): see the sibling chunk-upload
       // path above.
       await throwUploadError(chunkRes.status, err, `Chunk ${i} upload failed`, authSnapshot);
@@ -3073,18 +3157,19 @@ async function uploadFileChunked(
   // Step 3: Complete upload — server finalizes the file
   onProgress?.({ phase: 'finalizing', chunksTotal: chunkCount, chunksUploaded: chunkCount, bytesTotal: totalSize, bytesUploaded: totalSize });
 
-  const completeRes = await rateLimitedFetch(`${BASE_URL}/api/v1/files/${file_id}/upload/complete`, {
+  const completeRes = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/files/${file_id}/upload/complete`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, ...expectedUserHeaders(), 'Content-Type': 'application/json', ...(await uploadDeviceHeader()) },
     body: JSON.stringify({}),
-  });
+  }, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS);
   if (!completeRes.ok) {
-    const err = await completeRes.json().catch(() => ({ error: completeRes.statusText }));
+    const err = await readResponseJsonWithDeadline<{ error?: string; message?: string }>(completeRes, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS)
+      .catch(() => ({ error: completeRes.statusText }));
     // Task 1594 round 2 (F5) / round 3 (T5): route account_mismatch the same
     // as request(), guarded against a session that has since moved on.
     await throwUploadError(completeRes.status, err, 'Failed to finalize upload', authSnapshot);
   }
-  return completeRes.json() as Promise<FileEntry>;
+  return readResponseJsonWithDeadline<FileEntry>(completeRes, UPLOAD_CONTROL_REQUEST_TIMEOUT_MS);
 }
 
 export type ThumbnailVariant = 'small' | 'medium' | 'large';
@@ -3141,8 +3226,15 @@ export async function deletePhotoPreview(fileId: string): Promise<void> {
  * DELETE /api/v1/files/previews: removes every stored preview of the account in one
  * call (the server emits a `file_update` per file). Returns how many were removed.
  */
-export async function deleteAllPhotoPreviews(): Promise<number> {
-  const res = await request<{ removed?: unknown }>('DELETE', '/api/v1/files/previews');
+export async function deleteAllPhotoPreviews(signal?: AbortSignal): Promise<number> {
+  const res = await request<{ removed?: unknown }>(
+    'DELETE',
+    '/api/v1/files/previews',
+    undefined,
+    true,
+    undefined,
+    signal,
+  );
   return typeof res?.removed === 'number' && Number.isFinite(res.removed) ? res.removed : 0;
 }
 
@@ -3168,27 +3260,26 @@ onAccountEpochAdvance(() => {
   photoPreviewSupport = null;
 });
 
-/** Cached per session; a transient failure answers false without caching. */
+/** Cached per session. Only a confirmed 404 answers false; transient failures stay retryable. */
 export async function serverSupportsPhotoPreviews(): Promise<boolean> {
   if (photoPreviewSupport !== null) return photoPreviewSupport;
-  try {
-    photoPreviewSupport = (await getPhotoPreviewSummary()) !== null;
-    return photoPreviewSupport;
-  } catch {
-    return false;
-  }
+  photoPreviewSupport = (await getPhotoPreviewSummary()) !== null;
+  return photoPreviewSupport;
 }
 
 /**
  * GET /api/v1/files/photo-backup/identifiers — task 0552.
- * Returns the full file_id → local_identifier map for the authenticated
- * user. The mobile client uses this to short-circuit thumbnail rendering
- * for camera-roll-backed photos.
+ * Returns this device's file_id → local_identifier map. The mobile client
+ * uses it to short-circuit thumbnail rendering for camera-roll-backed photos.
  */
 export async function fetchPhotoBackupIdentifierMap(): Promise<Record<string, string>> {
+  const deviceHeader = await deviceIdHeader(getDeviceId);
   const data = await request<{ identifiers?: Record<string, string> }>(
     'GET',
     '/api/v1/files/photo-backup/identifiers',
+    undefined,
+    true,
+    deviceHeader,
   );
   return data.identifiers ?? {};
 }
@@ -3219,9 +3310,9 @@ export async function photoBackupClearAssociation(fileId: string): Promise<void>
 
 export async function downloadFile(id: string): Promise<Response> {
   const token = await getToken();
-  const res = await rateLimitedFetch(`${BASE_URL}/api/v1/files/${id}/download`, {
+  const res = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/files/${id}/download`, {
     headers: { Authorization: `Bearer ${token}` },
-  });
+  }, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
   if (!res.ok) {
     throw new ApiError(res.status, 'Download failed');
   }
@@ -3236,6 +3327,8 @@ export interface BulkTrashResult {
   trashed: string[];
   already_trashed: string[];
   missing: string[];
+  /** Legacy per-item fallback only: requests that reached a real error. */
+  failed?: string[];
 }
 
 export async function trashFiles(ids: string[]): Promise<BulkTrashResult> {
@@ -3251,12 +3344,13 @@ export async function trashFiles(ids: string[]): Promise<BulkTrashResult> {
       // Legacy fallback: no bulk endpoint, so delete each file individually.
       // Reconcile per-item with allSettled — a single failure must not abandon
       // the rest of the batch (Promise.all) nor let us claim the whole batch was
-      // trashed. Report exactly which ids landed (trashed), which were already
-      // gone (404 -> missing, matching the bulk endpoint's contract), and which
-      // genuinely failed (also surfaced as missing so callers refresh/retry).
+      // trashed. Report exactly which ids landed, which were already gone
+      // (404 -> missing), and which genuinely failed so optimistic callers can
+      // put only the failed rows back.
       const settled = await Promise.allSettled(uniqueIds.map((id) => deleteFile(id)));
       const trashed: string[] = [];
       const missing: string[] = [];
+      const failed: string[] = [];
       const hardErrors: unknown[] = [];
       settled.forEach((outcome, i) => {
         const id = uniqueIds[i];
@@ -3265,7 +3359,7 @@ export async function trashFiles(ids: string[]): Promise<BulkTrashResult> {
         } else if (outcome.reason instanceof ApiError && outcome.reason.status === 404) {
           missing.push(id);
         } else {
-          missing.push(id);
+          failed.push(id);
           hardErrors.push(outcome.reason);
         }
       });
@@ -3274,7 +3368,7 @@ export async function trashFiles(ids: string[]): Promise<BulkTrashResult> {
       if (trashed.length === 0 && hardErrors.length === uniqueIds.length) {
         throw hardErrors[0];
       }
-      return { trashed, already_trashed: [], missing };
+      return { trashed, already_trashed: [], missing, failed };
     }
     throw err;
   }
@@ -3288,8 +3382,45 @@ export async function moveFile(fileId: string, newParentId: string | null): Prom
   await request('PATCH', `/api/v1/files/${fileId}`, { parent_id: newParentId });
 }
 
-export async function restoreFile(id: string): Promise<void> {
-  await request('POST', `/api/v1/files/${id}/restore`);
+interface RestoreFileResponse {
+  message?: string;
+  restored_count?: number;
+  remaining?: number;
+  complete?: boolean;
+  job_id?: string | null;
+  rehomed_to_root?: boolean;
+}
+
+interface RestoreFileResultBase {
+  restored_count: number;
+  rehomed_to_root: boolean;
+}
+
+export type RestoreFileResult =
+  | (RestoreFileResultBase & { complete: true; remaining: 0 })
+  | (RestoreFileResultBase & { complete: false; remaining: number; job_id: string | null });
+
+export async function restoreFile(id: string): Promise<RestoreFileResult> {
+  const result = await request<RestoreFileResponse>('POST', `/api/v1/files/${id}/restore`);
+  const restoredCount = typeof result.restored_count === 'number' ? result.restored_count : 0;
+  const remaining = typeof result.remaining === 'number' ? Math.max(0, result.remaining) : 0;
+  const rehomedToRoot = result.rehomed_to_root === true;
+  const stillRunning = result.complete === false || result.message === 'restoring' || remaining > 0;
+  if (stillRunning) {
+    return {
+      complete: false,
+      restored_count: restoredCount,
+      remaining,
+      job_id: typeof result.job_id === 'string' ? result.job_id : null,
+      rehomed_to_root: rehomedToRoot,
+    };
+  }
+  return {
+    complete: true,
+    restored_count: restoredCount,
+    remaining: 0,
+    rehomed_to_root: rehomedToRoot,
+  };
 }
 
 export async function permanentDeleteFile(id: string, confirmToken?: string): Promise<void> {
@@ -3300,6 +3431,88 @@ export async function permanentDeleteFile(id: string, confirmToken?: string): Pr
     true,
     confirmToken ? { 'X-Confirm-Token': confirmToken } : undefined,
   );
+}
+
+export const PERMANENT_DELETE_BATCH_LIMIT = 500;
+
+export interface PermanentDeleteRefusal {
+  id: string;
+  live_descendants?: number;
+  blocking_descendants?: number;
+}
+
+export interface BulkPermanentDeleteResult {
+  deleted: string[];
+  skipped_not_trashed: string[];
+  missing: string[];
+  refused: PermanentDeleteRefusal[];
+  cycles: string[];
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function idList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : [];
+}
+
+function normalizeBulkPermanentDeleteResult(value: unknown): BulkPermanentDeleteResult {
+  const body = recordValue(value) ?? {};
+  const refused = Array.isArray(body.refused)
+    ? body.refused.flatMap((value): PermanentDeleteRefusal[] => {
+        const row = recordValue(value);
+        if (!row || typeof row.id !== 'string') return [];
+        return [{
+          id: row.id,
+          ...(typeof row.live_descendants === 'number' ? { live_descendants: row.live_descendants } : {}),
+          ...(typeof row.blocking_descendants === 'number' ? { blocking_descendants: row.blocking_descendants } : {}),
+        }];
+      })
+    : [];
+  return {
+    deleted: idList(body.deleted),
+    skipped_not_trashed: idList(body.skipped_not_trashed),
+    missing: idList(body.missing),
+    refused,
+    cycles: idList(body.cycles),
+  };
+}
+
+function isBulkPermanentDeleteConflict(value: unknown): boolean {
+  const body = recordValue(value);
+  return body?.error === 'has_live_descendants' || body?.error === 'folder_cycle';
+}
+
+/** Permanently delete one production-sized batch with one single-use confirmation token. */
+export async function permanentDeleteFiles(
+  ids: readonly string[],
+  confirmToken: string,
+): Promise<BulkPermanentDeleteResult> {
+  const uniqueIds = [...new Set(ids)];
+  if (uniqueIds.length === 0) return normalizeBulkPermanentDeleteResult({});
+  if (uniqueIds.length > PERMANENT_DELETE_BATCH_LIMIT) {
+    throw new ApiError(400, `Permanent delete accepts at most ${PERMANENT_DELETE_BATCH_LIMIT} items at a time.`);
+  }
+  try {
+    const result = await request<unknown>(
+      'POST',
+      '/api/v1/files/permanent',
+      { ids: uniqueIds },
+      true,
+      { 'X-Confirm-Token': confirmToken },
+    );
+    return normalizeBulkPermanentDeleteResult(result);
+  } catch (error) {
+    // Production commits deletable rows before returning these typed 409s. Keep
+    // their per-item result sets so callers never put successfully deleted rows back.
+    if (error instanceof ApiError && error.status === 409 && isBulkPermanentDeleteConflict(error.responseBody)) {
+      return normalizeBulkPermanentDeleteResult(error.responseBody);
+    }
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3553,22 +3766,23 @@ function shareAuthErrorMessage(status: number, rawMessage: string): string {
 export async function verifySharePassphrase(token: string, passphrase: string): Promise<ShareInfo> {
   let res: Response;
   try {
-    res = await rateLimitedFetch(`${BASE_URL}/api/v1/shares/${token}/verify`, {
+    res = await fetchWithDeadline(rateLimitedFetch, `${BASE_URL}/api/v1/shares/${token}/verify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ passphrase }),
-    });
+    }, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
   } catch (_err) {
     throw new ApiError(0, 'Could not reach the server. Check your connection and try again.');
   }
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
+    const err: Record<string, any> = await readResponseJsonWithDeadline<Record<string, any>>(res, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
+      .catch((): Record<string, any> => ({ error: res.statusText }));
     // message-over-error precedence matches task 1540's convention (PR #108,
     // request()/downloadSharedFileBlob) — see the comment there.
     const raw = err.message ?? err.error ?? `Passphrase verification failed: ${res.status}`;
     throw new ApiError(res.status, shareAuthErrorMessage(res.status, raw));
   }
-  return res.json() as Promise<ShareInfo>;
+  return readResponseJsonWithDeadline<ShareInfo>(res, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
 }
 
 /**
@@ -3594,12 +3808,18 @@ export async function downloadSharedFileBlob(
 
   let res: Response;
   try {
-    res = await rateLimitedFetch(`${BASE_URL}/api/v1/shares/${token}/download`, { headers });
+    res = await fetchWithDeadline(
+      rateLimitedFetch,
+      `${BASE_URL}/api/v1/shares/${token}/download`,
+      { headers },
+      DEFAULT_SCREEN_REQUEST_TIMEOUT_MS,
+    );
   } catch (_err) {
     throw new ApiError(0, 'Could not reach the server. Check your connection and try again.');
   }
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
+    const err: Record<string, any> = await readResponseJsonWithDeadline<Record<string, any>>(res, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
+      .catch((): Record<string, any> => ({ error: res.statusText }));
     // Task 1540 continuation (PR #108): prefer the server's human-readable
     // `message` over the machine `error` code, same as request() (finding
     // 7) — this direct-fetch path had the two swapped. Task 1539 (finding
@@ -3610,7 +3830,7 @@ export async function downloadSharedFileBlob(
     throw new ApiError(res.status, shareAuthErrorMessage(res.status, raw));
   }
 
-  const arrayBuf = await res.arrayBuffer();
+  const arrayBuf = await readResponseArrayBufferWithDeadline(res, TRANSFER_REQUEST_TIMEOUT_MS);
   const encryptedBytes = new Uint8Array(arrayBuf);
 
   const parseHeaderInt = (name: string): number | null => {
@@ -3746,8 +3966,8 @@ export async function getPreferenceValueStrict(key: string): Promise<unknown> {
 }
 
 /** Like setPreference, but for keys whose server-side value is a JSON object. */
-export async function setPreferenceValue(key: string, value: unknown): Promise<void> {
-  await request('PUT', `/api/v1/preferences/${key}`, { value });
+export async function setPreferenceValue(key: string, value: unknown, signal?: AbortSignal): Promise<void> {
+  await request('PUT', `/api/v1/preferences/${key}`, { value }, true, undefined, signal);
 }
 
 // ---------------------------------------------------------------------------
@@ -4507,30 +4727,28 @@ export async function unfreezeAccount(): Promise<{ frozen: boolean }> {
   return request<{ frozen: boolean }>('POST', '/api/v1/me/unfreeze');
 }
 
-export interface DeleteAccountResponse {
-  message: string;
-  /** ISO-8601 timestamp — when the encrypted blobs are permanently shredded. */
-  shred_after: string;
+export interface DeleteAccountRequestResponse {
+  status: 'email_sent';
 }
 
 /**
- * DELETE /api/v1/auth/account — permanent, irreversible account deletion
- * (task 1399, App Review 5.1.1(v)). Mirrors the web client's
- * `deleteAccountPermanently` (`repos/web/src/lib/api.ts`) byte-for-byte:
- * the server requires the literal string `"DELETE"` as `confirmation` AND a
- * step-up `X-Confirm-Token` (see `confirmAction`/`requestConfirmation`) — a
- * request with either missing/wrong is rejected by the server (400/403)
- * before anything is mutated. Never send this without a confirmation token
- * from a caller-verified password.
+ * POST /api/v1/account/delete/request: starts account deletion by emailing a
+ * single-use confirm link (valid 1 hour). Nothing is deleted by this call; the
+ * account is deleted only when the owner opens the link and confirms on the
+ * page. Needs a step-up `X-Confirm-Token` (a verified password) and, when the
+ * account has 2FA, the current `totp_code` (or an unused recovery code).
+ *
+ * Deliberately no fallback to `DELETE /api/v1/auth/account`: on a server
+ * without this route (404) the caller shows an "update needed" message.
  */
-export async function deleteAccountPermanently(
-  confirmation: string,
+export async function requestAccountDeletion(
   confirmToken: string,
-): Promise<DeleteAccountResponse> {
-  return request<DeleteAccountResponse>(
-    'DELETE',
-    '/api/v1/auth/account',
-    { confirmation },
+  totpCode?: string,
+): Promise<DeleteAccountRequestResponse> {
+  return request<DeleteAccountRequestResponse>(
+    'POST',
+    '/api/v1/account/delete/request',
+    totpCode ? { totp_code: totpCode } : {},
     true,
     { 'X-Confirm-Token': confirmToken },
   );

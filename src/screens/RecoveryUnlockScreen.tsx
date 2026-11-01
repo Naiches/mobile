@@ -10,6 +10,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { CommonActions, useNavigation } from '@react-navigation/native';
@@ -51,6 +52,8 @@ export default function RecoveryUnlockScreen() {
   const { signOut } = useAuth();
   const crypto = useCrypto();
   const { colors: c, resolved } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   useKeyboardLayoutAnimation();
   const [phrase, setPhrase] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -115,7 +118,8 @@ export default function RecoveryUnlockScreen() {
     },
     counter: { marginTop: 8, fontSize: 12, color: c.ink4, textAlign: 'right' },
     button: {
-      height: 46,
+      minHeight: 46,
+      paddingVertical: spacing.md,
       backgroundColor: c.ink,
       borderRadius: radii.md,
       alignItems: 'center',
@@ -184,6 +188,7 @@ export default function RecoveryUnlockScreen() {
       <ScrollView
         contentContainerStyle={[
           styles.content,
+          accessibilityLayout && { justifyContent: 'flex-start' },
           { paddingTop: insets.top + 28, paddingBottom: insets.bottom + 28 },
         ]}
         keyboardShouldPersistTaps="handled"

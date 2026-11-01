@@ -44,6 +44,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -115,9 +116,10 @@ const layout = StyleSheet.create({
   copyButtonText: { fontSize: 14, fontWeight: '600' },
   instructionText: { fontSize: 13, lineHeight: 19, marginTop: 12 },
   otpRow: { flexDirection: 'row', justifyContent: 'center', gap: 8, marginTop: 8, marginBottom: 16 },
+  otpRowAccessibility: { flexWrap: 'wrap' },
   otpBox: {
     width: 44,
-    height: 52,
+    minHeight: 52,
     borderRadius: 8,
     borderWidth: 1.5,
     fontSize: 22,
@@ -141,6 +143,7 @@ const layout = StyleSheet.create({
   secondaryButtonText: { fontSize: 15, fontWeight: '600' },
   backupGrid: { gap: 8 },
   backupRow: { flexDirection: 'row', gap: 8 },
+  backupRowAccessibility: { flexDirection: 'column' },
   backupCode: {
     flex: 1,
     borderRadius: 8,
@@ -159,7 +162,7 @@ const layout = StyleSheet.create({
     marginBottom: 20,
   },
   stepDot: { width: 6, height: 6, borderRadius: 3 },
-  statusRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
+  statusRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 4 },
   statusPill: {
     paddingHorizontal: 10,
     paddingVertical: 4,
@@ -564,7 +567,7 @@ function StepSecret({
           Set up authenticator
         </Text>
         <Text style={[layout.subtitle, { color: c.ink3, fontFamily: fonts.sans }]}>
-          Open Google Authenticator, Authy, or 1Password and scan or enter this key.
+          Use an authenticator app such as 2FAS or Proton Authenticator, then scan or enter this key.
         </Text>
       </View>
 
@@ -602,6 +605,8 @@ function StepVerify({
   onVerifyingChange: (verifying: boolean) => void;
   c: C;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [digits, setDigits] = useState<string[]>(['', '', '', '', '', '']);
   const [loading, setLoading] = useState(false);
   const inputRefs = useRef<(TextInput | null)[]>([]);
@@ -662,13 +667,18 @@ function StepVerify({
       </View>
 
       <View style={layout.section}>
-        <View style={layout.otpRow}>
+        <View style={[layout.otpRow, accessibilityLayout && layout.otpRowAccessibility]}>
           {digits.map((digit, i) => (
             <TextInput
               key={i}
               ref={ref => { inputRefs.current[i] = ref; }}
               style={[
                 layout.otpBox,
+                accessibilityLayout && {
+                  width: 64,
+                  minHeight: 64,
+                  paddingVertical: 10,
+                },
                 {
                   color: c.ink,
                   borderColor: digit ? c.amber : c.line,
@@ -712,6 +722,8 @@ function StepBackupCodes({
   c: C;
 }) {
   const { showToast } = useToast();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const handleCopyAll = useCallback(async () => {
     await Clipboard.setStringAsync(codes.join('\n'));
     showToast({ type: 'success', message: 'All backup codes copied to clipboard.' });
@@ -740,7 +752,7 @@ function StepBackupCodes({
       <View style={[layout.section, layout.card, { backgroundColor: c.paper2, borderColor: c.line }]}>
         <View style={layout.backupGrid}>
           {pairs.map((pair, rowIndex) => (
-            <View key={rowIndex} style={layout.backupRow}>
+            <View key={rowIndex} style={[layout.backupRow, accessibilityLayout && layout.backupRowAccessibility]}>
               {pair.map((code, colIndex) => (
                 <Text
                   key={colIndex}

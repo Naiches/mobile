@@ -32,6 +32,7 @@ mock.module('react-native', () => ({
   StyleSheet: { create: (s: unknown) => s },
   Alert,
   Platform: { OS: 'ios' },
+  useWindowDimensions: () => ({ width: 390, height: 844, fontScale: 1, scale: 3 }),
 }));
 
 mock.module('@expo/vector-icons', () => ({

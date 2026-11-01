@@ -16,7 +16,7 @@
  */
 
 import React from 'react';
-import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { StyleSheet, Text, TouchableOpacity, useWindowDimensions } from 'react-native';
 import type { StyleProp, ViewStyle } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { GlassCapsule, PREVIEW_CHROME_MATERIAL, type GlassScheme } from '../glass';
@@ -54,20 +54,26 @@ interface PreviewBottomBarProps {
 export function PreviewBottomBar({ scheme, actions, style }: PreviewBottomBarProps) {
   const iconColor = PREVIEW_CHROME_MATERIAL.label;
   const labelColor = PREVIEW_CHROME_MATERIAL.labelMuted;
+  const { fontScale } = useWindowDimensions();
+  const usesTwoRows = fontScale >= 1.35;
 
   return (
     <GlassCapsule
       scheme={scheme}
       materialOverride={PREVIEW_CHROME_MATERIAL}
       style={[styles.bar, style]}
-      contentStyle={styles.barContent}
+      contentStyle={[styles.barContent, usesTwoRows && styles.barContentLargeText]}
     >
       {actions.map((action) => (
         <TouchableOpacity
           key={action.key}
           onPress={action.onPress}
           disabled={action.disabled}
-          style={[styles.item, action.disabled && styles.itemDisabled]}
+          style={[
+            styles.item,
+            usesTwoRows && styles.itemLargeText,
+            action.disabled && styles.itemDisabled,
+          ]}
           hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
           accessibilityRole="button"
           accessibilityLabel={action.label}
@@ -80,7 +86,7 @@ export function PreviewBottomBar({ scheme, actions, style }: PreviewBottomBarPro
               action.active && styles.labelActive,
               !action.active ? { color: labelColor } : undefined,
             ]}
-            numberOfLines={1}
+            numberOfLines={usesTwoRows ? 2 : 1}
           >
             {action.label}
           </Text>
@@ -101,11 +107,23 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 4,
   },
+  barContentLargeText: {
+    flexWrap: 'wrap',
+  },
   item: {
     alignItems: 'center',
     gap: 3,
     minWidth: 56,
     paddingVertical: 2,
+  },
+  itemLargeText: {
+    width: '50%',
+    minWidth: 0,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
   },
   itemDisabled: {
     opacity: 0.4,
@@ -113,6 +131,8 @@ const styles = StyleSheet.create({
   label: {
     fontSize: 10.5,
     fontWeight: '600',
+    flexShrink: 1,
+    textAlign: 'center',
   },
   labelActive: {
     color: '#F5B800',

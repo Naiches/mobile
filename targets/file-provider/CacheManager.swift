@@ -153,7 +153,12 @@ final class CacheManager {
   /// Returns whether the write actually happened, so the caller can decide
   /// whether to also update its `sync_state` anchor.
   @discardableResult
-  func replaceChildren(parent: String?, with items: [CachedItem], expectedEpoch: Int) -> Bool {
+  func replaceChildren(
+    parent: String?,
+    with items: [CachedItem],
+    expectedEpoch: Int,
+    pruningNamespacePrefix: String? = nil
+  ) -> Bool {
     queue.sync {
       guard beginImmediate() else { return false }
       guard currentEpochMatches(expectedEpoch) else {
@@ -162,6 +167,9 @@ final class CacheManager {
       }
       _deleteChildren(parent: parent, keepingIds: Set(items.map(\.id)))
       for item in items { _upsert(item) }
+      if let pruningNamespacePrefix, let parent {
+        _pruneNamespace(pruningNamespacePrefix, reachableFrom: parent)
+      }
       return commitOrRollback()
     }
   }
@@ -565,6 +573,31 @@ final class CacheManager {
         bindText(stmt, index, id)
         index += 1
       }
+    }
+  }
+
+  /// Remove namespaced descendants that can no longer be reached from their
+  /// synthetic root. A root refresh is the only reliable time to learn that a
+  /// trashed folder was restored or purged; without this, names cached below
+  /// that folder survive indefinitely even though the folder itself is gone.
+  private func _pruneNamespace(_ prefix: String, reachableFrom root: String) {
+    executeBindable(
+      """
+      WITH RECURSIVE reachable(id) AS (
+        SELECT id FROM file_cache WHERE parent_id = ?
+        UNION
+        SELECT child.id
+          FROM file_cache AS child
+          JOIN reachable AS parent ON child.parent_id = parent.id
+      )
+      DELETE FROM file_cache
+       WHERE substr(id, 1, ?) = ?
+         AND id NOT IN (SELECT id FROM reachable)
+      """
+    ) { stmt in
+      bindText(stmt, 1, root)
+      sqlite3_bind_int(stmt, 2, Int32(prefix.count))
+      bindText(stmt, 3, prefix)
     }
   }
 

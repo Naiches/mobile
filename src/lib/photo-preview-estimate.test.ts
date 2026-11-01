@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { describe, expect, test } from 'bun:test';
-import { estimateTotals, pickSampleIds } from './photo-preview-estimate';
+import { estimateTotals, immediatePreviewEstimate, pickSampleIds } from './photo-preview-estimate';
 
 function seeded(seed: number): () => number {
   let s = seed;
@@ -80,6 +80,27 @@ describe('estimateTotals', () => {
 
   test('zero limit fits nothing', () => {
     expect(estimateTotals(1 * MB, 10, 0)).toEqual({ totalBytes: 10 * MB, fitsAll: false, fitCount: 0 });
+  });
+});
+
+describe('immediatePreviewEstimate', () => {
+  test('changes immediately for every format and size', () => {
+    expect(immediatePreviewEstimate('heic', 1280, [])).toEqual({ avgBytes: 220_000, sampled: 0, basis: 'typical' });
+    expect(immediatePreviewEstimate('heic', 3840, []).avgBytes).toBeGreaterThan(
+      immediatePreviewEstimate('heic', 1280, []).avgBytes,
+    );
+    expect(immediatePreviewEstimate('jpeg', 2560, []).avgBytes).toBeGreaterThan(
+      immediatePreviewEstimate('heic', 2560, []).avgBytes,
+    );
+  });
+
+  test('uses matching locally known variants when available', () => {
+    expect(immediatePreviewEstimate('jpeg', 1920, [
+      { preview_format: 'jpeg', preview_px: 1920, preview_bytes: 500_000 },
+      { preview_format: 'jpeg', preview_px: 1920, preview_bytes: 700_000 },
+      { preview_format: 'heic', preview_px: 1920, preview_bytes: 20 },
+      { preview_format: 'jpeg', preview_px: 1920, preview_bytes: null },
+    ])).toEqual({ avgBytes: 600_000, sampled: 2, basis: 'known-previews' });
   });
 });
 

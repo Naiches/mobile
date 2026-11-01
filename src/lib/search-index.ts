@@ -18,6 +18,12 @@ import { getApiUrl, getToken, captureRequestAuthSnapshot, endSessionForAccountMi
 import { rateLimitedFetch } from './rate-limited-fetch'
 import { withServerBusyRetry } from './server-busy-retry'
 import { expectedUserHeaders } from './expected-user'
+import {
+  DEFAULT_SCREEN_REQUEST_TIMEOUT_MS,
+  fetchWithDeadline,
+  readResponseArrayBufferWithDeadline,
+  readResponseJsonWithDeadline,
+} from './fetch-deadline'
 
 export interface SearchIndexEntry {
   name: string
@@ -118,13 +124,13 @@ export async function fetchIndex(indexKey: Uint8Array): Promise<SearchIndex | nu
   const token = await getToken()
   if (!token) return null
 
-  const res = await rateLimitedFetch(`${getApiUrl()}/api/v1/index`, {
+  const res = await fetchWithDeadline(rateLimitedFetch, `${getApiUrl()}/api/v1/index`, {
     headers: { Authorization: `Bearer ${token}` },
-  })
+  }, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
   if (res.status === 404) return null
   if (!res.ok) return null
 
-  const blob = new Uint8Array(await (await res.blob()).arrayBuffer())
+  const blob = new Uint8Array(await readResponseArrayBufferWithDeadline(res, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS))
   return decryptIndex(blob, indexKey)
 }
 
@@ -164,11 +170,11 @@ export async function saveIndex(
   // budget answers 429 server_busy — wait Retry-After and re-send (<= 3 times).
   // A non-OK final answer still collapses to `null` below, as before.
   const res = await withServerBusyRetry(() =>
-    rateLimitedFetch(`${getApiUrl()}/api/v1/index`, {
+    fetchWithDeadline(rateLimitedFetch, `${getApiUrl()}/api/v1/index`, {
       method: 'PUT',
       headers,
       body: encrypted as unknown as BodyInit,
-    }),
+    }, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS),
     undefined,
     isLatestSave,
   )
@@ -182,7 +188,8 @@ export async function saveIndex(
     // session mismatch here must not leave the user silently signed in with
     // index persistence quietly broken.
     if (res.status === 409) {
-      const body = (await res.json().catch(() => ({}))) as { error?: string }
+      const body: { error?: string } = await readResponseJsonWithDeadline<{ error?: string }>(res, DEFAULT_SCREEN_REQUEST_TIMEOUT_MS)
+        .catch((): { error?: string } => ({}))
       if (body.error === 'account_mismatch') {
         await endSessionForAccountMismatch(authSnapshot)
       }
@@ -201,10 +208,25 @@ export function updateIndexEntry(
   fileId: string,
   entry: SearchIndexEntry,
 ): SearchIndex {
+  return updateIndexEntries(index, [[fileId, entry]]);
+}
+
+/** Apply a decrypted batch with one index clone, rather than one clone per row. */
+export function updateIndexEntries(
+  index: SearchIndex,
+  entries: Iterable<readonly [string, SearchIndexEntry]>,
+): SearchIndex {
+  const files = { ...index.files };
+  let changed = false;
+  for (const [fileId, entry] of entries) {
+    files[fileId] = entry;
+    changed = true;
+  }
+  if (!changed) return index;
   return {
     ...index,
     updated_at: new Date().toISOString(),
-    files: { ...index.files, [fileId]: entry },
+    files,
   }
 }
 

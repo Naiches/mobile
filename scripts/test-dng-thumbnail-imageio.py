@@ -282,11 +282,15 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix='beebeeb-dng-imageio-') as tmpdir:
       temp_path = Path(tmpdir) / 'GeneratedDngImageIOHarness.swift'
+      tool_tmp = Path(tmpdir) / 'tool-tmp'
+      tool_tmp.mkdir()
       temp_path.write_text(program)
       command = ['swift', str(temp_path), str(fixture_path)]
       if args.mutate_no_max_pixel_size:
         command.append('--mutate-no-max-pixel-size')
-      result = subprocess.run(command, text=True, capture_output=True)
+      child_env = os.environ.copy()
+      child_env['TMPDIR'] = f'{tool_tmp}{os.sep}'
+      result = subprocess.run(command, text=True, capture_output=True, env=child_env)
       if args.keep_temp:
         kept = repo_root / '.tmp-generated-dng-imageio-harness.swift'
         kept.write_text(program)

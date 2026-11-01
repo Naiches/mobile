@@ -1,5 +1,5 @@
 import { appVersion } from '../lib/app-version';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ActionSheetIOS,
   ActivityIndicator,
@@ -42,7 +42,7 @@ try { Notifications = require('expo-notifications'); } catch {}
 try { MediaLibrary = require('expo-media-library/legacy'); } catch {}
 try { Contacts = require('expo-contacts'); } catch {}
 try { Calendar = require('expo-calendar'); } catch {}
-import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation, useRoute, type RouteProp } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { fonts, spacing, surfacesFor, typeScale, type Colors } from '../theme';
@@ -57,6 +57,8 @@ import { useToast } from '../lib/toast-context';
 import { useNetworkStatus } from '../lib/useNetworkStatus';
 import { recordRuntimeTrace } from '../lib/runtime-trace';
 import { ensureCalendarPermission } from '../lib/calendar-permissions';
+import { ensureContactsPermission } from '../lib/contacts-permissions';
+import { deriveCategoryBackupStatus, type CategoryKind, type CategoryRowStatus } from '../lib/category-backup-status';
 import {
   ensurePhotoPermission,
   getPhotoPermission,
@@ -122,45 +124,37 @@ import {
   type BackupCategory,
   type DeviceManifest,
 } from '../services/BackupService';
-import type { RootStackParamList } from '../App';
+import type { RootStackParamList, TabParamList } from '../App';
 import { NativeSwitch } from '../components/NativeSwitch';
 import DevicesSection from '../components/settings/DevicesSection';
 import { SETTINGS_CATEGORIES, SettingsCategory, SettingsCategoryList, type SettingsCategoryId } from '../components/settings/SettingsCategories';
 import { useSettingsAttention } from '../lib/settings-attention-context';
 import SettingsDiagnostics from '../components/settings/SettingsDiagnostics';
 import { markUnlocked } from '../lib/lock-state';
+import { requestDeviceOwnerAuth } from '../lib/device-owner-auth';
+import {
+  APP_LOCK_DELAY_OPTIONS,
+  APP_LOCK_DELAY_KEY,
+  APP_LOCK_PREF_KEY,
+  DEFAULT_LOCK_DELAY_MS,
+  isAppLockEnabled,
+  parseLockDelayMs,
+  lockDelayLabel,
+  settingChangeNeedsAuth,
+} from '../lib/app-lock-policy';
 import { populateFileProviderCache, registerTrustedFileProviderDomain, resetTrustedFileProviderDomain } from '../lib/file-provider-mount';
 import { setFilesMountedByUser } from '../lib/files-mount-default';
-import { NOTIFICATIONS_OPT_OUT_KEY, registerForPushNotifications, unregisterPushToken } from '../lib/push-notifications';
+import { enablePushNotifications, NOTIFICATIONS_OPT_OUT_KEY, unregisterPushToken } from '../lib/push-notifications';
 import * as BeebeebCrypto from '../../modules/beebeeb-crypto';
 import { DEFAULT_NOTIFICATION_PREFERENCES } from '../lib/notification-prefs';
+import { FinishSetupCard } from '../components/first-run/FinishSetupCard';
+import { useFirstRunSetup } from '../lib/first-run-context';
+import { useCoachMarks } from '../lib/coach-marks-context';
 
-const BIOMETRIC_PREF_KEY = 'beebeeb_biometric_lock';
-const BIOMETRIC_DELAY_KEY = 'beebeeb_biometric_delay';
-const CONTACTS_LAST_SCAN_KEY = 'beebeeb_contacts_last_scan_at';
-const CALENDAR_LAST_SCAN_KEY = 'beebeeb_calendar_last_scan_at';
-const CONTACTS_LAST_SCAN_COUNT_KEY = 'beebeeb_contacts_last_scan_count';
-const CALENDAR_LAST_SCAN_COUNT_KEY = 'beebeeb_calendar_last_scan_count';
 // User-level override on top of the OS permission. If the user explicitly
 // toggles notifications OFF in our settings, we honour that even when iOS
 // still has permission granted — the OS permission is the *ceiling*, this
 // pref is the user's current intent within that ceiling.
-interface BiometricDelayOption {
-  label: string;
-  ms: number;
-}
-const BIOMETRIC_DELAY_OPTIONS: BiometricDelayOption[] = [
-  { label: 'Immediately', ms: 0 },
-  { label: '1 minute', ms: 60_000 },
-  { label: '5 minutes', ms: 300_000 },
-  { label: '15 minutes', ms: 900_000 },
-  { label: '1 hour', ms: 3_600_000 },
-];
-
-function biometricDelayLabel(ms: number): string {
-  return BIOMETRIC_DELAY_OPTIONS.find((o) => o.ms === ms)?.label ?? 'Immediately';
-}
-
 function regionDisplayName(region: string): string {
   if (region.toLowerCase() === 'europe') return 'Europe';
   return region;
@@ -181,11 +175,6 @@ function withTimeout<T>(promise: Promise<T>, fallback: T, timeoutMs: number): Pr
 }
 
 type C = Colors;
-
-interface NativePermissionResponse {
-  status?: string;
-  granted?: boolean;
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -218,22 +207,6 @@ function timeAgo(iso: string): string {
 }
 
 
-function permissionGranted(permission: NativePermissionResponse | null | undefined): boolean {
-  return permission?.granted === true || permission?.status === 'granted';
-}
-
-async function ensureContactsPermission(): Promise<boolean> {
-  const current = typeof Contacts.getPermissionsAsync === 'function'
-    ? await Contacts.getPermissionsAsync()
-    : null;
-  if (permissionGranted(current)) return true;
-
-  const requested = typeof Contacts.requestPermissionsAsync === 'function'
-    ? await Contacts.requestPermissionsAsync()
-    : null;
-  return permissionGranted(requested);
-}
-
 // ---------------------------------------------------------------------------
 // Static layout styles (no colors — shared regardless of theme)
 // ---------------------------------------------------------------------------
@@ -244,6 +217,7 @@ const layout = StyleSheet.create({
   scrollContent: { paddingHorizontal: 16 },
   floatingTitle: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 },
   section: { marginBottom: 14 },
+  setupAgainRow: { minHeight: 48, marginTop: 10, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', gap: 10 },
   // 1314 — grouped-inset: an opaque cell, not an outlined box.
   card: { borderRadius: 26, overflow: 'hidden' },
   row: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 16, minHeight: 46 },
@@ -302,6 +276,8 @@ function SettingsRow({
   icon?: IoniconName;
   c: C;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const handlePress = onPress
     ? () => {
         recordRuntimeTrace('settings.row.press', { label, value, danger: danger === true });
@@ -316,7 +292,14 @@ function SettingsRow({
 
   return (
     <TouchableOpacity
-      style={layout.row}
+      style={[
+        layout.row,
+        accessibilityLayout && {
+          alignItems: 'flex-start',
+          flexWrap: 'wrap',
+          minHeight: Math.ceil(40 * Math.min(fontScale, 2)),
+        },
+      ]}
       activeOpacity={onPress ? 0.6 : 1}
       onPress={handlePress}
       disabled={!onPress}
@@ -329,14 +312,21 @@ function SettingsRow({
           name={icon}
           size={18}
           color={danger ? c.red : c.ink3}
-          style={{ marginRight: 12, width: 20 }}
+          style={{ marginRight: 12, width: 20, marginTop: accessibilityLayout ? 3 : 0 }}
         />
       )}
       {/* 1314 — canvas grouped-inset rows are 17pt, not 14. */}
-      <Text style={[typeScale.body, { flex: 1, color: danger ? c.red : c.ink }]}>
+      <Text style={[
+        typeScale.body,
+        { flex: 1, color: danger ? c.red : c.ink },
+        accessibilityLayout && { flexBasis: icon ? '75%' : '100%' },
+      ]}>
         {label}
       </Text>
-      <View style={layout.rowRight}>
+      <View style={[
+        layout.rowRight,
+        accessibilityLayout && { width: '100%', paddingLeft: icon ? 32 : 0, flexWrap: 'wrap', justifyContent: 'flex-start' },
+      ]}>
         {badge != null && (
           <View style={{
             borderRadius: 5,
@@ -351,7 +341,7 @@ function SettingsRow({
             </Text>
           </View>
         )}
-        {value != null && <Text style={{ fontSize: 13, color: c.ink3, fontFamily: label === 'Version' ? fonts.mono : fonts.sans }}>{value}</Text>}
+        {value != null && <Text style={{ flexShrink: 1, fontSize: 13, color: c.ink3, fontFamily: label === 'Version' ? fonts.mono : fonts.sans }}>{value}</Text>}
         {showChevron && !danger && <Text style={{ fontSize: 18, color: c.ink4, marginLeft: 2 }}>{'›'}</Text>}
       </View>
     </TouchableOpacity>
@@ -430,50 +420,6 @@ const EMPTY_CATEGORY_STATS: CategoryStats = {
   hasKnownBackupState: false,
 };
 
-function categoryStatsHasEvidence(stats: CategoryStats): boolean {
-  return Boolean(
-    stats.lastSyncAt ||
-    stats.lastScanAt ||
-    stats.hasKnownBackupState ||
-    stats.hasScanned ||
-    stats.legacyCount > 0 ||
-    stats.totalCount > 0 ||
-    stats.uploadedCount > 0
-  );
-}
-
-function mergeCategoryStatsWithNativeStatus(
-  stats: CategoryStats,
-  nativeStatus: BeebeebCrypto.NativeCategoryBackupStatus | null,
-): CategoryStats {
-  if (!nativeStatus) return stats;
-  const nativeCount = nativeStatus.lastScanCount ?? 0;
-  const hasNativeState = Boolean(
-    nativeStatus.hasKnownBackupState ||
-    nativeStatus.lastScanAt ||
-    nativeStatus.lastUploadAt ||
-    nativeCount > 0
-  );
-  if (!hasNativeState) return stats;
-  return {
-    ...stats,
-    uploadedCount: Math.max(stats.uploadedCount, nativeCount),
-    totalCount: Math.max(stats.totalCount, nativeCount),
-    lastSyncAt: stats.lastSyncAt ?? nativeStatus.lastUploadAt ?? null,
-    lastScanAt: stats.lastScanAt ?? nativeStatus.lastScanAt ?? null,
-    hasScanned: stats.hasScanned || hasNativeState,
-    hasKnownBackupState: stats.hasKnownBackupState || Boolean(nativeStatus.hasKnownBackupState),
-  };
-}
-
-const EMPTY_NATIVE_CATEGORY_STATUS: BeebeebCrypto.NativeCategoryBackupStatus = {
-  lastScanAt: null,
-  lastScanCount: 0,
-  lastUploadAt: null,
-  hasParentFolder: false,
-  hasKnownBackupState: false,
-};
-
 const EMPTY_BACKUP_STATUS_COUNTS: Record<BackupAssetStatus, number> = {
   pending_upload: 0,
   staging: 0,
@@ -488,105 +434,57 @@ const EMPTY_BACKUP_STATUS_COUNTS: Record<BackupAssetStatus, number> = {
   failed: 0,
 };
 
-function BackupCategoryStatus({
-  stats,
-  paused,
+/**
+ * One line under the Contacts / Calendar toggle: the status derived from the
+ * real setting and the native backup (progress, last backup, count, checked,
+ * or a plain error with its fix). Tapping an error runs its fix; otherwise it
+ * opens Backup Insights.
+ */
+function CategoryBackupRow({
+  status,
   c,
-  label = 'Backup',
-  itemSingular = 'item',
-  itemPlural = 'items',
+  kind,
   onPress,
-  checking = false,
+  onAction,
+  busy = false,
 }: {
-  stats: CategoryStats;
-  paused?: boolean;
+  status: CategoryRowStatus;
   c: C;
-  label?: string;
-  itemSingular?: string;
-  itemPlural?: string;
-  onPress?: () => void;
-  checking?: boolean;
+  kind: CategoryKind;
+  onPress: () => void;
+  onAction: () => void;
+  busy?: boolean;
 }) {
-  const {
-    uploadedCount,
-    totalCount,
-    uploadedBytes,
-    totalBytes,
-    lastSyncAt,
-    lastScanAt,
-    syncing,
-    legacyCount,
-    hasScanned,
-    hasKnownBackupState,
-  } = stats;
-  const itemNoun = (count: number) => count === 1 ? itemSingular : itemPlural;
-  const progressLabel = totalCount > 0
-    ? `${uploadedCount.toLocaleString()} of ${totalCount.toLocaleString()} ${itemNoun(totalCount)}`
-    : null;
-  const uploadedLabel = `${uploadedCount.toLocaleString()} ${itemNoun(uploadedCount)}`;
-  const pct = totalCount > 0 ? Math.min(uploadedCount / totalCount, 1) : 0;
-  const fillWidth = `${Math.max(pct * 100, 1)}%` as `${number}%`;
-  const showBar = totalCount > 0;
-  const hasEvidence = categoryStatsHasEvidence(stats);
-  const dotColor = paused
-    ? c.ink4
-    : checking && !hasEvidence
+  const isError = status.state === 'error';
+  const dotColor = isError
+    ? c.red
+    : status.state === 'running'
       ? c.amber
-      : syncing
-        ? c.amber
-        : lastSyncAt || lastScanAt || hasKnownBackupState || (hasScanned && totalCount === 0)
-          ? c.green
-          : c.ink4;
-  const barColor = paused ? c.ink4 : syncing ? c.amber : c.green;
-
-  let line: string;
-  if (paused && totalCount > uploadedCount) {
-    line = `Paused · waiting for Wi-Fi${progressLabel ? ` · ${progressLabel}` : ''}`;
-  } else if (syncing && totalCount === 0) {
-    line = `Scanning ${label.toLowerCase()}...`;
-  } else if (checking && !hasEvidence) {
-    line = `Checking ${label.toLowerCase()} backup...`;
-  } else if (totalCount === 0 && !lastSyncAt && !lastScanAt && !syncing && legacyCount === 0 && !hasScanned && !hasKnownBackupState) {
-    line = `Waiting for first ${label.toLowerCase()} scan`;
-  } else if (syncing) {
-    const byteLabel = totalBytes > 0 ? ` · ${formatBytes(uploadedBytes)} / ${formatBytes(totalBytes)}` : '';
-    line = `Updating ${label.toLowerCase()} backup · ${progressLabel ?? uploadedLabel}${byteLabel}`;
-  } else if (lastSyncAt) {
-    line = `Last backup: ${timeAgo(lastSyncAt)} · ${uploadedLabel}${uploadedBytes > 0 ? ` · ${formatBytes(uploadedBytes)}` : ''}`;
-  } else if (lastScanAt && totalCount > 0) {
-    line = `Last scan: ${timeAgo(lastScanAt)} · ${uploadedLabel}`;
-  } else if (lastScanAt || (hasScanned && totalCount === 0)) {
-    line = `Last scan found no ${itemPlural} to back up`;
-  } else if (hasKnownBackupState) {
-    line = `Backup is on · waiting for changes`;
-  } else if (legacyCount > 0) {
-    line = `${legacyCount.toLocaleString()} legacy ${itemNoun(legacyCount)} migrated from the old backup layout`;
-  } else {
-    line = `${progressLabel ?? uploadedLabel} backed up`;
-  }
-  if (legacyCount > 0 && lastSyncAt) {
-    line += ` · ${legacyCount.toLocaleString()} legacy ${itemNoun(legacyCount)} migrated`;
-  }
-
+      : status.state === 'ok'
+        ? c.green
+        : c.ink4;
+  const showBar = status.state === 'running' && status.fraction != null;
+  const fillWidth = `${Math.max((status.fraction ?? 0) * 100, 1)}%` as `${number}%`;
   return (
     <TouchableOpacity
       style={{ paddingHorizontal: 12, paddingBottom: 10, paddingTop: 2, gap: 6 }}
       activeOpacity={0.6}
-      onPress={onPress}
-      accessibilityLabel={`View ${label.toLowerCase()} backup details`}
+      disabled={busy}
+      onPress={isError && status.action ? onAction : onPress}
+      accessibilityLabel={busy ? `Starting ${kind} backup` : isError ? status.text : `${status.text}. View ${kind} backup details`}
       accessibilityRole="button"
-      disabled={!onPress}
+      testID={`${kind}-backup-status`}
     >
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
         <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: dotColor }} />
-        <Text style={{ fontSize: 11, color: c.ink3, flex: 1 }}>
-          {line}
+        <Text style={{ fontSize: 11, color: isError ? c.red : c.ink3, flex: 1 }}>
+          {busy ? 'Starting backup…' : status.text}
         </Text>
         <Ionicons name="chevron-forward" size={14} color={c.ink4} />
       </View>
       {showBar && (
         <View style={{ height: 4, borderRadius: 2, backgroundColor: c.line2, overflow: 'hidden' }}>
-          <View style={{ height: '100%', width: fillWidth, backgroundColor: barColor, borderRadius: 2 }} />
+          <View style={{ height: '100%', width: fillWidth, backgroundColor: c.amber, borderRadius: 2 }} />
         </View>
       )}
     </TouchableOpacity>
@@ -606,6 +504,8 @@ function StorageBar({
   showPercent?: boolean;
   prominent?: boolean;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   // limitBytes <= 0 = "no fixed cap" sentinel — never show "-1 B" or a bogus 0%.
   const hasCap = limitBytes > 0;
   const pct = hasCap ? Math.min(usedBytes / limitBytes, 1) : 0;
@@ -619,7 +519,7 @@ function StorageBar({
   return (
     <View style={{ gap: 6 }}>
       {showPercent && (
-        <View style={{ flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' }}>
+        <View style={{ flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', flexWrap: accessibilityLayout ? 'wrap' : 'nowrap', gap: 4 }}>
           <Text style={{ fontSize: prominent ? 13 : 12, fontWeight: '600' as const, color: c.ink2 }}>
             Storage
           </Text>
@@ -648,6 +548,7 @@ type Nav = NativeStackNavigationProp<RootStackParamList>;
 
 export default function SettingsScreen() {
   const navigation = useNavigation<Nav>();
+  const route = useRoute<RouteProp<TabParamList, 'Settings'>>();
   const insets = useSafeAreaInsets();
   // 1394 — GlassTabBar now overlays this screen instead of reserving flow
   // height for it.
@@ -676,21 +577,45 @@ export default function SettingsScreen() {
     accountRefusalReason,
     manifestUnavailableReason,
     serverCheckPausedReason,
+    contactsBackupStatus,
+    calendarBackupStatus,
+    refreshCategoryStatus,
+    runCategoryBackupNow,
   } = useBackup();
   // Task 2245 (P1): same object the Settings tab badge reads.
   const settingsAttention = useSettingsAttention();
+  const firstRunSetup = useFirstRunSetup();
+  const coachMarks = useCoachMarks();
   const { showToast } = useToast();
   const isOnline = useNetworkStatus();
   const apiEnvironment = getApiEnvironment();
   const [activeCategory, setActiveCategory] = useState<SettingsCategoryId | null>(null);
+  const [categoryActionRunning, setCategoryActionRunning] = useState<CategoryKind | null>(null);
   const scrollRef = useRef<ScrollView>(null);
-  const { width: windowWidth } = useWindowDimensions();
+  const { width: windowWidth, height: windowHeight, fontScale } = useWindowDimensions();
+  const screenLayoutSignature = `${windowWidth}:${windowHeight}:${fontScale}`;
+  const accessibilityLayout = fontScale >= 1.3;
 
   const selectCategory = useCallback((id: SettingsCategoryId | null) => {
     setActiveCategory(id);
     setIsScrolled(false);
     scrollRef.current?.scrollTo({ y: 0, animated: false });
   }, []);
+
+  useFocusEffect(useCallback(() => {
+    const requested = route.params?.firstRunCategory;
+    if (requested) selectCategory(requested);
+  }, [route.params?.firstRunCategory, selectCategory]));
+
+  const continueFirstRunSetup = useCallback(async () => {
+    await firstRunSetup.resume();
+    navigation.navigate('FirstRunSetup');
+  }, [firstRunSetup, navigation]);
+
+  const reopenFirstRunSetup = useCallback(async () => {
+    await Promise.all([firstRunSetup.reopen(), coachMarks.replay()]);
+    navigation.navigate('FirstRunSetup');
+  }, [coachMarks, firstRunSetup, navigation]);
 
   // 2235 — sub-screens are local state, not routes, so iOS has no native
   // interactive pop to offer. Interpret a left-edge pan as "back" ourselves.
@@ -746,10 +671,10 @@ export default function SettingsScreen() {
   const lastQuotaAlertRef = useRef<number>(0);
 
   // Biometric lock
-  const [biometricEnabled, setBiometricEnabled] = useState(false);
+  const [biometricEnabled, setBiometricEnabled] = useState(true);
   const [biometricAvailable, setBiometricAvailable] = useState(false);
   const [loadingBiometric, setLoadingBiometric] = useState(true);
-  const [biometricDelayMs, setBiometricDelayMs] = useState(0);
+  const [biometricDelayMs, setBiometricDelayMs] = useState(DEFAULT_LOCK_DELAY_MS);
 
   // iOS Files.app integration
   const [fileProviderSupported, setFileProviderSupported] = useState(Platform.OS === 'ios');
@@ -793,10 +718,8 @@ export default function SettingsScreen() {
   const [regionStrict, setRegionStrict] = useState(false);
   const [regionStrictRefusal, setRegionStrictRefusal] = useState<StrictRefusal | null>(null);
 
-  // Backup per-category stats (sourced from BackupDatabase + .device.json manifest)
+  // Camera-roll stats (sourced from BackupDatabase + .device.json manifest)
   const [photoStats, setPhotoStats] = useState<CategoryStats>(EMPTY_CATEGORY_STATS);
-  const [contactsStats, setContactsStats] = useState<CategoryStats>(EMPTY_CATEGORY_STATS);
-  const [calendarStats, setCalendarStats] = useState<CategoryStats>(EMPTY_CATEGORY_STATS);
   const [backupStatsLoading, setBackupStatsLoading] = useState(true);
   const backupStatsRefreshInFlightRef = useRef(false);
   const backupStatsRefreshQueuedRef = useRef(false);
@@ -856,48 +779,18 @@ export default function SettingsScreen() {
   // Keep vault unlocked for background backup
   const [keepVaultUnlocked, setKeepVaultUnlockedState] = useState(false);
 
-  const [contactsLastSessionAt, setContactsLastSessionAt] = useState<string | null>(null);
-  const [calendarLastSessionAt, setCalendarLastSessionAt] = useState<string | null>(null);
-  const [contactsLastSessionCount, setContactsLastSessionCount] = useState(0);
-  const [calendarLastSessionCount, setCalendarLastSessionCount] = useState(0);
-  const [contactsNativeStatus, setContactsNativeStatus] = useState<BeebeebCrypto.NativeCategoryBackupStatus | null>(null);
-  const [calendarNativeStatus, setCalendarNativeStatus] = useState<BeebeebCrypto.NativeCategoryBackupStatus | null>(null);
-
   // Theme — sourced from global ThemeContext
   const { colors: c, resolved, mode: themePreference, setMode: handleThemeChange } = useTheme();
   // 1314 — measured height of the floating title, fed to the scroll inset.
   const [headerHeight, setHeaderHeight] = useState(0);
   const [isScrolled, setIsScrolled] = useState(false);
+  useLayoutEffect(() => {
+    setHeaderHeight(0);
+  }, [screenLayoutSignature]);
 
   // ---------------------------------------------------------------------------
   // Data loading
   // ---------------------------------------------------------------------------
-
-  const loadNativeContactCalendarBackupStatus = useCallback(async () => {
-    const started = Date.now();
-    try {
-      const [contacts, calendar] = await Promise.all([
-        BeebeebCrypto.getContactsBackupStatus(),
-        BeebeebCrypto.getCalendarBackupStatus(),
-      ]);
-      setContactsNativeStatus(contacts);
-      setCalendarNativeStatus(calendar);
-      recordRuntimeTrace('settings.backup.native_status.loaded', {
-        durationMs: Date.now() - started,
-        contactsKnown: Boolean(contacts.hasKnownBackupState || contacts.lastScanAt || contacts.lastUploadAt || contacts.lastScanCount > 0),
-        calendarKnown: Boolean(calendar.hasKnownBackupState || calendar.lastScanAt || calendar.lastUploadAt || calendar.lastScanCount > 0),
-      });
-    } catch (err) {
-      setContactsNativeStatus(EMPTY_NATIVE_CATEGORY_STATUS);
-      setCalendarNativeStatus(EMPTY_NATIVE_CATEGORY_STATUS);
-      recordRuntimeTrace('settings.backup.native_status.failed', {
-        durationMs: Date.now() - started,
-        error: errorMessage(err),
-      });
-      // Older native builds do not expose these status methods; Settings falls
-      // back to legacy SecureStore and manifest data until the app is rebuilt.
-    }
-  }, []);
 
   const loadPhotoAlbumSelection = useCallback(async () => {
     if (Platform.OS !== 'ios') return;
@@ -922,9 +815,8 @@ export default function SettingsScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      void loadNativeContactCalendarBackupStatus();
       void loadPhotoAlbumSelection();
-    }, [loadNativeContactCalendarBackupStatus, loadPhotoAlbumSelection]),
+    }, [loadPhotoAlbumSelection]),
   );
 
   const fetchUsage = useCallback(async () => {
@@ -963,18 +855,19 @@ export default function SettingsScreen() {
 
   const loadBiometricPrefs = useCallback(async () => {
     try {
-      const supported = await LocalAuthentication.hasHardwareAsync();
-      const enrolled = await LocalAuthentication.isEnrolledAsync();
-      setBiometricAvailable(supported && enrolled);
-      const stored = await SecureStore.getItemAsync(BIOMETRIC_PREF_KEY);
-      setBiometricEnabled(stored === 'true');
-      const delayRaw = await SecureStore.getItemAsync(BIOMETRIC_DELAY_KEY);
-      setBiometricDelayMs(delayRaw ? parseInt(delayRaw, 10) : 0);
+      // The lock accepts Face ID or the device passcode, so any device
+      // security (not only an enrolled biometric) makes the row available.
+      const level = await LocalAuthentication.getEnrolledLevelAsync();
+      const available = level !== LocalAuthentication.SecurityLevel.NONE;
+      setBiometricAvailable(available);
+      const stored = await SecureStore.getItemAsync(APP_LOCK_PREF_KEY);
+      setBiometricEnabled(isAppLockEnabled(stored));
+      const delayRaw = await SecureStore.getItemAsync(APP_LOCK_DELAY_KEY);
+      setBiometricDelayMs(parseLockDelayMs(delayRaw));
       recordRuntimeTrace('settings.biometric_prefs.loaded', {
-        supported,
-        enrolled,
-        enabled: stored === 'true',
-        delayMs: delayRaw ? parseInt(delayRaw, 10) : 0,
+        available,
+        enabled: isAppLockEnabled(stored),
+        delayMs: parseLockDelayMs(delayRaw),
       });
     } catch {
       // Biometrics unavailable on this device
@@ -1145,20 +1038,11 @@ export default function SettingsScreen() {
     loadFileProviderPrefs();
     loadAccountData();
     loadStorageRegionPref();
-    void loadNativeContactCalendarBackupStatus();
     if (isPhotoBackupEnabled) {
       void refreshCameraRollStatus();
       void loadDeletionBehavior();
       void loadKeepVaultUnlocked();
     }
-    SecureStore.getItemAsync(CONTACTS_LAST_SCAN_KEY).then(setContactsLastSessionAt).catch(() => {});
-    SecureStore.getItemAsync(CALENDAR_LAST_SCAN_KEY).then(setCalendarLastSessionAt).catch(() => {});
-    SecureStore.getItemAsync(CONTACTS_LAST_SCAN_COUNT_KEY)
-      .then((value) => { setContactsLastSessionCount(value ? parseInt(value, 10) || 0 : 0); })
-      .catch(() => {});
-    SecureStore.getItemAsync(CALENDAR_LAST_SCAN_COUNT_KEY)
-      .then((value) => { setCalendarLastSessionCount(value ? parseInt(value, 10) || 0 : 0); })
-      .catch(() => {});
     // Seed the push toggle from OS permission AND a user opt-out flag —
     // OS permission alone overestimates ("granted" but user wants quiet),
     // SecureStore alone underestimates (user toggled off in a past
@@ -1186,7 +1070,7 @@ export default function SettingsScreen() {
       }
     })();
     getBackupNotificationSettings().then(setBackupNotifPrefs).catch(() => {});
-  }, [fetchUsage, loadBiometricPrefs, loadFileProviderPrefs, loadAccountData, loadStorageRegionPref, loadNativeContactCalendarBackupStatus, isPhotoBackupEnabled, refreshCameraRollStatus, loadDeletionBehavior, loadKeepVaultUnlocked]);
+  }, [fetchUsage, loadBiometricPrefs, loadFileProviderPrefs, loadAccountData, loadStorageRegionPref, isPhotoBackupEnabled, refreshCameraRollStatus, loadDeletionBehavior, loadKeepVaultUnlocked]);
 
   // Refresh camera roll status whenever native backup work settles.
   useEffect(() => {
@@ -1232,9 +1116,6 @@ export default function SettingsScreen() {
         };
         const photoSummary = summaries.photo ?? emptySummary;
         const videoSummary = summaries.video ?? emptySummary;
-        const contactSummary = summaries.contact ?? emptySummary;
-        const calendarSummary = summaries.calendar ?? emptySummary;
-
         const localPhotoUploaded = photoSummary.uploadedCount + videoSummary.uploadedCount;
         const localPhotoTotal = photoSummary.totalCount + videoSummary.totalCount;
         const photoLastSyncAt = manifest?.backups.camera_roll.last_sync ?? null;
@@ -1250,40 +1131,6 @@ export default function SettingsScreen() {
           hasScanned: photoLastSyncAt != null || localPhotoUploaded > 0,
           hasKnownBackupState: photoLastSyncAt != null || localPhotoUploaded > 0,
         });
-        const contactsNativeScanAt = contactsNativeStatus?.lastScanAt ?? null;
-        const calendarNativeScanAt = calendarNativeStatus?.lastScanAt ?? null;
-        const contactsNativeCount = contactsNativeStatus?.lastScanCount ?? 0;
-        const calendarNativeCount = calendarNativeStatus?.lastScanCount ?? 0;
-        const contactsLastScanAt = contactsNativeScanAt ?? contactsLastSessionAt ?? null;
-        const calendarLastScanAt = calendarNativeScanAt ?? calendarLastSessionAt ?? null;
-        const contactsLastSyncAt = manifest?.backups.contacts.last_sync ?? contactsNativeStatus?.lastUploadAt ?? null;
-        const calendarLastSyncAt = manifest?.backups.calendar.last_sync ?? calendarNativeStatus?.lastUploadAt ?? null;
-        const contactCount = Math.max(contactSummary.uploadedCount, contactSummary.totalCount, contactsNativeCount, contactsLastSessionCount);
-        const calendarCount = Math.max(calendarSummary.uploadedCount, calendarSummary.totalCount, calendarNativeCount, calendarLastSessionCount);
-        setContactsStats({
-          uploadedCount: Math.max(contactSummary.uploadedCount, contactsNativeCount, contactsLastSessionCount),
-          totalCount: contactCount,
-          uploadedBytes: contactSummary.uploadedBytes,
-          totalBytes: contactSummary.totalBytes,
-          lastSyncAt: contactsLastSyncAt,
-          lastScanAt: contactsLastScanAt,
-          syncing: false,
-          legacyCount: manifest?.backups.contacts.legacy_items_migrated ?? 0,
-          hasScanned: contactsLastScanAt != null || contactCount > 0 || Boolean(contactsNativeStatus?.hasKnownBackupState),
-          hasKnownBackupState: Boolean(contactsNativeStatus?.hasKnownBackupState),
-        });
-        setCalendarStats({
-          uploadedCount: Math.max(calendarSummary.uploadedCount, calendarNativeCount, calendarLastSessionCount),
-          totalCount: calendarCount,
-          uploadedBytes: calendarSummary.uploadedBytes,
-          totalBytes: calendarSummary.totalBytes,
-          lastSyncAt: calendarLastSyncAt,
-          lastScanAt: calendarLastScanAt,
-          syncing: false,
-          legacyCount: manifest?.backups.calendar.legacy_items_migrated ?? 0,
-          hasScanned: calendarLastScanAt != null || calendarCount > 0 || Boolean(calendarNativeStatus?.hasKnownBackupState),
-          hasKnownBackupState: Boolean(calendarNativeStatus?.hasKnownBackupState),
-        });
       } while (backupStatsRefreshQueuedRef.current);
       recordRuntimeTrace('settings.backup.stats.loaded', {
         durationMs: Date.now() - started,
@@ -1293,7 +1140,7 @@ export default function SettingsScreen() {
       backupStatsRefreshInFlightRef.current = false;
       setBackupStatsLoading(false);
     }
-  }, [syncing, contactsLastSessionAt, calendarLastSessionAt, contactsLastSessionCount, calendarLastSessionCount, contactsNativeStatus, calendarNativeStatus]);
+  }, [syncing]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -1303,8 +1150,6 @@ export default function SettingsScreen() {
   }, [
     refreshBackupStats,
     isPhotoBackupEnabled,
-    isContactsBackupEnabled,
-    isCalendarBackupEnabled,
     backupProgress.completed,
   ]);
 
@@ -1335,91 +1180,86 @@ export default function SettingsScreen() {
       current: biometricEnabled,
     });
     if (!enabled) {
+      // Turning protection down needs the device owner (Face ID or passcode).
+      // Cancel or failure changes nothing.
+      if (settingChangeNeedsAuth({ kind: 'toggle', enable: false })) {
+        const auth = await requestDeviceOwnerAuth('Confirm it is you to turn off app lock', {
+          cancelled: 'App lock is still on.',
+          failed: 'Could not confirm it is you. App lock is still on.',
+          unavailable: 'App lock is still on.',
+        });
+        recordRuntimeTrace('settings.biometric_toggle.auth_result', { ok: auth.ok });
+        if (!auth.ok) {
+          showToast({ type: 'info', message: auth.message });
+          return;
+        }
+      }
       setBiometricEnabled(false);
       try {
-        await SecureStore.setItemAsync(BIOMETRIC_PREF_KEY, 'false');
+        await SecureStore.setItemAsync(APP_LOCK_PREF_KEY, 'false');
         markUnlocked();
         recordRuntimeTrace('settings.biometric_toggle.pref_disabled');
       } catch {
         setBiometricEnabled(true);
         recordRuntimeTrace('settings.biometric_toggle.pref_disable_failed');
-        Alert.alert('Face ID lock could not be disabled', 'Please try again.');
-        return;
-      }
-
-      try {
-        await crypto.setBiometricRequirement(false);
-        recordRuntimeTrace('settings.biometric_toggle.keychain_disabled');
-      } catch {
-        recordRuntimeTrace('settings.biometric_toggle.keychain_disable_deferred');
-        showToast({
-          type: 'info',
-          message: 'Face ID lock is off. Local key protection will update after the next vault unlock.',
-        });
+        Alert.alert('App lock could not be turned off', 'Please try again.');
       }
       return;
     }
 
-    if (enabled) {
-      recordRuntimeTrace('settings.biometric_toggle.local_auth_request');
-      const result = await LocalAuthentication.authenticateAsync({
-        promptMessage: 'Confirm your identity to enable Face ID lock',
-        cancelLabel: 'Cancel',
-        disableDeviceFallback: true,
-      });
-      recordRuntimeTrace('settings.biometric_toggle.local_auth_result', {
-        success: result.success === true,
-        error: result.error,
-      });
-      if (!result.success) return;
-      // The system biometric sheet briefly backgrounds Beebeeb. Without this
-      // grace stamp the AppState listener would interpret the resume as a
-      // background→active transition and immediately push the lock screen,
-      // even though the user just authenticated.
-      markUnlocked();
-    }
-    try {
-      await crypto.setBiometricRequirement(true);
-      recordRuntimeTrace('settings.biometric_toggle.keychain_enabled');
-    } catch {
-      recordRuntimeTrace('settings.biometric_toggle.keychain_enable_failed');
-      Alert.alert(
-        'Face ID setup failed',
-        'Unlock Beebeeb with your recovery phrase and try again. The local vault must be open before changing Face ID protection.',
-      );
-      return;
-    }
+    // Turning it on needs no extra prompt. The vault key uses user presence,
+    // so the lock tries Face ID first and accepts the passcode as fallback.
     setBiometricEnabled(true);
-    await SecureStore.setItemAsync(BIOMETRIC_PREF_KEY, 'true');
-    recordRuntimeTrace('settings.biometric_toggle.pref_enabled');
-  }, [biometricEnabled, crypto, showToast]);
+    try {
+      await SecureStore.setItemAsync(APP_LOCK_PREF_KEY, 'true');
+      recordRuntimeTrace('settings.biometric_toggle.pref_enabled');
+    } catch {
+      setBiometricEnabled(false);
+      recordRuntimeTrace('settings.biometric_toggle.pref_enable_failed');
+      Alert.alert('App lock could not be turned on', 'Please try again.');
+    }
+  }, [biometricEnabled, showToast]);
 
   const handleBiometricDelayPress = useCallback(() => {
     const apply = async (ms: number) => {
+      // A longer delay lowers protection, so it needs the device owner first.
+      if (settingChangeNeedsAuth({ kind: 'delay', fromMs: biometricDelayMs, toMs: ms })) {
+        const auth = await requestDeviceOwnerAuth('Confirm it is you to change when Beebeeb locks', {
+          cancelled: 'The lock delay is unchanged.',
+          failed: 'Could not confirm it is you. The lock delay is unchanged.',
+          unavailable: 'The lock delay is unchanged.',
+        });
+        recordRuntimeTrace('settings.biometric_delay.auth_result', { ok: auth.ok });
+        if (!auth.ok) {
+          showToast({ type: 'info', message: auth.message });
+          return;
+        }
+      }
       recordRuntimeTrace('settings.biometric_delay.change', { ms });
       setBiometricDelayMs(ms);
-      await SecureStore.setItemAsync(BIOMETRIC_DELAY_KEY, String(ms));
+      await SecureStore.setItemAsync(APP_LOCK_DELAY_KEY, String(ms));
+      await firstRunSetup.markDone('app-lock');
       Haptics.selectionAsync();
     };
-    const labels = BIOMETRIC_DELAY_OPTIONS.map((o) => o.label);
+    const labels = APP_LOCK_DELAY_OPTIONS.map((o) => o.label);
     if (Platform.OS === 'ios') {
       ActionSheetIOS.showActionSheetWithOptions(
         {
-          title: 'Lock after',
+          title: 'Lock when returning to Beebeeb after',
           options: [...labels, 'Cancel'],
           cancelButtonIndex: labels.length,
         },
         (index) => {
-          if (index < labels.length) apply(BIOMETRIC_DELAY_OPTIONS[index].ms);
+          if (index < labels.length) apply(APP_LOCK_DELAY_OPTIONS[index].ms);
         },
       );
     } else {
-      Alert.alert('Lock after', undefined, [
-        ...BIOMETRIC_DELAY_OPTIONS.map((o) => ({ text: o.label, onPress: () => apply(o.ms) })),
+      Alert.alert('Lock when returning to Beebeeb after', undefined, [
+        ...APP_LOCK_DELAY_OPTIONS.map((o) => ({ text: o.label, onPress: () => apply(o.ms) })),
         { text: 'Cancel', style: 'cancel' as const },
       ]);
     }
-  }, []);
+  }, [biometricDelayMs, firstRunSetup, showToast]);
 
   // Task 1722 round 4 (Guus 2026-10-15, Q1): Files is on by default for a signed-in account;
   // this switch still turns it off, and that choice is kept for this account across sign-outs
@@ -1465,8 +1305,8 @@ export default function SettingsScreen() {
 
   const handleNotificationsToggle = useCallback(async (enabled: boolean) => {
     if (enabled) {
-      const { status } = await Notifications.requestPermissionsAsync();
-      if (status !== 'granted') {
+      const granted = await enablePushNotifications();
+      if (!granted) {
         Alert.alert(
           'Notifications disabled',
           'Enable notifications for Beebeeb in iOS Settings to receive alerts.',
@@ -1475,6 +1315,7 @@ export default function SettingsScreen() {
       }
     }
     setNotificationsEnabled(enabled);
+    if (enabled) await firstRunSetup.markDone('notifications');
     // Persist the user's intent so a fresh launch (or another tab focus)
     // doesn't bounce the toggle back to "OS permission says yes" — we keep
     // their explicit opt-out until they flip it on again here.
@@ -1484,7 +1325,6 @@ export default function SettingsScreen() {
       // SecureStore unavailable (web) — toggle remains in-memory only.
     }
     if (enabled) {
-      void registerForPushNotifications();
       setNotifPrefsLoading(true);
       getNotificationPreferences()
         .then(setNotifPrefs)
@@ -1493,7 +1333,7 @@ export default function SettingsScreen() {
     } else {
       void unregisterPushToken();
     }
-  }, []);
+  }, [firstRunSetup]);
 
   const handleNotifPrefToggle = useCallback(
     async (key: keyof MobileNotificationPreferences, value: boolean) => {
@@ -1540,9 +1380,10 @@ export default function SettingsScreen() {
       // the manifest will reconverge on the next successful run.
       console.warn(`Failed to ${enabling ? 'initialize' : 'disable'} backup for ${category}:`, err);
     }
-    void loadNativeContactCalendarBackupStatus();
-    refreshBackupStats();
-  }, [loadNativeContactCalendarBackupStatus, refreshBackupStats]);
+    if (category === 'camera_roll') {
+      void refreshBackupStats();
+    }
+  }, [refreshBackupStats]);
 
   const handleTogglePhotoBackup = useCallback(async () => {
     const enabling = !isPhotoBackupEnabled;
@@ -1568,13 +1409,14 @@ export default function SettingsScreen() {
       }
     }
     await togglePhotoBackup();
-    await syncBackupCategory('camera_roll', enabling);
-  }, [isPhotoBackupEnabled, togglePhotoBackup, syncBackupCategory]);
+    if (enabling) void firstRunSetup.markDone('photo-backup').catch(() => {});
+    void syncBackupCategory('camera_roll', enabling);
+  }, [firstRunSetup, isPhotoBackupEnabled, togglePhotoBackup, syncBackupCategory]);
 
   const handleToggleContactsBackup = useCallback(async () => {
     const enabling = !isContactsBackupEnabled;
     if (enabling) {
-      const granted = await ensureContactsPermission();
+      const granted = await ensureContactsPermission(Contacts);
       if (!granted) {
         Alert.alert(
           'Contacts access needed',
@@ -1591,8 +1433,9 @@ export default function SettingsScreen() {
       }
     }
     await toggleContactsBackup();
-    await syncBackupCategory('contacts', enabling);
-  }, [isContactsBackupEnabled, toggleContactsBackup, syncBackupCategory]);
+    if (enabling) void firstRunSetup.markDone('contacts').catch(() => {});
+    void syncBackupCategory('contacts', enabling);
+  }, [firstRunSetup, isContactsBackupEnabled, toggleContactsBackup, syncBackupCategory]);
 
   const handleToggleCalendarBackup = useCallback(async () => {
     const enabling = !isCalendarBackupEnabled;
@@ -1629,8 +1472,9 @@ export default function SettingsScreen() {
       }
     }
     await toggleCalendarBackup();
-    await syncBackupCategory('calendar', enabling);
-  }, [isCalendarBackupEnabled, toggleCalendarBackup, syncBackupCategory, showToast]);
+    if (enabling) void firstRunSetup.markDone('calendar').catch(() => {});
+    void syncBackupCategory('calendar', enabling);
+  }, [firstRunSetup, isCalendarBackupEnabled, toggleCalendarBackup, syncBackupCategory, showToast]);
 
   const handleIncludeVideosChange = useCallback(async (value: boolean) => {
     await setIncludeVideos(value);
@@ -1675,7 +1519,7 @@ export default function SettingsScreen() {
     try {
       await BeebeebCrypto.setPhotoBackupSelectedAlbumIds(uniqueIds);
       if (isPhotoBackupEnabled) {
-        await triggerBackupNow();
+        await triggerBackupNow({ skipCategories: true });
         void refreshCameraRollStatus();
         void refreshBackupStats();
       }
@@ -1804,7 +1648,7 @@ export default function SettingsScreen() {
     const { version } = appVersion();
     Alert.alert(
       `Beebeeb v${version}`,
-      '• End-to-end encrypted file storage\n• Camera roll backup\n• Dark mode support\n• File search and sort\n• Swipe actions\n• Biometric lock\n\nMade in Europe by Beebeeb.io',
+      '• End-to-end encrypted file storage\n• Camera roll backup\n• Dark mode support\n• File search and sort\n• Swipe actions\n• App lock\n\nMade in Europe by Beebeeb.io',
     );
   }, []);
 
@@ -1870,14 +1714,47 @@ export default function SettingsScreen() {
   const cameraIssueSuffix = cameraIssueCount > 0
     ? ` · ${cameraIssueCount.toLocaleString()} needs attention`
     : '';
-  const displayContactsStats = mergeCategoryStatsWithNativeStatus(contactsStats, contactsNativeStatus);
-  const displayCalendarStats = mergeCategoryStatsWithNativeStatus(calendarStats, calendarNativeStatus);
-  const contactsBackupChecking =
-    (backupStatsLoading || contactsNativeStatus === null) &&
-    !categoryStatsHasEvidence(displayContactsStats);
-  const calendarBackupChecking =
-    (backupStatsLoading || calendarNativeStatus === null) &&
-    !categoryStatsHasEvidence(displayCalendarStats);
+  const contactsRowStatus = deriveCategoryBackupStatus({
+    kind: 'contacts',
+    settingEnabled: isContactsBackupEnabled,
+    native: contactsBackupStatus,
+    manifest: null,
+  });
+  const calendarRowStatus = deriveCategoryBackupStatus({
+    kind: 'calendar',
+    settingEnabled: isCalendarBackupEnabled,
+    native: calendarBackupStatus,
+    manifest: null,
+  });
+  const handleCategoryAction = (kind: CategoryKind, status: CategoryRowStatus) => {
+    if (categoryActionRunning) return;
+    if (status.action === 'open_settings') {
+      void Linking.openSettings();
+    } else if (status.action === 'backup_anyway' && status.confirmText) {
+      Alert.alert('Back up anyway?', status.confirmText, [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Back up anyway',
+          style: 'destructive',
+          onPress: () => {
+            setCategoryActionRunning(kind);
+            showToast({ type: 'info', message: `Preparing ${kind} backup…` });
+            void runCategoryBackupNow(kind, { force: true }).then(
+              () => showToast({ type: 'success', message: `${kind === 'contacts' ? 'Contacts' : 'Calendar'} backup started` }),
+              (error) => showToast({ type: 'error', message: errorMessage(error) }),
+            ).finally(() => setCategoryActionRunning(null));
+          },
+        },
+      ]);
+    } else if (status.action === 'retry') {
+      setCategoryActionRunning(kind);
+      void runCategoryBackupNow(kind)
+        .catch((error) => {
+          showToast({ type: 'error', message: errorMessage(error) });
+        })
+        .finally(() => setCategoryActionRunning(null));
+    }
+  };
   const cameraPhotoAccessNotice = photoAccessNotice(photoPermission, photoVisibleCount);
   const cameraRollSummary = (() => {
     // Task 1594: a stopped backup says why, before any progress line.
@@ -1965,6 +1842,7 @@ export default function SettingsScreen() {
           scroll-edge blur behind it, the same pattern Drive uses (1313). */}
       {isScrolled ? <ScrollEdgeBlur height={headerHeight || SCROLL_EDGE.chromeFallback} /> : null}
       <View
+        key={`settings-header-${screenLayoutSignature}`}
         style={layout.floatingTitle}
         onLayout={(e) => {
           const h = Math.round(e.nativeEvent.layout.height);
@@ -2013,7 +1891,26 @@ export default function SettingsScreen() {
       >
 
         {activeCategory === null ? (
-          <SettingsCategoryList colors={c} backgroundColor={surfaces.groupedCell} onSelect={selectCategory} attention={settingsAttention} />
+          <>
+            <FinishSetupCard onContinue={() => { void continueFirstRunSetup(); }} />
+            <SettingsCategoryList
+              key={`settings-categories-${screenLayoutSignature}`}
+              colors={c}
+              backgroundColor={surfaces.groupedCell}
+              onSelect={selectCategory}
+              attention={settingsAttention}
+            />
+            <TouchableOpacity
+              style={layout.setupAgainRow}
+              onPress={() => { void reopenFirstRunSetup(); }}
+              accessibilityRole="button"
+              testID="settings-first-run-reopen"
+            >
+              <Ionicons name="refresh-outline" size={18} color={c.ink3} />
+              <Text style={[typeScale.subhead, { color: c.ink2, flex: 1 }]}>Set up this iPhone again</Text>
+              <Ionicons name="chevron-forward" size={15} color={c.ink4} />
+            </TouchableOpacity>
+          </>
         ) : null}
 
         <SettingsCategory id="account" active={activeCategory}>
@@ -2029,13 +1926,13 @@ export default function SettingsScreen() {
               </View>
               <View style={layout.accountInfo}>
                 {displayName ? (
-                  <Text style={{ fontSize: 14, fontWeight: '600' as const, color: c.ink }} numberOfLines={1}>
+                  <Text style={{ fontSize: 14, fontWeight: '600' as const, color: c.ink }} numberOfLines={accessibilityLayout ? 3 : 1}>
                     {displayName}
                   </Text>
                 ) : null}
                 <Text
                   style={{ fontSize: displayName ? 12 : 14, color: displayName ? c.ink3 : c.ink }}
-                  numberOfLines={1}
+                  numberOfLines={accessibilityLayout ? 3 : 1}
                 >
                   {email}
                 </Text>
@@ -2163,7 +2060,11 @@ export default function SettingsScreen() {
             {!loadingBiometric && biometricAvailable && (
               <>
                 <ToggleRow
-                  label="Biometric lock"
+                  label="App lock"
+                  subtitle={Platform.OS === 'ios'
+                    ? 'Opening Beebeeb always asks for Face ID or your passcode.'
+                    : 'Opening Beebeeb always asks for your screen lock or fingerprint.'}
+                  testID="settings-toggle-app-lock"
                   value={biometricEnabled}
                   onValueChange={handleBiometricToggle}
                   c={c}
@@ -2172,8 +2073,8 @@ export default function SettingsScreen() {
                   <>
                     <RowDivider c={c} />
                     <SettingsRow
-                      label="Lock after"
-                      value={biometricDelayLabel(biometricDelayMs)}
+                      label="Lock when returning to Beebeeb after"
+                      value={lockDelayLabel(biometricDelayMs)}
                       onPress={handleBiometricDelayPress}
                       c={c}
                     />
@@ -2310,15 +2211,13 @@ export default function SettingsScreen() {
                   c={c}
                 />
                 {isContactsBackupEnabled && (
-                  <BackupCategoryStatus
-                    stats={displayContactsStats}
-                    paused={backupPaused}
+                  <CategoryBackupRow
+                    status={contactsRowStatus}
                     c={c}
-                    label="Contacts"
-                    itemSingular="contact"
-                    itemPlural="contacts"
-                    checking={contactsBackupChecking}
+                    kind="contacts"
                     onPress={() => navigation.navigate('BackupInsights')}
+                    onAction={() => handleCategoryAction('contacts', contactsRowStatus)}
+                    busy={categoryActionRunning === 'contacts'}
                   />
                 )}
                 <RowDivider c={c} />
@@ -2329,15 +2228,13 @@ export default function SettingsScreen() {
                   c={c}
                 />
                 {isCalendarBackupEnabled && (
-                  <BackupCategoryStatus
-                    stats={displayCalendarStats}
-                    paused={backupPaused}
+                  <CategoryBackupRow
+                    status={calendarRowStatus}
                     c={c}
-                    label="Calendar"
-                    itemSingular="event"
-                    itemPlural="events"
-                    checking={calendarBackupChecking}
+                    kind="calendar"
                     onPress={() => navigation.navigate('BackupInsights')}
+                    onAction={() => handleCategoryAction('calendar', calendarRowStatus)}
+                    busy={categoryActionRunning === 'calendar'}
                   />
                 )}
                 <RowDivider c={c} />
@@ -2399,7 +2296,7 @@ export default function SettingsScreen() {
                         </TouchableOpacity>
                         {photoAlbumsExpanded && (
                           <View style={{ paddingHorizontal: 12, paddingBottom: 8, paddingLeft: 50 }}>
-                            <Text style={{ fontSize: 12, color: c.ink3, paddingVertical: 6 }}>Choose phone albums to upload. To change what appears in Photos, use Folders shown in Photos.</Text>
+                            <Text style={{ fontSize: 12, color: c.ink3, paddingVertical: 6 }}>Choose phone albums to upload. To change what appears in Photos, use Photo sources.</Text>
                             <TouchableOpacity
                               style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 7 }}
                               activeOpacity={0.6}
@@ -2426,7 +2323,7 @@ export default function SettingsScreen() {
                                     size={18}
                                     color={selected ? c.amber : c.ink4}
                                   />
-                                  <Text style={{ fontSize: 13, color: c.ink, flex: 1 }} numberOfLines={1}>
+                                  <Text style={{ fontSize: 13, color: c.ink, flex: 1 }} numberOfLines={accessibilityLayout ? undefined : 1}>
                                     {album.title}
                                   </Text>
                                   <Text style={{ fontSize: 12, color: c.ink3 }}>
@@ -2515,9 +2412,9 @@ export default function SettingsScreen() {
             />
             <RowDivider c={c} />
             <SettingsRow
-              label="Folders shown in Photos"
+              label="Photo sources"
               icon="images-outline"
-              onPress={() => navigation.navigate('PhotoLibrarySettings')}
+              onPress={() => navigation.navigate('PhotoSources')}
               c={c}
             />
             <RowDivider c={c} />
@@ -2654,7 +2551,7 @@ export default function SettingsScreen() {
         <View style={layout.section}>
           <SectionHeader title="Appearance" c={c} />
           <View style={[layout.card, { backgroundColor: surfaces.groupedCell }]}>
-            <View style={layout.themeOptions}>
+            <View style={[layout.themeOptions, accessibilityLayout && { flexWrap: 'wrap' }]}>
               {(['light', 'dark', 'system'] as ThemeMode[]).map((pref) => {
                 const selected = themePreference === pref;
                 const label = pref === 'light' ? 'Light' : pref === 'dark' ? 'Dark' : 'System';
@@ -2669,6 +2566,7 @@ export default function SettingsScreen() {
                     testID={`appearance-${pref}`}
                     style={[
                       layout.themeOption,
+                      accessibilityLayout && { flexBasis: '45%' },
                       {
                         borderColor: selected ? c.amber : c.line,
                         backgroundColor: selected ? c.amberBg : c.paper2,
@@ -2760,7 +2658,7 @@ export default function SettingsScreen() {
                       </>
                     )}
                     <TouchableOpacity
-                      style={layout.regionOption}
+                      style={[layout.regionOption, accessibilityLayout && { alignItems: 'flex-start', flexWrap: 'wrap' }]}
                       activeOpacity={row.available ? 0.6 : 1}
                       onPress={() => void handleRegionChange(row)}
                       disabled={disabled}
@@ -2777,8 +2675,8 @@ export default function SettingsScreen() {
                           <View style={[layout.regionRadioDot, { backgroundColor: c.amber }]} />
                         )}
                       </View>
-                      <View style={layout.regionInfo}>
-                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <View style={[layout.regionInfo, accessibilityLayout && { flexBasis: '75%' }]}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                           <Text style={{ fontSize: 14, color: row.available ? c.ink : c.ink4, fontWeight: '400' as const }}>
                             {row.label}
                           </Text>

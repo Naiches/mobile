@@ -18,7 +18,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
-LOG_DIR="${SWIFT_CI_LOG_DIR:-$(mktemp -d)}"
+if [ -n "${SWIFT_CI_LOG_DIR:-}" ]; then
+  LOG_DIR="$SWIFT_CI_LOG_DIR"
+else
+  LOG_DIR="$(mktemp -d)"
+  trap 'rm -rf -- "$LOG_DIR"' EXIT
+fi
 mkdir -p "$LOG_DIR"
 POD_LOG="$LOG_DIR/pod-install.log"
 BUILD_LOG="$LOG_DIR/xcodebuild.log"

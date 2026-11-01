@@ -51,7 +51,6 @@ func runBounded<T>(watchdog: TimeInterval = 10, _ op: @escaping () async -> T) -
 let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-fence-\(UUID().uuidString)", isDirectory: true)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 
 // The engine's backup_assets columns (NativeBackupEngine.ensureTables).
 let schema = """
@@ -438,6 +437,39 @@ do {
   m.close()
 }
 
+// Exact mark-404 requeues use the same fence. A live ticket may write; an old
+// account's response cannot mutate the next account's manifest.
+do {
+  let m = Manifest("c-mark-404")
+  m.signIn("acct-A")
+  guard let ticketA = m.ticket("acct-A") else { fatalError("no A ticket") }
+  m.queue.sync {
+    exsqlite3_exec(m.handle.db, """
+      INSERT INTO backup_assets
+        (local_asset_id, remote_file_id, created_at, asset_type, status, uploaded_account_id)
+      VALUES ('gone-a', 'file-a', '2026-10-01T10:00:00Z', 'photo', 'uploaded', 'acct-A')
+      """, nil, nil, nil)
+  }
+  let current = m.queue.sync {
+    FencedManifestWrites.requeueRemoteGone(
+      m.handle.db, fence: m.handle.writeFence, ticket: ticketA,
+      assetId: "gone-a", fileId: "file-a", nowMs: 1
+    )
+  }
+  expect(current == .requeued, "c4: current ticket requeues the vanished file")
+
+  m.signIn("acct-B")
+  let stale = m.queue.sync {
+    FencedManifestWrites.requeueRemoteGone(
+      m.handle.db, fence: m.handle.writeFence, ticket: ticketA,
+      assetId: "gone-a", fileId: "file-a", nowMs: 2
+    )
+  }
+  expect(stale == .failed, "c4: stale ticket is fenced")
+  expect(m.dropped.contains("server_mark.file_gone"), "c4: the fenced writer is recorded")
+  m.close()
+}
+
 // MARK: - the fence's own rules
 
 do {
@@ -461,11 +493,14 @@ do {
 
 // MARK: - Report
 
+let exitCode: Int32
 if failures.isEmpty {
   print("ManifestWriteFenceTests: \(total) assertions, 0 failed")
-  exit(0)
+  exitCode = 0
 } else {
   for f in failures { print("FAIL: \(f)") }
   print("ManifestWriteFenceTests: \(failures.count) of \(total) assertions FAILED")
-  exit(1)
+  exitCode = 1
 }
+try? fm.removeItem(at: root)
+exit(exitCode)

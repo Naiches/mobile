@@ -5,6 +5,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -301,6 +302,8 @@ type ByMeItem =
 export default function SharedScreen() {
   const { colors: c } = useTheme();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   // 1394 — shared bottom inset for the three FlatLists and the embedded
   // File Requests list, now that GlassTabBar floats over this screen instead
   // of reserving its own flow height.
@@ -577,14 +580,14 @@ export default function SharedScreen() {
         onPress={tappable ? () => openInvitePreview(item) : undefined}
         accessibilityRole="button"
         accessibilityLabel={`Shared file ${name} ${peer}`}
-        style={[styles.row, { borderBottomColor: c.line }]}
+        style={[styles.row, accessibilityLayout && styles.rowAccessibility, { borderBottomColor: c.line }]}
       >
         <View style={[styles.fileIcon, { backgroundColor: inviteMimeColor(item) }]}>
           <Ionicons name={fileTypeIconForInvite(item)} size={16} color="#FFFFFF" />
         </View>
-        <View style={styles.rowInfo}>
-          <Text style={[styles.rowName, { color: c.ink }]} numberOfLines={1}>{name}</Text>
-          <Text style={[styles.rowMeta, { color: c.ink3 }]} numberOfLines={1}>
+        <View style={[styles.rowInfo, accessibilityLayout && styles.rowInfoAccessibility]}>
+          <Text style={[styles.rowName, { color: c.ink }]} numberOfLines={accessibilityLayout ? 3 : 1}>{name}</Text>
+          <Text style={[styles.rowMeta, { color: c.ink3 }]} numberOfLines={accessibilityLayout ? undefined : 1}>
             {[peer, formatDate(item.created_at), expiryLabel(item.expires_at)]
               .filter(Boolean)
               .join('  ·  ')}
@@ -617,25 +620,25 @@ export default function SharedScreen() {
 
     const recoverable = canRebuildShareLink(item, isUnlocked);
     return (
-      <View style={[styles.row, { borderBottomColor: c.line }, item.revoked && { opacity: 0.55 }]}>
+      <View style={[styles.row, accessibilityLayout && styles.rowAccessibility, { borderBottomColor: c.line }, item.revoked && { opacity: 0.55 }]}>
         <TouchableOpacity
           activeOpacity={item.revoked ? 1 : 0.6}
           onPress={item.revoked ? undefined : () => openShareLinkPreview(item)}
           accessibilityRole="button"
           accessibilityLabel={`Share link for ${name}`}
-          style={styles.rowMain}
+          style={[styles.rowMain, accessibilityLayout && styles.rowMainAccessibility]}
         >
           <View style={[styles.fileIcon, { backgroundColor: linkMimeColor(item) }]}>
             <Ionicons name={linkIcon(item)} size={16} color="#FFFFFF" />
           </View>
-          <View style={styles.rowInfo}>
-            <Text style={[styles.rowName, { color: c.ink }]} numberOfLines={1}>{name}</Text>
-            <Text style={[styles.rowMeta, { color: c.ink3 }]} numberOfLines={1}>
+          <View style={[styles.rowInfo, accessibilityLayout && styles.rowInfoAccessibility]}>
+            <Text style={[styles.rowName, { color: c.ink }]} numberOfLines={accessibilityLayout ? 3 : 1}>{name}</Text>
+            <Text style={[styles.rowMeta, { color: c.ink3 }]} numberOfLines={accessibilityLayout ? undefined : 1}>
               {metaParts.join('  ·  ')}
             </Text>
           </View>
         </TouchableOpacity>
-        <View style={styles.rowTrailing}>
+        <View style={[styles.rowTrailing, accessibilityLayout && styles.rowTrailingAccessibility]}>
           <ShareLinkBadge link={item} />
           {!item.revoked && (
             recoverable ? (
@@ -650,7 +653,7 @@ export default function SharedScreen() {
                 <Text style={[styles.copyLinkText, { color: c.amberDeep }]}>Copy link</Text>
               </TouchableOpacity>
             ) : isUnlocked ? (
-              <Text style={[styles.linkUnavailable, { color: c.ink3 }]} numberOfLines={2}>
+              <Text style={[styles.linkUnavailable, { color: c.ink3 }]} numberOfLines={accessibilityLayout ? undefined : 2}>
                 Link not stored — revoke and recreate
               </Text>
             ) : null
@@ -830,13 +833,13 @@ export default function SharedScreen() {
 
       {/* Tier 2 — direction within Shares: With me | By me | Pending. */}
       {topTab === 'shares' && (
-        <View style={styles.dirBar} accessibilityRole="tablist">
+        <View style={[styles.dirBar, accessibilityLayout && styles.dirBarAccessibility]} accessibilityRole="tablist">
           {dirTabs.map((t) => {
             const active = shareDir === t.id;
             return (
               <TouchableOpacity
                 key={t.id}
-                style={[styles.dirTab, active && { borderBottomColor: c.amber }]}
+                style={[styles.dirTab, accessibilityLayout && styles.dirTabAccessibility, active && { borderBottomColor: c.amber }]}
                 onPress={() => {
                   if (shareDir === t.id) return;
                   Haptics.selectionAsync();
@@ -850,11 +853,11 @@ export default function SharedScreen() {
                 <View style={styles.tabContent}>
                   <Text
                     style={[styles.tabText, { color: c.ink3 }, active && [styles.tabTextActive, { color: c.ink }]]}
-                    numberOfLines={1}
+                    numberOfLines={accessibilityLayout ? undefined : 1}
                   >
                     {t.label}
                   </Text>
-                  <View style={[styles.tabCountBadge, { backgroundColor: active ? c.amberBg : c.paper2 }]}>
+                  <View style={[styles.tabCountBadge, accessibilityLayout && styles.tabCountBadgeAccessibility, { backgroundColor: active ? c.amberBg : c.paper2 }]}>
                     <Text style={[styles.tabCountText, { color: active ? c.amberDeep : c.ink3 }]} numberOfLines={1}>
                       {t.count}
                     </Text>
@@ -971,22 +974,29 @@ const styles = StyleSheet.create({
 
   // Tier 2 — direction segment (With me | By me | Pending), amber underline active
   dirBar: { flexDirection: 'row', paddingHorizontal: spacing.lg, paddingBottom: spacing.sm, gap: 4 },
+  dirBarAccessibility: { flexDirection: 'column' },
   dirTab: { flex: 1, paddingVertical: 10, alignItems: 'center', borderBottomWidth: 2, borderBottomColor: 'transparent' },
+  dirTabAccessibility: { flex: 0, width: '100%' },
   tabContent: { width: '100%', paddingHorizontal: 6, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 },
   tabText: { flexShrink: 1, fontSize: 13, fontWeight: '500' },
   tabTextActive: { fontWeight: '600' },
-  tabCountBadge: { minWidth: 22, height: 20, paddingHorizontal: 6, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  tabCountBadge: { minWidth: 22, minHeight: 20, paddingHorizontal: 6, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  tabCountBadgeAccessibility: { paddingVertical: 3 },
   tabCountText: { fontSize: 11, fontWeight: '700' },
 
   // List rows
   row: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: spacing.lg, borderBottomWidth: 1, gap: 12 },
+  rowAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   rowMain: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 12, minWidth: 0 },
+  rowMainAccessibility: { flex: 0, width: '100%', alignItems: 'flex-start' },
   rowTrailing: { alignItems: 'flex-end', justifyContent: 'center', gap: 6, maxWidth: 128 },
+  rowTrailingAccessibility: { width: '100%', maxWidth: '100%', alignItems: 'flex-start', paddingLeft: 44 },
   copyLinkBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingVertical: 2 },
   copyLinkText: { fontSize: 12, fontWeight: '600' },
   linkUnavailable: { fontSize: 10.5, lineHeight: 14, textAlign: 'right' },
   fileIcon: { width: 32, height: 32, borderRadius: radii.sm, alignItems: 'center', justifyContent: 'center' },
   rowInfo: { flex: 1, minWidth: 0 },
+  rowInfoAccessibility: { flexBasis: '70%' },
   rowName: { fontSize: 14, fontWeight: '500' },
   rowMeta: { fontSize: 11, marginTop: 2 },
 

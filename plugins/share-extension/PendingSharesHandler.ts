@@ -27,6 +27,7 @@ import {
   type PendingShareSummary,
 } from '../../modules/beebeeb-crypto'
 import { encryptedUpload, generateFileId } from '../../src/lib/encrypted-upload'
+import { matchShareRoute, type RoutedShareCounts } from '../../src/lib/share-routing'
 
 export type { PendingShareResource, PendingShareSummary }
 
@@ -37,6 +38,8 @@ export interface ProcessResult {
   uploaded: number
   failed: number
   skipped: number
+  /** Files saved to an app's Backups folder (see share-routing.ts), by app name. */
+  routed: RoutedShareCounts
 }
 
 export interface ProcessPendingSharesOptions {
@@ -44,9 +47,11 @@ export interface ProcessPendingSharesOptions {
   encryptChunkFn: (fileId: string, plaintext: Uint8Array) => Promise<EncryptedData>
   encryptMetadataFn: (fileId: string, metadata: string) => Promise<EncryptedData>
   onItemUploaded?: (item: PendingShareResource) => void
+  /** Finds or creates the `Backups › <app>` folder and returns its id. A failure leaves the file at its normal destination. */
+  resolveAppFolder?: (app: string) => Promise<string>
 }
 
-const NOOP: ProcessResult = { uploaded: 0, failed: 0, skipped: 0 }
+const NOOP: ProcessResult = { uploaded: 0, failed: 0, skipped: 0, routed: {} }
 
 /**
  * Quick check used by the App.tsx mount/foreground hooks to know whether
@@ -80,14 +85,15 @@ export async function processPendingShares(opts: ProcessPendingSharesOptions): P
   if (pending.length === 0) return NOOP
 
   if (!opts.vaultUnlocked) {
-    return { uploaded: 0, failed: 0, skipped: pending.length }
+    return { uploaded: 0, failed: 0, skipped: pending.length, routed: {} }
   }
 
   // Read the parent-folder mapping from the App Group container.
   // The share extension writes this so we know where to upload each file.
   const parentMap = await readParentMap()
 
-  const result: ProcessResult = { uploaded: 0, failed: 0, skipped: 0 }
+  const result: ProcessResult = { uploaded: 0, failed: 0, skipped: 0, routed: {} }
+  const appFolders = new Map<string, Promise<string | undefined>>()
   const uploadedIds: string[] = []
 
   for (const summary of pending) {
@@ -101,7 +107,22 @@ export async function processPendingShares(opts: ProcessPendingSharesOptions): P
 
     try {
       // Look up the target folder from the parent map
-      const parentId = parentMap[summary.id] ?? undefined
+      let parentId = parentMap[summary.id] ?? undefined
+      // No folder picked: a known app's export goes to its Backups folder.
+      let routedApp: string | null = null
+      const route = parentId === undefined && opts.resolveAppFolder ? matchShareRoute(resource.filename) : null
+      if (route) {
+        let folder = appFolders.get(route.app)
+        if (!folder) {
+          folder = opts.resolveAppFolder!(route.app).catch(() => undefined)
+          appFolders.set(route.app, folder)
+        }
+        const folderId = await folder
+        if (folderId) {
+          parentId = folderId
+          routedApp = route.app
+        }
+      }
 
       await encryptedUpload({
         fileId: await generateFileId(),
@@ -113,6 +134,7 @@ export async function processPendingShares(opts: ProcessPendingSharesOptions): P
         encryptMetadataFn: opts.encryptMetadataFn,
       })
       result.uploaded += 1
+      if (routedApp) result.routed[routedApp] = (result.routed[routedApp] ?? 0) + 1
       uploadedIds.push(summary.id)
       try {
         await acknowledgePendingShare(summary.id)

@@ -7,6 +7,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
@@ -83,23 +84,26 @@ function GuideCard({
   c: Colors;
 }) {
   const bg = initialsColor(index);
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
+  const stepNumberSize = Math.max(20, Math.ceil(14 * fontScale));
 
   return (
     <View style={[styles.card, { backgroundColor: c.paper, borderColor: c.line }]}>
       <TouchableOpacity
-        style={styles.cardHeader}
+        style={[styles.cardHeader, accessibilityLayout && styles.cardHeaderAccessibility]}
         activeOpacity={0.7}
         onPress={onToggle}
         accessibilityRole="button"
         accessibilityLabel={`${guide.appName} backup guide, ${DIFFICULTY_LABEL[guide.difficulty]}`}
       >
-        <View style={[styles.appIcon, { backgroundColor: bg }]}>
+        <View style={[styles.appIcon, accessibilityLayout && styles.appIconAccessibility, { backgroundColor: bg }]}>
           <Text style={[styles.appIconText, { color: c.ink2 }]}>{guide.appInitials}</Text>
         </View>
 
         <View style={styles.cardHeaderInfo}>
           <Text style={[styles.appName, { color: c.ink }]}>{guide.appName}</Text>
-          <View style={styles.cardMeta}>
+          <View style={[styles.cardMeta, accessibilityLayout && styles.cardMetaAccessibility]}>
             <DifficultyBadge difficulty={guide.difficulty} />
             <Text style={[styles.stepCount, { color: c.ink3 }]}>{guide.steps.length} steps</Text>
           </View>
@@ -115,7 +119,12 @@ function GuideCard({
           <View style={[styles.divider, { backgroundColor: c.line }]} />
           {guide.steps.map((step, i) => (
             <View key={i} style={styles.step}>
-              <View style={[styles.stepNumber, { backgroundColor: c.amberBg }]}>
+              <View
+                style={[
+                  styles.stepNumber,
+                  { width: stepNumberSize, height: stepNumberSize, borderRadius: stepNumberSize / 2, backgroundColor: c.amberBg },
+                ]}
+              >
                 <Text style={[styles.stepNumberText, { color: c.amberDeep }]}>{i + 1}</Text>
               </View>
               <Text style={[styles.stepText, { color: c.ink2 }]}>{step}</Text>
@@ -141,6 +150,8 @@ export default function BackupGuidesScreen() {
   const { colors: c } = useTheme();
   const { showToast } = useToast();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const guideList = initialGuides;
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [requestApp, setRequestApp] = useState('');
@@ -163,16 +174,16 @@ export default function BackupGuidesScreen() {
   return (
     <View style={[styles.root, { backgroundColor: c.paper2 }]}>
       {/* Header */}
-      <View style={[styles.header, { paddingTop: Math.max(insets.top + 8, 18) }]}>
+      <View style={[styles.header, accessibilityLayout && styles.headerAccessibility, { paddingTop: Math.max(insets.top + 8, 18) }]}>
         <TouchableOpacity
-          style={styles.backBtn}
+          style={[styles.backBtn, accessibilityLayout && styles.backBtnAccessibility]}
           onPress={() => navigation.goBack()}
           accessibilityRole="button"
           accessibilityLabel="Go back"
         >
           <Text style={[styles.backBtnText, { color: c.ink }]}>{'‹'}</Text>
         </TouchableOpacity>
-        <Text style={[styles.title, { color: c.ink }]}>Back up your apps</Text>
+        <Text style={[styles.title, accessibilityLayout && styles.titleAccessibility, { color: c.ink }]} numberOfLines={accessibilityLayout ? undefined : 1}>Back up your apps</Text>
       </View>
 
       <FlatList
@@ -203,9 +214,9 @@ export default function BackupGuidesScreen() {
               <Text style={[styles.requestSub, { color: c.ink3 }]}>
                 Request a guide and we will add it to the backup library.
               </Text>
-              <View style={styles.requestRow}>
+              <View style={[styles.requestRow, accessibilityLayout && styles.requestRowAccessibility]}>
                 <TextInput
-                  style={[styles.requestInput, { backgroundColor: c.paper2, borderColor: c.line, color: c.ink }]}
+                  style={[styles.requestInput, accessibilityLayout && styles.requestInputAccessibility, { backgroundColor: c.paper2, borderColor: c.line, color: c.ink }]}
                   placeholder="App name"
                   placeholderTextColor={c.ink4}
                   value={requestApp}
@@ -216,6 +227,7 @@ export default function BackupGuidesScreen() {
                 <Pressable
                   style={({ pressed }) => [
                     styles.requestSubmit,
+                    accessibilityLayout && styles.requestSubmitAccessibility,
                     { backgroundColor: c.ink },
                     pressed && styles.requestSubmitPressed,
                   ]}
@@ -260,6 +272,7 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
     gap: 12,
   },
+  headerAccessibility: { alignItems: 'flex-start', flexDirection: 'column' },
   backBtn: {
     width: 36,
     height: 36,
@@ -267,6 +280,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  backBtnAccessibility: { width: undefined, height: undefined, minWidth: 44, minHeight: 44, padding: 8 },
   backBtnText: {
     fontSize: 28,
     lineHeight: 30,
@@ -277,6 +291,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     lineHeight: 30,
   },
+  titleAccessibility: { flex: undefined, width: '100%' },
 
   subtitle: {
     fontSize: 13,
@@ -305,6 +320,7 @@ const styles = StyleSheet.create({
     padding: 12,
     gap: 10,
   },
+  cardHeaderAccessibility: { alignItems: 'flex-start' },
   appIcon: {
     width: 36,
     height: 36,
@@ -312,12 +328,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  appIconAccessibility: { width: 52, height: undefined, minHeight: 52, paddingHorizontal: 4, paddingVertical: 4 },
   appIconText: {
     fontSize: 11,
     fontWeight: '700',
     letterSpacing: 0.2,
   },
-  cardHeaderInfo: { flex: 1, gap: 4 },
+  cardHeaderInfo: { flex: 1, minWidth: 0, gap: 4 },
   appName: {
     fontSize: 14,
     fontWeight: '600',
@@ -327,6 +344,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
   },
+  cardMetaAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   stepCount: {
     fontSize: 11,
   },
@@ -418,21 +436,26 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 8,
   },
+  requestRowAccessibility: { flexDirection: 'column' },
   requestInput: {
     flex: 1,
-    height: 38,
+    minHeight: 38,
     borderRadius: radii.md,
     borderWidth: 1,
     paddingHorizontal: 10,
+    paddingVertical: 8,
     fontSize: 13,
   },
+  requestInputAccessibility: { flex: undefined, width: '100%' },
   requestSubmit: {
-    height: 38,
+    minHeight: 38,
+    paddingVertical: 8,
     paddingHorizontal: 14,
     borderRadius: radii.md,
     alignItems: 'center',
     justifyContent: 'center',
   },
+  requestSubmitAccessibility: { width: '100%' },
   requestSubmitPressed: {
     opacity: 0.75,
   },
@@ -449,6 +472,7 @@ const styles = StyleSheet.create({
     marginTop: 16,
     gap: 4,
     paddingVertical: 8,
+    flexWrap: 'wrap',
   },
   roadmapLinkText: {
     fontSize: 13,

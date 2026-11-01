@@ -2,12 +2,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { registerRootComponent } from 'expo';
 import { StatusBar } from 'expo-status-bar';
-import { ActivityIndicator, AppState, type AppStateStatus, type ImageSourcePropType, Keyboard, Linking, Platform, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, AppState, type AppStateStatus, type ImageSourcePropType, Keyboard, Linking, Platform, StyleSheet, useWindowDimensions, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as FileSystem from 'expo-file-system/legacy';
-import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
-import { createNativeBottomTabNavigator } from '@bottom-tabs/react-navigation';
+import { NavigationContainer, createNavigationContainerRef, type NavigatorScreenParams } from '@react-navigation/native';
+import { createNativeBottomTabNavigator, type NativeBottomTabScreenProps } from '@bottom-tabs/react-navigation';
 import type { SFSymbol } from 'sf-symbols-typescript';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -18,7 +18,10 @@ import * as Font from 'expo-font';
 import { ThemeProvider, useTheme } from './lib/theme-context';
 import type { PerformanceStorageProfile } from './lib/performance-storage-settings';
 import { ToastProvider } from './lib/toast-context';
+import { requestDriveRefresh } from './lib/drive-freshness';
+import { setSyncTraceSink } from './lib/sync-client';
 import { recordRuntimeTrace } from './lib/runtime-trace';
+import { createJsEventLoopMonitor } from './lib/js-event-loop-monitor';
 import { flushMarksBeforeSignOut } from './lib/sign-out-mark-flush';
 import { BBLogo } from './components/BBLogo';
 import {
@@ -35,11 +38,37 @@ import {
 import type { User } from './lib/api';
 import { stashAccountDeletedNotice } from './lib/account-deleted-notice';
 import { AuthContext } from './lib/auth';
-import { CryptoProvider, SIMULATOR_MASTER_KEY_FILE, useCrypto, usesSoftwareVaultFallback } from './lib/crypto-context';
+import {
+  CryptoProvider,
+  physicalVaultUsesSoftwareFallback,
+  SIMULATOR_MASTER_KEY_FILE,
+  useCrypto,
+  usesSoftwareVaultFallback,
+} from './lib/crypto-context';
 // Task 1594: the vault key is bound to its owner (key-ownership.ts).
-import { clearKeyOwner, readKeyOwner } from './lib/key-ownership';
+import {
+  MASTER_KEY_CHECK_LABEL,
+  clearKeyOwner,
+  precheckKeyOwner,
+  readKeyOwner,
+} from './lib/key-ownership';
 import { getMeNamingKeyOwner, retryStartupGetMe } from './lib/cold-start-owner';
 import { markUnlocked, wasRecentlyUnlocked } from './lib/lock-state';
+import {
+  APP_LOCK_DELAY_KEY,
+  APP_LOCK_PREF_KEY,
+  classifyKeyLoad,
+  isAppLockEnabled,
+  parseLockDelayMs,
+  softwareFallbackUnlockPlan,
+  shouldLockAtLaunch,
+  shouldRelockOnReturn,
+} from './lib/app-lock-policy';
+import {
+  nativeVaultAuthConfirmsFace,
+  PASSCODE_MIGRATION_KEY,
+  runPasscodeKeyMigration,
+} from './lib/app-lock-migration';
 import { SyncProvider } from './lib/sync-context';
 import { useNetworkStatus } from './lib/useNetworkStatus';
 import { hydrateShareKeys, setPendingShareKey } from './lib/share-key-store';
@@ -48,6 +77,9 @@ import * as Notifications from 'expo-notifications';
 import * as BeebeebCrypto from '../modules/beebeeb-crypto';
 import { populateFileProviderCache } from './lib/file-provider-mount';
 import { ensureFilesMountedByDefault } from './lib/files-mount-default';
+import { runFilesPostUnlock } from './lib/files-ready';
+import { createForegroundReturnTracker } from './lib/drive-freshness';
+import FilesReadySheet from './components/FilesReadySheet';
 import { initLocalIdentifierMap } from './lib/local-identifier-map';
 import { applyPreferenceUpdateOp } from './lib/photo-preview-sync';
 import { photoPreviewAppActive } from './lib/photo-preview-runner';
@@ -74,8 +106,6 @@ import { registerDevice } from './lib/device-registration';
 // `preference_update` sync ops: the photo preview setting changed on another device.
 onPreferenceUpdateOp(applyPreferenceUpdateOp);
 
-const BIOMETRIC_PREF_KEY = 'beebeeb_biometric_lock';
-const BIOMETRIC_DELAY_KEY = 'beebeeb_biometric_delay';
 
 const optionalFontAssets: Record<string, number> = {};
 
@@ -134,7 +164,10 @@ import AdvancedSettingsScreen from './screens/AdvancedSettingsScreen';
 import PhotoPreviewsScreen from './screens/PhotoPreviewsScreen';
 import PhotoPreviewCompareScreen from './screens/PhotoPreviewCompareScreen';
 import ThumbnailWorkerScreen from './screens/ThumbnailWorkerScreen';
-import PhotoLibrarySettingsScreen from './screens/PhotoLibrarySettingsScreen';
+import { clearLegacyPhotoExclusions } from './lib/photo-exclusion-cleanup';
+import PhotoSourcesScreen from './screens/PhotoSourcesScreen';
+import FirstRunSetupScreen from './screens/FirstRunSetupScreen';
+import CoachMarks from './components/first-run/CoachMarks';
 // __DEV__-only glass primitives gallery (task 1311). Registered below only
 // when __DEV__, so it is unreachable in a production build.
 import GlassGalleryScreen from './screens/GlassGalleryScreen';
@@ -151,6 +184,8 @@ import { SettingsAttentionProvider, useSettingsAttention } from './lib/settings-
 import { settingsTabBadge } from './lib/settings-attention';
 import { AnnouncementProvider } from './lib/announcement-context';
 import AnnouncementBanner from './components/AnnouncementBanner';
+import { ensureAppBackupFolder } from './services/BackupService';
+import { shareImportMessage } from './lib/share-routing';
 import { discardAllPendingShares, getPendingSharesCount, processPendingShares } from '../plugins/share-extension/PendingSharesHandler';
 import { useToast } from './lib/toast-context';
 import { clearWidgetData } from './utils/widgetData';
@@ -167,10 +202,22 @@ import {
 import { SecureStoragePanel } from './components/SecureStoragePanel';
 import { shouldClearPendingMarkerOnBoot, shouldRouteToPhraseGate } from './lib/phrase-confirmation-gate';
 import AndroidThumbnailRepairWorker from './lib/AndroidThumbnailRepairWorker';
+import { startRunDiagnostics } from './lib/run-diagnostics-runtime';
 import { BeebeebThumbnails } from '../modules/beebeeb-crypto';
+import { FirstRunSetupProvider, useFirstRunSetup } from './lib/first-run-context';
+import { CoachMarksProvider, useCoachMarks } from './lib/coach-marks-context';
+import { coachMarksCanPresentOnRoute, type CoachMarkStep } from './lib/coach-marks';
+import { clearActiveFirstRunAccount, type FirstRunSettingsCategory } from './lib/first-run-setup';
+import { firstRunSecureStorage } from './lib/first-run-storage';
+import { overlayScreen } from './lib/onboarding/overlay-screen';
+import { FilesSharedProvider, FilesTabBarVisibilityProvider } from './lib/files-shared-state';
+import {
+  filesTabReselectAction,
+  type BreadcrumbEntry,
+  type FilesAction,
+} from './lib/folder-navigation';
 
 const PHRASE_VERIFIED_KEY = 'beebeeb_phrase_verified';
-const MASTER_KEY_CHECK_LABEL = 'io.beebeeb.master-key-check';
 const MASTER_KEY_FALLBACK_LABEL = 'io.beebeeb.master-key.fallback';
 const STARTUP_STEP_TIMEOUT_MS = 5000;
 const STARTUP_TOKEN_READ_RECOVERY_TIMEOUT_MS = 15_000;
@@ -262,16 +309,25 @@ export type TabParamList = {
   // `'scan'` opens document scanner, `'recent'` shows last-24h filter, and
   // `'root'` resets the Files tab to Drive root on same-tab reselect.
   // FilesScreen consumes & clears the param so the action only fires once.
-  Files: { action?: 'upload' | 'search' | 'scan' | 'recent' | 'root' } | undefined;
+  Files: { action?: FilesAction; folderId?: string | null } | undefined;
   Shared: undefined;
   Photos: undefined;
-  Settings: undefined;
+  Settings: { firstRunCategory?: FirstRunSettingsCategory } | undefined;
   // 1308a — the iOS 26 native search-role tab (Apple's own "bar morphs into a
   // search field" behaviour, replacing 1312's glass search orb). Its own
   // tabPress is always intercepted (`preventsDefault` + a listener) and
   // redirected into Files' existing `{action:'search'}` contract (1338/1357)
   // — this route's own screen is never actually shown.
   Search: undefined;
+};
+
+export type FilesStackParamList = {
+  Drive: { action?: FilesAction; folderId?: string | null } | undefined;
+  Folder: {
+    folderId: string;
+    name: string;
+    path: BreadcrumbEntry[];
+  };
 };
 
 export type RootStackParamList = {
@@ -294,7 +350,8 @@ export type RootStackParamList = {
   Welcome: undefined;
   Signup: undefined;
   // Main app
-  Tabs: undefined;
+  Tabs: NavigatorScreenParams<TabParamList> | undefined;
+  FirstRunSetup: undefined;
   Trash: undefined;
   // File requests (0643)
   FileRequests: undefined;
@@ -381,7 +438,7 @@ export type RootStackParamList = {
   PhotoPreviews: undefined;
   PhotoPreviewCompare: { localIdentifier?: string };
   ThumbnailWorker: undefined;
-  PhotoLibrarySettings: undefined;
+  PhotoSources: undefined;
   /** `__DEV__` only — the iOS 26 glass primitives gallery (task 1311). */
   GlassGallery: undefined;
   DevPlaintextPurge: undefined;
@@ -448,7 +505,10 @@ const linking = {
         // beebeeb://upload and beebeeb://search are intercepted in
         // handleShortcutURL below so they can pass an `action` param.
         screens: {
-          Files: 'files',
+          Files: {
+            path: 'files',
+            screens: { Drive: '' },
+          },
           Shared: 'shared',
           Photos: 'photos',
           Settings: 'settings',
@@ -462,6 +522,7 @@ const linking = {
 };
 
 const Tab = createNativeBottomTabNavigator<TabParamList>();
+const FilesStack = createNativeStackNavigator<FilesStackParamList>();
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 // Module-level nav ref so non-component code (deep-link handler / quick
@@ -494,8 +555,9 @@ setupNotificationHandler();
 function OfflineBanner() {
   const insets = useSafeAreaInsets();
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
   return (
-    <View style={[offlineStyles.banner, { top: insets.top + 8, backgroundColor: c.amberBg, borderColor: c.line }]}>
+    <View style={[offlineStyles.banner, fontScale >= 1.3 && offlineStyles.bannerAccessibility, { top: insets.top + 8, backgroundColor: c.amberBg, borderColor: c.line }]}>
       <View style={[offlineStyles.iconCircle, { backgroundColor: c.line2 }]}>
         <Ionicons name="cloud-offline-outline" size={14} color={c.amberDeep} />
       </View>
@@ -526,6 +588,7 @@ const offlineStyles = StyleSheet.create({
     shadowRadius: 6,
     elevation: 4,
   },
+  bannerAccessibility: { alignItems: 'flex-start' },
   iconCircle: {
     width: 28,
     height: 28,
@@ -590,6 +653,8 @@ const signedOutPurger = createSignedOutPurger({
   full: () => purgeAllPlaintextCaches(),
 });
 
+setSyncTraceSink((name, fields) => recordRuntimeTrace(name, fields));
+
 function ShareSheetImporter({ enabled: enabledProp }: { enabled: boolean }) {
   const { showToast } = useToast();
   const { isUnlocked, encryptChunk, encryptMetadata } = useCrypto();
@@ -623,10 +688,11 @@ function ShareSheetImporter({ enabled: enabledProp }: { enabled: boolean }) {
         vaultUnlocked: crypto.isUnlocked,
         encryptChunkFn: crypto.encryptChunk,
         encryptMetadataFn: crypto.encryptMetadata,
+        resolveAppFolder: ensureAppBackupFolder,
       });
       if (result.uploaded > 0) {
-        const noun = result.uploaded === 1 ? 'file' : 'files';
-        showToast({ type: 'success', message: `${result.uploaded} ${noun} imported from share sheet` });
+        requestDriveRefresh('share-import');
+        showToast({ type: 'success', message: shareImportMessage(result) });
       }
       if (result.failed > 0) {
         showToast({ type: 'error', message: `${result.failed} share import${result.failed === 1 ? '' : 's'} failed` });
@@ -666,46 +732,31 @@ function BiometricGuard({
   startupLockChecked,
   userId,
   onUnlock,
+  onLockRequired,
+  onRecoveryRequired,
 }: {
   locked: boolean;
   startupLockChecked: boolean;
   userId: string | undefined;
   onUnlock: () => void;
+  onLockRequired: () => void;
+  onRecoveryRequired: () => void;
 }) {
   const crypto = useCrypto();
 
-  // Silent vault unlock — runs exactly ONCE on cold launch.
-  // After that, all unlocks come from BiometricLockScreen.handleUnlocked().
-  // The ref prevents re-triggering on every foreground/tab switch.
-  const silentUnlockDone = useRef(false);
-  useEffect(() => {
-    if (silentUnlockDone.current) return;
-    if (!startupLockChecked) return;
-    if (locked) return;
-    if (crypto.isUnlocked) { silentUnlockDone.current = true; return; }
-    silentUnlockDone.current = true;
-    // When biometric lock is enabled, the lock screen's authenticate() is the
-    // SOLE entry that drives unlock. Firing a silent keychain-backed unlock here
-    // too would surface a SECOND Face ID prompt on a Secure-Enclave key (the SE
-    // decrypt prompts), racing the lock screen and producing the "first fails,
-    // second unlocks" double-prompt. Skip the silent path entirely in that case.
-    void (async () => {
-      const pref = await SecureStore.getItemAsync(BIOMETRIC_PREF_KEY).catch(() => null);
-      if (pref === 'true') return;
-      await crypto.unlock(undefined, 'cold_launch_vault_unlock').catch(() => {});
-    })();
-  }, [locked, startupLockChecked, crypto.isUnlocked]);
+  // There is deliberately no silent cold-launch unlock here. A signed-in cold
+  // launch always shows BiometricLockScreen, which is the SOLE driver of the
+  // unlock: a second keychain-backed unlock firing alongside it would raise a
+  // second Face ID prompt (the double-prompt, tasks 0792 / 0882), and a
+  // swallowed failure of a silent one left the app open with a locked vault.
 
-  // Post-login vault unlock — closes the gap the two existing unlock drivers
-  // leave open for biometric-app-lock-ON accounts that sign in mid-session
-  // (task 1176). On such a login the grace window (markUnlocked) suppresses the
-  // BiometricLockScreen, and the silent cold-launch unlock above bails on
-  // `pref === 'true'` (and is a consumed one-shot) — so NOTHING calls
-  // crypto.unlock(), unlockAttempted never flips true, and FilesScreen parks on
-  // its skeleton forever (gated on unlockAttempted at FilesScreen.tsx:1870).
+  // Post-login vault unlock — a sign-in mid-session sits inside the grace window
+  // (markUnlocked), which suppresses the BiometricLockScreen, so NOTHING else
+  // calls crypto.unlock(), unlockAttempted never flips true, and FilesScreen
+  // parks on its skeleton forever (gated on unlockAttempted at
+  // FilesScreen.tsx:1870).
   //
-  // The `!locked` guard is load-bearing: on a COLD-LAUNCH biometric account
-  // (locked === true) this returns early so the BiometricLockScreen remains the
+  // The `!locked` guard is load-bearing: on a COLD-LAUNCH (locked === true) this returns early so the BiometricLockScreen remains the
   // SOLE unlock driver — this must NOT reintroduce the double-Face-ID the lock
   // screen / silent-unlock split fixed (tasks 0792 / 0882). We only drive an
   // unlock once the startup lock decision has settled AND no lock screen is up
@@ -716,7 +767,12 @@ function BiometricGuard({
     if (!startupLockChecked) return;
     if (locked) return;
     if (crypto.isUnlocked || crypto.unlockAttempted) return;
-    crypto.unlock(undefined, 'post_login_vault_unlock').catch(() => {});
+    crypto.unlock(undefined, 'post_login_vault_unlock').catch((err) => {
+      // A failed key load never leaves the app open with a locked vault: a
+      // cancelled / failed prompt hands over to the lock screen, which can
+      // retry. A missing key is VaultRecoveryGate's job (needsRecoveryPhrase).
+      if (classifyKeyLoad({ error: err, viaPassword: false }) === 'stay-locked') onLockRequired();
+    });
   }, [userId, startupLockChecked, locked, crypto.isUnlocked, crypto.unlockAttempted]);
 
   // The vault key load raises its OWN Face ID prompt only when it reads the
@@ -727,36 +783,102 @@ function BiometricGuard({
   // direction is the double-prompt (prompt + SE) or a missing gate (task 0792).
   const requireExplicitBiometric = crypto.isUnlocked || usesSoftwareVaultFallback();
 
-  async function handleUnlocked(opts?: { fallbackUnlock?: boolean }): Promise<{ ok: boolean }> {
-    const fallbackUnlock = opts?.fallbackUnlock ?? false;
-    try {
-      await crypto.unlock(undefined, 'app_biometric_lock_screen');
-    } catch (err) {
-      // The key load failed. The ONLY failure that should still open the app
-      // is the genuine "no key was ever provisioned" case (fresh install /
-      // device restore): there is nothing to biometric-gate and the
-      // VaultRecoveryGate takes over to collect a recovery phrase. The
-      // password path is also allowed through (the user proved identity with
-      // their Beebeeb password). EVERY other failure — a cancelled
-      // Secure-Enclave Face ID, or a transient keychain read — is fail-closed:
-      // stay locked so the vault never opens without a successful biometric.
-      const message = err instanceof Error ? err.message : '';
-      const missingKey = /no master key in keychain/i.test(message);
-      if (!fallbackUnlock && !missingKey) {
-        return { ok: false };
+  async function handleUnlocked(opts?: {
+    fallbackUnlock?: boolean;
+    softwareFallbackAuthenticated?: boolean;
+  }): Promise<{
+    ok: boolean;
+    nativeFaceAuthConfirmed: boolean;
+    explicitDeviceAuthRequired: boolean;
+  }> {
+    const viaPassword = opts?.fallbackUnlock ?? false;
+    let physicalFallbackPresent = false;
+    if (userId) {
+      // Preserve the vault's long-standing "owner before prompt" invariant.
+      // A stale key for another account is purged without Face ID, and a
+      // crash-left fallback without its recovery-check marker routes directly
+      // to recovery instead of raising a pointless device-owner sheet.
+      const ownerPrecheck = await precheckKeyOwner(userId);
+      const hasProvisionedKey = ownerPrecheck !== 'purged' && (
+        await SecureStore.getItemAsync(MASTER_KEY_CHECK_LABEL).catch(() => null)
+      ) != null;
+      if (hasProvisionedKey) {
+        physicalFallbackPresent = await physicalVaultUsesSoftwareFallback();
       }
     }
-    const token = await getToken().catch(() => null);
-    if (token) {
-      await BeebeebCrypto.mirrorSessionToAppGroup(token, getApiUrl()).catch(() => false);
+    const softwareFallbackPlan = softwareFallbackUnlockPlan({
+      physicalFallbackPresent,
+      deviceOwnerAuthenticated: opts?.softwareFallbackAuthenticated === true,
+      viaPassword,
+    });
+    if (softwareFallbackPlan === 'authenticate') {
+      return {
+        ok: false,
+        nativeFaceAuthConfirmed: false,
+        explicitDeviceAuthRequired: true,
+      };
     }
-    // The domain registrar prewarms mounted Files roots after unlock.
-    // Resume any thumbnail worker pool jobs that were paused during lock.
-    if (Platform.OS === 'ios') {
-      try { await BeebeebThumbnails.resumeWorkers(); } catch {}
+    // Read this before the native load: an upgraded `.devicePasscode` key is
+    // migrated during that load, but its one-time sheet proves only the iPhone
+    // passcode, not Face ID consent. Stay conservative until a later current-
+    // policy unlock (or an explicit wizard/settings Face ID attempt).
+    const accessControlAlreadyCurrent = (
+      await SecureStore.getItemAsync(PASSCODE_MIGRATION_KEY).catch(() => null)
+    ) === '1';
+    let loadError: unknown = null;
+    try {
+      await crypto.unlock(undefined, 'app_biometric_lock_screen', undefined, {
+        preferSoftwareFallback: softwareFallbackPlan === 'prefer-fallback',
+      });
+    } catch (err) {
+      loadError = err;
     }
+    // A cancelled Secure-Enclave Face ID or a transient keychain read stays
+    // locked so the lock screen can prompt again. A missing key (fresh install
+    // / restore) or a failed key load after the Beebeeb password check goes to
+    // the recovery flow. Neither ever opens the app with a locked vault.
+    const outcome = classifyKeyLoad({ error: loadError, viaPassword });
+    if (outcome === 'stay-locked') {
+      return { ok: false, nativeFaceAuthConfirmed: false, explicitDeviceAuthRequired: false };
+    }
+    const migrateAccessControl = outcome !== 'recovery';
+    if (outcome === 'recovery') {
+      onRecoveryRequired();
+    }
+    // Authentication and key classification are complete. Do not keep the
+    // lock-screen spinner visible while optional post-unlock housekeeping runs.
     onUnlock();
-    return { ok: true };
+    void (async () => {
+      if (migrateAccessControl) {
+        // Move a legacy Face-ID-only or passcode-only key to user presence.
+        // This is single-flight, and finishes before workers are resumed.
+        await runPasscodeKeyMigration({
+          get: (key) => SecureStore.getItemAsync(key),
+          set: (key, value) => SecureStore.setItemAsync(key, value),
+          setBiometricRequirement: crypto.setBiometricRequirement,
+        });
+      }
+      const token = await getToken().catch(() => null);
+      if (token) {
+        await BeebeebCrypto.mirrorSessionToAppGroup(token, getApiUrl()).catch(() => false);
+      }
+      // The domain registrar prewarms mounted Files roots after unlock.
+      // Resume any thumbnail worker pool jobs that were paused during lock.
+      if (Platform.OS === 'ios') {
+        try { await BeebeebThumbnails.resumeWorkers(); } catch {}
+      }
+    })();
+    return {
+      ok: true,
+      nativeFaceAuthConfirmed: nativeVaultAuthConfirmsFace({
+        accessControlAlreadyCurrent,
+        explicitAuthRequired: requireExplicitBiometric,
+        vaultOpened: outcome === 'open',
+        viaPassword,
+        viaSoftwareFallback: softwareFallbackPlan === 'prefer-fallback',
+      }),
+      explicitDeviceAuthRequired: false,
+    };
   }
 
   if (!locked) return null;
@@ -767,7 +889,7 @@ function BiometricGuard({
   );
 }
 
-function VaultRecoveryGate({ enabled, navReady, navReadyEpoch }: { enabled: boolean; navReady: boolean; navReadyEpoch: number }) {
+function VaultRecoveryGate({ enabled, forceRecovery, onRecoveryRouted, navReady, navReadyEpoch }: { enabled: boolean; forceRecovery: boolean; onRecoveryRouted: () => void; navReady: boolean; navReadyEpoch: number }) {
   const crypto = useCrypto();
 
   useEffect(() => {
@@ -790,7 +912,7 @@ function VaultRecoveryGate({ enabled, navReady, navReadyEpoch }: { enabled: bool
       isUnlocked: crypto.isUnlocked,
       currentRoute: navigationRef.isReady() ? navigationRef.getCurrentRoute()?.name ?? null : null,
     });
-    if (!enabled || !crypto.needsRecoveryPhrase || crypto.isUnlocked) return;
+    if (!enabled || !(crypto.needsRecoveryPhrase || forceRecovery) || crypto.isUnlocked) return;
     // Bail until the navigation container is ready. navReady is in the dep
     // array so this effect re-fires the moment nav becomes ready, even if
     // needsRecoveryPhrase flipped to true earlier (common on cold launch
@@ -803,14 +925,16 @@ function VaultRecoveryGate({ enabled, navReady, navReadyEpoch }: { enabled: bool
       currentRoute === 'RecoveryUnlock' ||
       currentRoute === 'RecoveryPhraseVerify'
     ) {
+      if (forceRecovery) onRecoveryRouted();
       return;
     }
 
     navigationRef.navigate('RecoveryUnlock');
+    if (forceRecovery) onRecoveryRouted();
     // 1283 — navReadyEpoch in the deps is the actual fix: every container (re)mount re-runs this
     // effect once the new navigator is ready, so a navigate() swallowed by a remount is simply
     // re-issued against the live navigator instead of being lost forever.
-  }, [enabled, navReady, navReadyEpoch, crypto.needsRecoveryPhrase, crypto.isUnlocked]);
+  }, [enabled, forceRecovery, navReady, navReadyEpoch, crypto.needsRecoveryPhrase, crypto.isUnlocked]);
 
   return null;
 }
@@ -845,14 +969,80 @@ function PhraseGate({ enabled, navReady, navReadyEpoch }: { enabled: boolean; na
   return null;
 }
 
-// Task 1722 round 4 (Guus 2026-10-15, Q1 "Files on by default"): on every unlock and
-// foreground, the signed-in account gets Beebeeb in iOS Files unless it turned Files off in
+function FirstRunSetupGate({
+  enabled,
+  navReady,
+  navReadyEpoch,
+}: {
+  enabled: boolean;
+  navReady: boolean;
+  navReadyEpoch: number;
+}) {
+  const crypto = useCrypto();
+  const setup = useFirstRunSetup();
+  const account = useAccountState();
+  const accountStep = overlayScreen(account.document, account.unsupportedSchema);
+
+  useEffect(() => {
+    if (!enabled || !navReady || !navigationRef.isReady()) return;
+    if (!crypto.isUnlocked || !account.ready || account.gate.kind === 'needs_plan' || accountStep) return;
+    if (!setup.shouldShowWizard) return;
+    if (navigationRef.getCurrentRoute()?.name === 'FirstRunSetup') return;
+    navigationRef.navigate('FirstRunSetup');
+  }, [
+    account.gate.kind,
+    account.ready,
+    accountStep,
+    crypto.isUnlocked,
+    enabled,
+    navReady,
+    navReadyEpoch,
+    setup.shouldShowWizard,
+  ]);
+
+  return null;
+}
+
+function CoachMarksGate({ enabled, navigationEpoch }: { enabled: boolean; navigationEpoch: number }) {
+  const crypto = useCrypto();
+  const setup = useFirstRunSetup();
+  const coach = useCoachMarks();
+  const account = useAccountState();
+  const accountStep = overlayScreen(account.document, account.unsupportedSchema);
+  const currentRoute = navigationEpoch >= 0 && navigationRef.isReady()
+    ? navigationRef.getCurrentRoute()?.name ?? null
+    : null;
+  const navigateTo = useCallback((step: CoachMarkStep) => {
+    if (!navigationRef.isReady()) return;
+    if (step === 'drive') navigationRef.navigate('Tabs', { screen: 'Files', params: { action: 'root' } });
+    else if (step === 'photos') navigationRef.navigate('Tabs', { screen: 'Photos' });
+    else if (step === 'shared') navigationRef.navigate('Tabs', { screen: 'Shared' });
+    else navigationRef.navigate('Tabs', { screen: 'Settings' });
+  }, []);
+
+  const canShow = enabled &&
+    crypto.isUnlocked &&
+    setup.ready &&
+    setup.state.completed &&
+    account.ready &&
+    account.gate.kind !== 'needs_plan' &&
+    coachMarksCanPresentOnRoute(coach.state, currentRoute) &&
+    !accountStep;
+
+  return <CoachMarks enabled={canShow} navigateTo={navigateTo} />;
+}
+
+// Task 1722 round 4 (Guus 2026-10-15, Q1 "Files on by default"): on every unlock and after a
+// real, long background return, the signed-in account gets Beebeeb in iOS Files unless it turned Files off in
 // Settings (src/lib/files-mount-default.ts: register when mounted, mount when not, stay off
 // after an explicit off). Q2: sign-out still removes the domain and the Files key.
 function FileProviderDomainRegistrar({ enabled, userId }: { enabled: boolean; userId: string | null }) {
   const crypto = useCrypto();
   const registeringRef = useRef(false);
   const attemptedRef = useRef(false);
+  const foregroundTrackerRef = useRef(createForegroundReturnTracker());
+  const returnedFromBackground = useCallback((next: string) => foregroundTrackerRef.current(next), []);
+  const [filesReadyVisible, setFilesReadyVisible] = useState(false);
 
   const register = useCallback(async () => {
     if (Platform.OS !== 'ios' || !enabled || !crypto.isUnlocked || !userId) return;
@@ -863,7 +1053,28 @@ function FileProviderDomainRegistrar({ enabled, userId }: { enabled: boolean; us
     try {
       const token = await getToken();
       if (!token) return;
-      const { action, result } = await ensureFilesMountedByDefault(userId);
+      // After every unlock: session to the App Group, Files mounted (the extension's key and the
+      // authentication throttle are handled by the registration), root and working set signalled,
+      // and the "ready" sheet when Files had asked for authentication a few minutes ago.
+      const captured: { outcome: Awaited<ReturnType<typeof ensureFilesMountedByDefault>> | null } = { outcome: null };
+      const { showReady } = await runFilesPostUnlock({
+        readAuthRequiredAt: BeebeebCrypto.getFileProviderAuthRequiredAt,
+        clearAuthRequired: BeebeebCrypto.clearFileProviderAuthRequired,
+        mirrorSession: () => BeebeebCrypto.mirrorSessionToAppGroup(token, getApiUrl()),
+        ensureFiles: async () => {
+          captured.outcome = await ensureFilesMountedByDefault(userId);
+          const { action, result } = captured.outcome;
+          return {
+            action,
+            changed: result?.added === true || result?.removedBeforeAdd === true,
+          };
+        },
+        signalEnumerators: BeebeebCrypto.signalFileProviderEnumerators,
+        now: Date.now,
+      });
+      if (showReady) setFilesReadyVisible(true);
+      if (!captured.outcome) return;
+      const { action, result } = captured.outcome;
       // "registered" is not "presented in Files". userVisibleRootError != null
       // means iOS could not surface the location (the user may have removed it),
       // so don't treat it as mounted.
@@ -889,6 +1100,7 @@ function FileProviderDomainRegistrar({ enabled, userId }: { enabled: boolean; us
 
   useEffect(() => {
     attemptedRef.current = false;
+    foregroundTrackerRef.current = createForegroundReturnTracker();
   }, [crypto.isUnlocked, enabled, userId]);
 
   useEffect(() => {
@@ -897,27 +1109,60 @@ function FileProviderDomainRegistrar({ enabled, userId }: { enabled: boolean; us
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', (next) => {
-      if (next === 'active') {
-        // Re-arm so every foreground re-checks getDomains() and re-adds the
-        // domain if the user removed the Beebeeb location in Files while the
-        // app was backgrounded. Without this, attemptedRef stays true and a
-        // user-removed mount never comes back until the vault re-locks.
+      if (returnedFromBackground(next)) {
+        // Re-check only after a real, long background. Bare inactive/active
+        // transitions (Face ID, Control Center) keep the current attempt.
         attemptedRef.current = false;
         void register();
       }
     });
     return () => sub.remove();
-  }, [register]);
+  }, [register, returnedFromBackground]);
 
-  return null;
+  return <FilesReadySheet visible={filesReadyVisible} onDismissed={() => setFilesReadyVisible(false)} />;
 }
 
 // ---------------------------------------------------------------------------
 // Tab Navigator
 // ---------------------------------------------------------------------------
 
+function FilesNavigator({ route, navigation }: NativeBottomTabScreenProps<TabParamList, 'Files'>) {
+  const clearTabAction = useCallback(() => {
+    navigation.setParams({ action: undefined, folderId: undefined });
+  }, [navigation]);
+
+  return (
+    <FilesSharedProvider
+      tabAction={route.params?.action}
+      tabFolderId={route.params?.folderId}
+      clearTabAction={clearTabAction}
+    >
+      <FilesStack.Navigator
+        initialRouteName="Drive"
+        screenOptions={{
+          headerShown: false,
+          gestureEnabled: true,
+          animation: 'default',
+        }}
+      >
+        <FilesStack.Screen name="Drive" component={FilesScreen} />
+        <FilesStack.Screen
+          name="Folder"
+          component={FilesScreen}
+          getId={({ params }) => params.folderId}
+        />
+      </FilesStack.Navigator>
+    </FilesSharedProvider>
+  );
+}
+
+function SearchRedirectScreen() {
+  return null;
+}
+
 function TabNavigator() {
   const { colors: c } = useTheme();
+  const [filesTabBarHidden, setFilesTabBarHidden] = useState(false);
   // Task 2245 (P1): ONE source for the Settings badge and the Settings root
   // rows. Storage refreshes on foreground (inside the hook) and when
   // Settings gains focus (SettingsScreen calls `refresh()`).
@@ -943,7 +1188,9 @@ function TabNavigator() {
   const settingsBadge: string = settingsTabBadge(settingsAttention);
 
   return (
+    <FilesTabBarVisibilityProvider setHidden={setFilesTabBarHidden}>
     <Tab.Navigator
+      tabBarHidden={filesTabBarHidden}
       tabBarActiveTintColor={c.amber}
       // No effect on iOS 26+ (Liquid Glass tabs don't tint inactive icons by
       // colour) — kept for iOS <26 devices, which still get the stock
@@ -963,15 +1210,14 @@ function TabNavigator() {
     >
       <Tab.Screen
         name="Files"
-        component={FilesScreen}
+        component={FilesNavigator}
         options={{ tabBarButtonTestID: 'tab-files' }}
         listeners={({ navigation, route }) => ({
           tabPress: () => {
             const state = navigation.getState();
             const focusedRoute = state.routes[state.index];
-            if (focusedRoute?.key === route.key) {
-              navigation.setParams({ action: 'root' });
-            }
+            const action = filesTabReselectAction(focusedRoute?.key === route.key);
+            if (action) navigation.setParams({ action });
           },
         })}
       />
@@ -991,7 +1237,7 @@ function TabNavigator() {
           contract (1338/1357) before the default tab switch completes. */}
       <Tab.Screen
         name="Search"
-        component={FilesScreen}
+        component={SearchRedirectScreen}
         options={{ role: 'search', tabBarButtonTestID: 'tab-search', preventsDefault: true }}
         listeners={({ navigation }) => ({
           tabPress: (e) => {
@@ -1001,6 +1247,7 @@ function TabNavigator() {
         })}
       />
     </Tab.Navigator>
+    </FilesTabBarVisibilityProvider>
   );
 }
 
@@ -1025,9 +1272,27 @@ export default function App() {
   // (RN silently falls back to system monospace for unknown family names)
   void fontsLoaded; // used implicitly: font is available once loaded
 
+  // Record why the previous run ended and watch this one (background footprint, memory warnings).
+  useEffect(() => {
+    startRunDiagnostics();
+  }, []);
+
+  useEffect(() => {
+    const monitor = createJsEventLoopMonitor({ trace: recordRuntimeTrace });
+    monitor.start();
+    return () => monitor.stop();
+  }, []);
+
   // Biometric lock: show lock screen when app resumes from background
   const [locked, setLocked] = useState(false);
-  const [startupLockChecked, setStartupLockChecked] = useState(false);
+  // Set when the vault key could not be loaded after the Beebeeb password
+  // check: routes to the recovery / password unlock flow.
+  const [recoveryRequested, setRecoveryRequested] = useState(false);
+  // Bind the lock decision to the authenticated account. A stale "checked"
+  // value from the signed-out splash must never make the first restored-
+  // session frame paintable before this account's lock is decided.
+  const [lockDecisionUserId, setLockDecisionUserId] = useState<string | null>(null);
+  const startupLockChecked = user == null || lockDecisionUserId === user.user_id;
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
   const backgroundAtRef = useRef<number | null>(null);
   const startupRunIdRef = useRef(0);
@@ -1054,6 +1319,7 @@ export default function App() {
   // across a remount, so effects keyed only on it never re-fire — which is how the vault-recovery
   // redirect could be issued against a dying navigator and silently vanish.
   const [navReadyEpoch, setNavReadyEpoch] = useState(0);
+  const [navigationStateEpoch, setNavigationStateEpoch] = useState(0);
 
   const isConnected = useNetworkStatus();
 
@@ -1079,7 +1345,7 @@ export default function App() {
       // the canonical client_devices UUID into the push-token registration.
       // Both are best-effort — failures are silently swallowed inside each fn.
       void registerDevice().then((clientDeviceId) => {
-        void registerForPushNotifications(clientDeviceId);
+        void registerForPushNotifications(clientDeviceId, { requestPermission: false });
       });
       // Hydrate the PhotoKit identifier map so thumbnails can short-circuit
       // through PHImageManager for camera-roll-backed files (task 0552).
@@ -1282,10 +1548,10 @@ export default function App() {
           SecureStore.setItemAsync(LAST_CONNECTED_KEY, new Date().toISOString()).catch(() => {});
           // Register this device with the clients API (best-effort, cold launch).
           void registerDevice().then((clientDeviceId) => {
-            // Android token acquisition owns the permission prompt and channel
-            // setup; iOS already acquires its token inside registerDevice().
+            // Android needs its channel before token registration. Startup is
+            // passive: first-run setup or Settings owns the permission prompt.
             if (Platform.OS === 'android') {
-              void registerForPushNotifications(clientDeviceId);
+              void registerForPushNotifications(clientDeviceId, { requestPermission: false });
             }
           });
           // Hydrate PhotoKit identifier map on cold launch too (refreshAuth
@@ -1372,6 +1638,15 @@ export default function App() {
     })();
   }, []);
 
+  // One-shot: the retired "folders shown in Photos" exclusion list is deleted.
+  useEffect(() => {
+    void clearLegacyPhotoExclusions({
+      get: (key) => AsyncStorage.getItem(key),
+      set: (key, value) => AsyncStorage.setItem(key, value),
+      deleteSecure: (key) => SecureStore.deleteItemAsync(key),
+    });
+  }, []);
+
   // On mount: check for an existing session
   useEffect(() => {
     void runStartup();
@@ -1379,31 +1654,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
     if (!user) {
       setLocked(false);
-      setStartupLockChecked(true);
+      setLockDecisionUserId(null);
       backgroundAtRef.current = null;
-      return () => {
-        cancelled = true;
-      };
+      return;
     }
 
-    setStartupLockChecked(false);
-    void (async () => {
-      const pref = await SecureStore.getItemAsync(BIOMETRIC_PREF_KEY).catch(() => null);
-      if (cancelled) return;
-      if (pref === 'true' && !wasRecentlyUnlocked()) {
-        setLocked(true);
-      } else {
-        setLocked(false);
-      }
-      setStartupLockChecked(true);
-    })();
-
-    return () => {
-      cancelled = true;
-    };
+    // Every signed-in cold launch locks, whatever the app lock setting says;
+    // the setting only governs relocking when the user returns later. A
+    // sign-in that just authenticated is inside the grace window.
+    setLocked(shouldLockAtLaunch({ signedIn: true, recentlyUnlocked: wasRecentlyUnlocked() }));
+    setLockDecisionUserId(user.user_id);
   }, [user?.user_id]);
 
   // Register session-expired handler so 401s auto-sign-out
@@ -1444,6 +1706,9 @@ export default function App() {
   useEffect(() => {
     // Round 15 (review item 5): cleared at sign-out, so a later session's
     // refreshAuth reads the key owner instead of naming the previous user.
+    if (!user && currentUserIdRef.current) {
+      void clearActiveFirstRunAccount(firstRunSecureStorage, currentUserIdRef.current).catch(() => {});
+    }
     currentUserIdRef.current = user ? user.user_id : null;
   }, [user]);
   const onSignedOutSurface = !checking && !showDiagnostics && !showSecureStorageError && user == null;
@@ -1462,20 +1727,18 @@ export default function App() {
     return () => subscription.remove();
   }, [user?.user_id]);
 
-  // Lock the app when it goes to background and biometric pref is on.
-  // The user-configurable delay (BIOMETRIC_DELAY_KEY, in ms) lets a quick
-  // app-switcher peek skip the lock — only background longer than `delay`
-  // triggers Face ID on resume.
+  // Relock when returning to the app: only if the app lock setting is ON and the
+  // app was in the background for longer than the delay (APP_LOCK_DELAY_KEY, in
+  // ms; default 15 minutes). A quick app-switcher peek does not lock.
   useEffect(() => {
     const subscription = AppState.addEventListener('change', async (nextState: AppStateStatus) => {
-      const prev = appStateRef.current;
       appStateRef.current = nextState;
 
-      // Only `background` resets the timer. `inactive` is fired by the system
-      // for incidental events (notification panel pull, biometric prompts,
-      // share sheet, app switcher peek) and must not be treated as the user
-      // leaving the app. Without this distinction the Face ID prompt itself
-      // produces an inactive→active cycle that re-locks immediately.
+      // Only `background` starts the timer. `inactive` is fired by the system
+      // for incidental events (notification panel pull, the Face ID and
+      // passcode sheets, share sheet, app switcher peek) and must not be
+      // treated as the user leaving the app. Without this distinction the
+      // prompt itself produces an inactive→active cycle that re-locks at once.
       if (nextState === 'background') {
         if (backgroundAtRef.current == null) {
           backgroundAtRef.current = Date.now();
@@ -1483,21 +1746,25 @@ export default function App() {
         return;
       }
 
-      if (prev === 'background' && nextState === 'active') {
-        const elapsed = backgroundAtRef.current != null ? Date.now() - backgroundAtRef.current : 0;
+      // Evaluate on any return to `active` that followed a REAL background
+      // period (iOS often passes through `inactive` on the way back).
+      if (nextState === 'active' && backgroundAtRef.current != null) {
+        const backgroundedForMs = Date.now() - backgroundAtRef.current;
         backgroundAtRef.current = null;
 
-        // Recently authenticated? The system briefly backgrounds the app
-        // around the Face ID prompt and again right after enabling the
-        // setting. Skip the lock so we don't bounce the user.
-        if (wasRecentlyUnlocked()) return;
-
         try {
-          const pref = await SecureStore.getItemAsync(BIOMETRIC_PREF_KEY);
-          if (pref !== 'true') return;
-          const delayRaw = await SecureStore.getItemAsync(BIOMETRIC_DELAY_KEY);
-          const delay = delayRaw ? parseInt(delayRaw, 10) : 0;
-          if (elapsed > delay) {
+          const pref = await SecureStore.getItemAsync(APP_LOCK_PREF_KEY);
+          const delayRaw = await SecureStore.getItemAsync(APP_LOCK_DELAY_KEY);
+          // Recently authenticated? The system briefly backgrounds the app
+          // around the prompt and again right after changing the setting.
+          if (
+            shouldRelockOnReturn({
+              enabled: isAppLockEnabled(pref),
+              backgroundedForMs,
+              delayMs: parseLockDelayMs(delayRaw),
+              recentlyUnlocked: wasRecentlyUnlocked(),
+            })
+          ) {
             setLocked(true);
           }
         } catch {
@@ -1631,6 +1898,7 @@ export default function App() {
   // Listen for a successful login from the auth screens
   // by polling the token after navigation events
   const handleNavigationStateChange = useCallback(async () => {
+    setNavigationStateEpoch((epoch) => epoch + 1);
     if (user) return;
     // Task 1746 (restores the 1594 round 6 guard removed with the old signup): while
     // signup is storing the new account's key, `user` must not flip underneath it.
@@ -1642,7 +1910,7 @@ export default function App() {
   }, [user, refreshAuth]);
 
   // Loading splash while checking auth, or diagnostic panel when server is unreachable
-  if (checking || welcomeSeen === null || showDiagnostics || showSecureStorageError) {
+  if (checking || !startupLockChecked || welcomeSeen === null || showDiagnostics || showSecureStorageError) {
     return (
       <SafeAreaProvider>
         <View style={{ flex: 1, backgroundColor: c.paper, alignItems: 'center', justifyContent: 'center', paddingHorizontal: showDiagnostics || showSecureStorageError ? 0 : 32 }}>
@@ -1699,6 +1967,8 @@ export default function App() {
       <ToastProvider>
       <AnnouncementProvider>
       <BackupProvider>
+        <FirstRunSetupProvider accountId={user?.user_id ?? null}>
+        <CoachMarksProvider accountId={user?.user_id ?? null}>
         <SettingsAttentionProvider>
         <NavigationContainer
           ref={navigationRef}
@@ -1712,8 +1982,17 @@ export default function App() {
           }}
           onStateChange={handleNavigationStateChange}
         >
-            <VaultRecoveryGate enabled={isAuthenticated && startupLockChecked && !locked} navReady={navReady} navReadyEpoch={navReadyEpoch} />
+            <VaultRecoveryGate enabled={isAuthenticated && startupLockChecked && !locked} forceRecovery={recoveryRequested} onRecoveryRouted={() => setRecoveryRequested(false)} navReady={navReady} navReadyEpoch={navReadyEpoch} />
             <PhraseGate enabled={needsPhraseGate && startupLockChecked && !locked} navReady={navReady} navReadyEpoch={navReadyEpoch} />
+            <FirstRunSetupGate
+              enabled={isAuthenticated && startupLockChecked && !locked && !needsPhraseGate}
+              navReady={navReady}
+              navReadyEpoch={navReadyEpoch}
+            />
+            <CoachMarksGate
+              enabled={navReady && isAuthenticated && startupLockChecked && !locked && !needsPhraseGate}
+              navigationEpoch={navigationStateEpoch}
+            />
             <DevicePerformanceCalibrator enabled={isAuthenticated && startupLockChecked && !locked} />
             {isAuthenticated && startupLockChecked && !locked && Platform.OS === 'android'
               ? <AndroidThumbnailRepairWorker enabled />
@@ -1723,6 +2002,11 @@ export default function App() {
               {isAuthenticated ? (
                 <>
                   <Stack.Screen name="Tabs" component={TabNavigator} />
+                  <Stack.Screen
+                    name="FirstRunSetup"
+                    component={FirstRunSetupScreen}
+                    options={{ gestureEnabled: false, animation: 'fade' }}
+                  />
                   <Stack.Screen
                     name="RecoveryUnlock"
                     component={RecoveryUnlockScreen}
@@ -1844,8 +2128,8 @@ export default function App() {
                     options={{ headerShown: false }}
                   />
                   <Stack.Screen
-                    name="PhotoLibrarySettings"
-                    component={PhotoLibrarySettingsScreen}
+                    name="PhotoSources"
+                    component={PhotoSourcesScreen}
                     options={{ headerShown: false }}
                   />
                 </>
@@ -1876,6 +2160,8 @@ export default function App() {
             </Stack.Navigator>
         </NavigationContainer>
         </SettingsAttentionProvider>
+        </CoachMarksProvider>
+        </FirstRunSetupProvider>
 
         {/* Offline banner */}
         {!isConnected && <OfflineBanner />}
@@ -1901,6 +2187,8 @@ export default function App() {
             startupLockChecked={startupLockChecked}
             userId={user?.user_id}
             onUnlock={() => { markUnlocked(); setLocked(false); }}
+            onLockRequired={() => setLocked(true)}
+            onRecoveryRequired={() => setRecoveryRequested(true)}
           />
         )}
 

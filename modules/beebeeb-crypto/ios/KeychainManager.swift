@@ -63,6 +63,129 @@ final class KeychainManager {
     set { UserDefaults.standard.set(newValue, forKey: "io.beebeeb.requiresBiometric") }
   }
 
+  // Version 1 changed the primary passcode-allowed ACL from `.devicePasscode`
+  // to `.userPresence`. An absent version with an existing primary key means
+  // an upgraded install: its first load must honor the old ACL exactly once,
+  // then re-wrap to the current Face-ID-first policy.
+  private static let primaryAccessControlVersionKey = "io.beebeeb.primaryAccessControl.version"
+  private static let currentPrimaryAccessControlVersion = 1
+
+  private static var legacyPrimaryAccessControl: Bool {
+    UserDefaults.standard.integer(forKey: primaryAccessControlVersionKey) < currentPrimaryAccessControlVersion
+  }
+
+  private static func markPrimaryAccessControlCurrent() {
+    UserDefaults.standard.set(currentPrimaryAccessControlVersion, forKey: primaryAccessControlVersionKey)
+  }
+
+  /// Check whether Expo SecureStore has an item without requesting its value.
+  ///
+  /// The physical-device software-vault recovery path needs to decide whether
+  /// an explicit device-owner sheet is required *before* it reads the fallback
+  /// master key. Calling SecureStore.getItemAsync merely to test existence
+  /// would return those sensitive bytes across the native/JS bridge too early.
+  /// Query attributes only and suppress all authentication UI; JS receives one
+  /// Boolean and never the item's data.
+  static func secureStoreItemExistsWithoutReadingData(label: String) throws -> Bool {
+    let encodedKey = Data(label.utf8)
+    let noUIContext = LAContext()
+    noUIContext.interactionNotAllowed = true
+    // Expo SecureStore 15 stores current unauthenticated/authenticated aliases
+    // under app:no-auth / app:auth and still searches the legacy app service.
+    for service in ["app:no-auth", "app:auth", "app"] {
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrGeneric as String: encodedKey,
+        kSecAttrAccount as String: encodedKey,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+        kSecReturnAttributes as String: kCFBooleanTrue as Any,
+        kSecUseAuthenticationContext as String: noUIContext,
+      ]
+      var item: CFTypeRef?
+      let status = SecItemCopyMatching(query as CFDictionary, &item)
+      switch status {
+      case errSecSuccess:
+        return true
+      case errSecItemNotFound:
+        continue
+      case errSecInteractionNotAllowed, errSecAuthFailed:
+        // A protected matching item exists but cannot be inspected without UI.
+        // Treat it as present so the caller fails closed behind authentication.
+        return true
+      default:
+        throw KeychainError.readError(status)
+      }
+    }
+    return false
+  }
+
+  // Replacing the primary SE key is deliberately recoverable across process
+  // termination. The extension copy is kept throughout the replacement; this
+  // tiny, non-sensitive journal tells the next foreground load to use that
+  // copy to finish the primary re-wrap before reporting a missing vault key.
+  private static let accessControlMigrationPendingKey = "io.beebeeb.accessControlMigration.pending"
+  private static let accessControlMigrationTargetKey = "io.beebeeb.accessControlMigration.targetBiometric"
+
+  private static func beginAccessControlMigration(targetBiometric: Bool) {
+    let defaults = UserDefaults.standard
+    // Target first, pending last: termination between these writes cannot
+    // expose an incomplete journal as active.
+    defaults.set(targetBiometric, forKey: accessControlMigrationTargetKey)
+    defaults.set(true, forKey: accessControlMigrationPendingKey)
+    defaults.synchronize()
+  }
+
+  private static func finishAccessControlMigration() {
+    let defaults = UserDefaults.standard
+    // Pending first: once it is absent, the stale target is inert.
+    defaults.removeObject(forKey: accessControlMigrationPendingKey)
+    defaults.removeObject(forKey: accessControlMigrationTargetKey)
+    defaults.synchronize()
+  }
+
+  /// Complete a primary-key replacement interrupted after its journal was
+  /// committed. Never turn this into a normal `nil` load: while the journal is
+  /// active, a temporarily unavailable/cancelled recovery copy means "remain
+  /// locked and retry", not "the vault key is gone".
+  private static func repairInterruptedAccessControlMigration(label: String) throws -> Data? {
+    let defaults = UserDefaults.standard
+    guard defaults.bool(forKey: accessControlMigrationPendingKey) else { return nil }
+
+    let targetBiometric = defaults.bool(forKey: accessControlMigrationTargetKey)
+    RuntimeTrace.event("keychain.manager.access_control_repair.request", [
+      "label": label,
+      "targetBiometric": targetBiometric
+    ])
+
+    guard let recovered = BeebeebKeychainCore.loadMasterKey(label: label, mode: .extensionOnly) else {
+      RuntimeTrace.event("keychain.manager.access_control_repair.recovery_unavailable", ["label": label])
+      throw KeychainError.vaultAuth(.notWarm)
+    }
+
+    deleteSEKey(tag: BeebeebKeychainCore.seKeyTag)
+    deleteWrappedItem(account: label)
+    requiresBiometric = targetBiometric
+    do {
+      try storePrimaryWrappedKey(masterKeyBytes: recovered, label: label)
+      finishAccessControlMigration()
+      RuntimeTrace.event("keychain.manager.access_control_repair.success", [
+        "label": label,
+        "targetBiometric": targetBiometric
+      ])
+      return recovered
+    } catch {
+      // Leave the journal active. The extension copy remains untouched and a
+      // later foreground load can safely retry the repair.
+      RuntimeTrace.event("keychain.manager.access_control_repair.failed", [
+        "label": label,
+        "targetBiometric": targetBiometric,
+        "error": error.localizedDescription
+      ])
+      throw error
+    }
+  }
+
   // MARK: - Store
 
   /// Encrypt `masterKeyBytes` with the SE wrapping key and persist in Keychain.
@@ -75,32 +198,7 @@ final class KeychainManager {
     #if DEBUG && targetEnvironment(simulator)
     try storeSimulatorSoftwareKey(masterKeyBytes: masterKeyBytes, label: label)
     #else
-    // --- Primary SE key (biometric or passcode, per user preference) ---
-    let seKey = try getOrCreateSEKey()
-    guard let publicKey = SecKeyCopyPublicKey(seKey) else {
-      throw KeychainError.seKeyNotFound
-    }
-
-    var cfErr: Unmanaged<CFError>?
-    guard let wrapped = SecKeyCreateEncryptedData(publicKey, BeebeebKeychainCore.eciesAlgorithm, masterKeyBytes as CFData, &cfErr) else {
-      throw KeychainError.encryptionFailed
-    }
-
-    deleteWrappedItem(account: label)
-
-    var attrs: [CFString: Any] = [
-      kSecClass: kSecClassGenericPassword,
-      kSecAttrService: BeebeebKeychainCore.wrappedKeyService,
-      kSecAttrAccount: label,
-      kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlock,
-      kSecValueData: wrapped as Data,
-    ]
-    if let group = BeebeebKeychainCore.accessGroup { attrs[kSecAttrAccessGroup] = group }
-
-    let status = SecItemAdd(attrs as CFDictionary, nil)
-    guard status == errSecSuccess else {
-      throw KeychainError.writeError(status)
-    }
+    try storePrimaryWrappedKey(masterKeyBytes: masterKeyBytes, label: label)
 
     // --- Extension SE key (.devicePasscode always — no biometric prompt from extensions) ---
     try storeExtensionWrappedKey(masterKeyBytes: masterKeyBytes, label: label)
@@ -108,6 +206,48 @@ final class KeychainManager {
     // fails this store — the vault key above is already written.
     syncFileProviderWrappedKey(masterKeyBytes: masterKeyBytes, label: label, allowed: fileProviderKeyAllowed)
     #endif
+  }
+
+  /// Write only the interactive primary copy. Access-control replacement uses
+  /// this path so the unchanged extension recovery copy is never deleted and
+  /// re-added during a migration. Updating an existing Keychain item is one
+  /// atomic operation; the migration journal covers a failed first add.
+  private static func storePrimaryWrappedKey(masterKeyBytes: Data, label: String) throws {
+    let createsPrimaryKey = BeebeebKeychainCore.findSEKey(tag: BeebeebKeychainCore.seKeyTag) == nil
+    let seKey = try getOrCreateSEKey()
+    guard let publicKey = SecKeyCopyPublicKey(seKey) else {
+      throw KeychainError.seKeyNotFound
+    }
+
+    var cfErr: Unmanaged<CFError>?
+    guard let wrapped = SecKeyCreateEncryptedData(
+      publicKey,
+      BeebeebKeychainCore.eciesAlgorithm,
+      masterKeyBytes as CFData,
+      &cfErr
+    ) else {
+      throw KeychainError.encryptionFailed
+    }
+
+    var query: [CFString: Any] = [
+      kSecClass: kSecClassGenericPassword,
+      kSecAttrService: BeebeebKeychainCore.wrappedKeyService,
+      kSecAttrAccount: label,
+    ]
+    if let group = BeebeebKeychainCore.accessGroup { query[kSecAttrAccessGroup] = group }
+    let values: [CFString: Any] = [
+      kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlock,
+      kSecValueData: wrapped as Data,
+    ]
+    var status = SecItemUpdate(query as CFDictionary, values as CFDictionary)
+    if status == errSecItemNotFound {
+      query.merge(values) { _, new in new }
+      status = SecItemAdd(query as CFDictionary, nil)
+    }
+    guard status == errSecSuccess else {
+      throw KeychainError.writeError(status)
+    }
+    if createsPrimaryKey { markPrimaryAccessControlCurrent() }
   }
 
   // MARK: - Files key lifecycle (task 1722 G1/G6/G7, review round 3)
@@ -344,17 +484,21 @@ final class KeychainManager {
       throw KeychainError.encryptionFailed
     }
 
-    deleteWrappedItem(account: label, service: BeebeebKeychainCore.wrappedKeyServiceExt)
-
-    var extAttrs: [CFString: Any] = [
+    var query: [CFString: Any] = [
       kSecClass: kSecClassGenericPassword,
       kSecAttrService: BeebeebKeychainCore.wrappedKeyServiceExt,
       kSecAttrAccount: label,
+    ]
+    if let group = BeebeebKeychainCore.accessGroup { query[kSecAttrAccessGroup] = group }
+    let values: [CFString: Any] = [
       kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlock,
       kSecValueData: extWrapped as Data,
     ]
-    if let group = BeebeebKeychainCore.accessGroup { extAttrs[kSecAttrAccessGroup] = group }
-    let status = SecItemAdd(extAttrs as CFDictionary, nil)
+    var status = SecItemUpdate(query as CFDictionary, values as CFDictionary)
+    if status == errSecItemNotFound {
+      query.merge(values) { _, new in new }
+      status = SecItemAdd(query as CFDictionary, nil)
+    }
     guard status == errSecSuccess else {
       throw KeychainError.writeError(status)
     }
@@ -416,6 +560,12 @@ final class KeychainManager {
     }
     #endif
 
+    #if !targetEnvironment(simulator)
+    if let repaired = try repairInterruptedAccessControlMigration(label: label) {
+      return repaired
+    }
+    #endif
+
     // No wrapped blob at all → no key was ever provisioned here (fresh install /
     // device restore that dropped the SE blob). Return nil BEFORE evaluating any
     // biometric so a genuine recovery case never flashes a Face ID sheet. The JS
@@ -425,7 +575,12 @@ final class KeychainManager {
       return nil
     }
 
-    // A key IS provisioned. Perform EXACTLY ONE explicit, user-initiated
+    // A key IS provisioned. Old passcode-only keys cannot be satisfied by a
+    // Face ID evaluation: doing that first creates a Face-ID-then-passcode
+    // double prompt. Give that legacy key one UNEVALUATED context so its own
+    // ACL presents the required passcode sheet, then reuse the now-satisfied
+    // context for cold-SE retries and immediately replace the key with
+    // `.userPresence`. Current keys perform EXACTLY ONE explicit, user-initiated
     // evaluation (task 0882 primary fix) and reuse it for the SE decrypt via
     // kSecUseAuthenticationContext — this REPLACES the old too-early implicit
     // biometric raised inside SecKeyCreateDecryptedData (which fired before the
@@ -433,28 +588,55 @@ final class KeychainManager {
     // mislabeled as a generic `seKeyNotFound` → JS `transient`). Preserves the
     // 0792 exactly-one-prompt invariant (the explicit eval replaces, never adds,
     // a prompt) and runs off the main thread (see authenticateForPrimaryLoad).
-    let authContext = try authenticateForPrimaryLoad(label: label)
+    let legacyDevicePasscode = legacyPrimaryAccessControl && !requiresBiometric
+    let authContext: LAContext
+    if legacyDevicePasscode {
+      authContext = LAContext()
+      authContext.localizedFallbackTitle = "Use iPhone passcode"
+    } else {
+      authContext = try authenticateForPrimaryLoad(label: label)
+    }
 
     // Main app uses .primaryOnly — biometric/passcode prompt is acceptable
     // here. Files uses .fileProviderOnly; Share uses .extensionThenPrimary.
-    var decryptError: Unmanaged<CFError>?
-    guard let plaintextData = BeebeebKeychainCore.loadMasterKey(
-      label: label,
-      mode: .primaryOnly,
-      authContext: authContext,
-      decryptError: &decryptError
-    ) else {
-      // Auth succeeded but the SE decrypt still returned nil this early in
-      // process start. Map the (previously discarded) CFError to a typed reason
-      // instead of a blanket seKeyNotFound (task 0882 companion). The common
-      // case is a transient SE hiccup → notWarm → JS retries, and the retry
-      // reuses `authContext` (no second prompt).
+    // A just-launched Secure Enclave can briefly reject the decrypt after the
+    // policy succeeds. Retry only that decrypt, on this SAME satisfied
+    // LAContext, so warm-up cannot create a second Face ID sheet.
+    let decryptRetryDelays: [TimeInterval] = [0.3, 0.5, 0.8, 1.2, 1.8]
+    var plaintextData: Data?
+    for attempt in 0...decryptRetryDelays.count {
+      var decryptError: Unmanaged<CFError>?
+      if let loaded = BeebeebKeychainCore.loadMasterKey(
+        label: label,
+        mode: .primaryOnly,
+        authContext: authContext,
+        decryptError: &decryptError
+      ) {
+        plaintextData = loaded
+        break
+      }
+
       let reason = BeebeebKeychainCore.classifyDecryptError(decryptError)
       RuntimeTrace.event("keychain.manager.load.decrypt_failed", [
         "label": label,
-        "reason": reason.rawValue
+        "reason": reason.rawValue,
+        "attempt": attempt + 1
       ])
-      throw KeychainError.vaultAuth(reason)
+      guard reason == .notWarm, attempt < decryptRetryDelays.count else {
+        throw KeychainError.vaultAuth(reason)
+      }
+      Thread.sleep(forTimeInterval: decryptRetryDelays[attempt])
+    }
+    guard let plaintextData else {
+      throw KeychainError.vaultAuth(.notWarm)
+    }
+
+    if legacyPrimaryAccessControl {
+      RuntimeTrace.event("keychain.manager.load.legacy_access_control_migration", [
+        "label": label,
+        "wasBiometricOnly": requiresBiometric
+      ])
+      try replaceAccessControl(requireBiometric: false, masterKeyBytes: plaintextData, label: label)
     }
 
     // Keep the extension-wrapped blob in sync so backup extensions can read.
@@ -485,8 +667,8 @@ final class KeychainManager {
   /// Policy matches the primary SE key's access-control variant
   /// (`getOrCreateSEKey`, driven by `requiresBiometric`):
   ///   - `.biometryAny`    → `.deviceOwnerAuthenticationWithBiometrics`
-  ///   - `.devicePasscode` → `.deviceOwnerAuthentication` (biometrics OR
-  ///                          passcode — preserves the passcode-only fallback).
+  ///   - `.userPresence`   → `.deviceOwnerAuthentication` (biometrics OR
+  ///                          passcode — Face ID is attempted first).
   ///
   /// Threading: `evaluatePolicy` is asynchronous and iOS presents its sheet on
   /// the main thread. We therefore MUST NOT block the main thread while waiting
@@ -500,10 +682,6 @@ final class KeychainManager {
   /// unavailable so the JS layer decides retry-vs-surface (fail-closed, 0428).
   private static func authenticateForPrimaryLoad(label: String) throws -> LAContext {
     let context = LAContext()
-    // Short reuse window so the immediately-following SE decrypt (and a cheap
-    // post-auth transient retry) are covered by this single evaluation without
-    // leaving a broad ambient-auth window open.
-    context.touchIDAuthenticationAllowableReuseDuration = 10
     let reason = "Unlock your Beebeeb vault"
 
     let requireBiometricPolicy = requiresBiometric
@@ -515,6 +693,8 @@ final class KeychainManager {
       // RN lock screen's disableDeviceFallback); the in-app password button is
       // the explicit fallback. Passcode-allowed keys keep the default sheet.
       context.localizedFallbackTitle = ""
+    } else {
+      context.localizedFallbackTitle = "Use iPhone passcode"
     }
 
     var canEvalError: NSError?
@@ -524,8 +704,8 @@ final class KeychainManager {
         "requiresBiometric": requireBiometricPolicy,
         "error": canEvalError?.localizedDescription ?? "unknown"
       ])
-      // Subsystem not ready yet this early in start (or biometrics not
-      // enrolled) — retryable, not a user failure.
+      // The lock screen surfaces this result with Settings recovery or Retry;
+      // it must not start a fresh LAContext automatically.
       throw KeychainError.vaultAuth(.notAvailable)
     }
 
@@ -545,7 +725,15 @@ final class KeychainManager {
       evalError = error
       semaphore.signal()
     }
-    semaphore.wait()
+    let waitResult = semaphore.wait(timeout: .now() + 60)
+    guard waitResult == .success else {
+      context.invalidate()
+      RuntimeTrace.event("keychain.manager.load.evaluate_timed_out", [
+        "label": label,
+        "timeoutSeconds": 60
+      ])
+      throw KeychainError.vaultAuth(.authFailed)
+    }
 
     if evalSuccess {
       RuntimeTrace.event("keychain.manager.load.evaluate_success", [
@@ -586,6 +774,8 @@ final class KeychainManager {
   static func delete() {
     deleteSEKey()
     deleteWrappedItems()
+    finishAccessControlMigration()
+    UserDefaults.standard.removeObject(forKey: primaryAccessControlVersionKey)
     #if DEBUG && targetEnvironment(simulator)
     deleteSimulatorSoftwareKeys()
     #endif
@@ -593,7 +783,8 @@ final class KeychainManager {
 
   // MARK: - Access control toggle
 
-  /// Switch between .devicePasscode (background OK) and .biometryAny (foreground only).
+  /// Switch between .userPresence (Face ID with passcode fallback) and
+  /// .biometryAny (foreground only).
   ///
   /// If a wrapping key already exists, all stored master keys are decrypted with the old
   /// SE key, the old key is deleted, a new SE key is generated with the updated access
@@ -652,7 +843,7 @@ final class KeychainManager {
     // Generate new primary SE key with updated access control
     let newFlags: SecAccessControlCreateFlags = requireBiometric
       ? [.privateKeyUsage, .biometryAny]
-      : [.privateKeyUsage, .devicePasscode]
+      : [.privateKeyUsage, .userPresence]
     let newSEKey = try generateSEKey(tag: BeebeebKeychainCore.seKeyTag, flags: newFlags)
     guard let newPublicKey = SecKeyCopyPublicKey(newSEKey) else {
       throw KeychainError.seKeyNotFound
@@ -689,6 +880,7 @@ final class KeychainManager {
       "requireBiometric": requireBiometric,
       "rewrapped": plaintexts.count
     ])
+    markPrimaryAccessControlCurrent()
   }
 
   /// Switch access control using the already-unlocked master key.
@@ -709,28 +901,63 @@ final class KeychainManager {
       throw KeychainError.invalidMasterKeySize
     }
 
+    if !legacyPrimaryAccessControl,
+       requiresBiometric == requireBiometric,
+       BeebeebKeychainCore.findSEKey(tag: BeebeebKeychainCore.seKeyTag) != nil,
+       BeebeebKeychainCore.fetchWrappedBlob(service: BeebeebKeychainCore.wrappedKeyService, label: label) != nil {
+      RuntimeTrace.event("keychain.manager.replace_access_control.noop", [
+        "requireBiometric": requireBiometric,
+        "label": label
+      ])
+      return
+    }
+
     let previousPolicy = requiresBiometric
-    deleteSEKey()
-    deleteWrappedItems()
+    // Establish/verify the recovery copy while the old primary is still
+    // intact. Its write is atomic, so termination here leaves at least the
+    // original primary loadable and no active migration journal.
+    try storeExtensionWrappedKey(masterKeyBytes: masterKeyBytes, label: label)
+    beginAccessControlMigration(targetBiometric: requireBiometric)
+    // Replace only the interactive primary copy. The extension and mounted
+    // Files copies wrap the same master key under independent keys; keeping
+    // them live avoids disrupting background consumers and preserves a
+    // recovery copy if this process is terminated during the primary rewrap.
+    deleteSEKey(tag: BeebeebKeychainCore.seKeyTag)
+    deleteWrappedItem(account: label)
     requiresBiometric = requireBiometric
 
     do {
-      try store(masterKeyBytes: masterKeyBytes, label: label)
+      try storePrimaryWrappedKey(masterKeyBytes: masterKeyBytes, label: label)
+      finishAccessControlMigration()
       RuntimeTrace.event("keychain.manager.replace_access_control.success", [
         "requireBiometric": requireBiometric,
         "label": label
       ])
     } catch {
-      deleteSEKey()
-      deleteWrappedItems()
+      let replacementError = error
+      deleteSEKey(tag: BeebeebKeychainCore.seKeyTag)
+      deleteWrappedItem(account: label)
       requiresBiometric = previousPolicy
-      try? store(masterKeyBytes: masterKeyBytes, label: label)
-      RuntimeTrace.event("keychain.manager.replace_access_control.failed_rolled_back", [
-        "requireBiometric": requireBiometric,
-        "label": label,
-        "error": error.localizedDescription
-      ])
-      throw error
+      beginAccessControlMigration(targetBiometric: previousPolicy)
+      do {
+        try storePrimaryWrappedKey(masterKeyBytes: masterKeyBytes, label: label)
+        finishAccessControlMigration()
+        RuntimeTrace.event("keychain.manager.replace_access_control.failed_rolled_back", [
+          "requireBiometric": requireBiometric,
+          "label": label,
+          "error": replacementError.localizedDescription
+        ])
+      } catch {
+        // Keep the rollback journal active; the extension copy is still a
+        // recovery source for the next foreground load.
+        RuntimeTrace.event("keychain.manager.replace_access_control.rollback_failed", [
+          "requireBiometric": requireBiometric,
+          "label": label,
+          "replacementError": replacementError.localizedDescription,
+          "rollbackError": error.localizedDescription
+        ])
+      }
+      throw replacementError
     }
   }
 
@@ -833,7 +1060,7 @@ final class KeychainManager {
     if let existing = BeebeebKeychainCore.findSEKey(tag: BeebeebKeychainCore.seKeyTag) { return existing }
     let flags: SecAccessControlCreateFlags = requiresBiometric
       ? [.privateKeyUsage, .biometryAny]
-      : [.privateKeyUsage, .devicePasscode]
+      : [.privateKeyUsage, .userPresence]
     return try generateSEKey(tag: BeebeebKeychainCore.seKeyTag, flags: flags)
   }
 

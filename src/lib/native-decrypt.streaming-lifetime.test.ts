@@ -42,6 +42,7 @@ mock.module('../../modules/beebeeb-crypto', () => ({
   decryptLocalFileNative: async () => { throw new Error('not exercised'); },
   downloadAndDecryptFileNative: async () => { throw new Error('whole-file path must not run'); },
   streamVideoNative: async (_h, _api, _tok, fileId, outputPath, _size, _chunks, opts) => {
+    if (fileId === 'vfail') throw new Error('Chunk 0 response is missing X-Chunk-Count');
     files.set(outputPath, 100);
     let finishTerminal!: () => void;
     let finishTerminalStatus!: (value: unknown) => void;
@@ -308,5 +309,42 @@ describe('1724 streaming preview lifetime', () => {
     expect(cancelCalls).toBeGreaterThanOrEqual(1);
     await tick();
     expect(files.has('file:///cache/preview/vabort.mp4')).toBe(false);
+  });
+
+  test('a stale chunk count from the file list is traced and the stream still plays', async () => {
+    const uri = await nd.decryptToTempFile('vstale', null, 'mp4', 5000, 1, 7);
+    expect(uri).toBe('http://127.0.0.1:41234/s/vstale/v.mp4');
+    const stale = traces.filter((trace) => trace.marker === 'preview.decrypt.stream.declared_chunk_count_stale');
+    expect(stale.length).toBe(1);
+    expect(stale[0].payload).toMatchObject({ declaredChunkCount: 1, actualChunkCount: 4 });
+    expect(traces.some((trace) => trace.marker === 'preview.decrypt.stream.failed_fallback')).toBe(false);
+    await nd.releasePreviewCopy('vstale', 'mp4');
+  });
+
+  test('a matching chunk count is not traced as stale', async () => {
+    await nd.decryptToTempFile('vfresh', null, 'mp4', 5000, 4, 7);
+    expect(traces.some((trace) => trace.marker === 'preview.decrypt.stream.declared_chunk_count_stale')).toBe(false);
+    await nd.releasePreviewCopy('vfresh', 'mp4');
+  });
+
+  test('closing the preview while the pump still runs cancels it and deletes the plaintext', async () => {
+    await nd.decryptToTempFile('vclose', null, 'mp4', 5000, 4, 7);
+    expect(files.has('file:///cache/preview/vclose.mp4')).toBe(true);
+
+    await nd.releasePreviewCopy('vclose', 'mp4');
+
+    expect(cancelCalls).toBeGreaterThanOrEqual(1);
+    expect(files.has('file:///cache/preview/vclose.mp4')).toBe(false);
+    await tick();
+    expect(plaintextGate.held()).toBe(0);
+  });
+
+  test('a stream that cannot start is logged with its reason before the full download takes over', async () => {
+    await expect(nd.decryptToTempFile('vfail', null, 'mp4', 5000, 4, 7)).rejects.toThrow('whole-file path must not run');
+    const fallback = traces.filter((trace) => trace.marker === 'preview.decrypt.stream.failed_fallback');
+    expect(fallback.length).toBe(1);
+    expect(fallback[0].payload.message).toContain('missing X-Chunk-Count');
+    await tick();
+    expect(plaintextGate.held()).toBe(0);
   });
 });

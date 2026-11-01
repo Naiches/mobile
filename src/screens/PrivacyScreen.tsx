@@ -19,12 +19,14 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import * as FileSystem from 'expo-file-system/legacy';
 import { gatedPlaintextWrite } from '../lib/plaintext-gate';
+import { downloadDataExport, DataExportDownloadError } from '../lib/data-export-download';
 import * as Sharing from 'expo-sharing';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -34,6 +36,7 @@ import { fonts, spacing, type Colors } from '../theme';
 import { NativeSwitch } from '../components/NativeSwitch';
 import type { RootStackParamList } from '../App';
 import {
+  ApiError,
   getToken,
   getTrackingPreference,
   setTrackingPreference,
@@ -55,6 +58,8 @@ const layout = StyleSheet.create({
   section: { marginBottom: 14 },
   card: { borderRadius: 12, borderWidth: 1, overflow: 'hidden' },
   row: { flexDirection: 'row', alignItems: 'center', paddingVertical: 11, paddingHorizontal: 12 },
+  rowAccessibility: { alignItems: 'flex-start' },
+  trailingAccessibility: { marginTop: 2 },
   divider: { height: 1, marginLeft: 12 },
   noteText: { fontSize: 11, paddingHorizontal: 6, marginTop: 6, lineHeight: 16 },
   sectionHeader: {
@@ -100,9 +105,12 @@ function ActionRow({
   onPress: () => void;
   c: C;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
+
   return (
     <TouchableOpacity
-      style={layout.row}
+      style={[layout.row, accessibilityLayout && layout.rowAccessibility]}
       activeOpacity={0.6}
       disabled={disabled}
       // 1104 follow-up — stable id for Maestro/E2E (matches SettingsRow scheme)
@@ -118,7 +126,7 @@ function ActionRow({
         name={icon}
         size={18}
         color={danger ? c.red : c.ink3}
-        style={{ marginRight: 12, width: 20 }}
+        style={{ marginRight: 12, width: 20, marginTop: accessibilityLayout ? 2 : 0 }}
       />
       <View style={{ flex: 1, paddingRight: 8 }}>
         <Text style={{ fontSize: 14, color: danger ? c.red : c.ink }}>{label}</Text>
@@ -129,9 +137,9 @@ function ActionRow({
         )}
       </View>
       {disabled ? (
-        <ActivityIndicator size="small" color={c.amber} />
+        <ActivityIndicator size="small" color={c.amber} style={accessibilityLayout ? layout.trailingAccessibility : undefined} />
       ) : (
-        <Text style={{ fontSize: 18, color: c.ink4 }}>{'›'}</Text>
+        <Text style={[{ fontSize: 18, color: c.ink4 }, accessibilityLayout && layout.trailingAccessibility]}>{'›'}</Text>
       )}
     </TouchableOpacity>
   );
@@ -140,6 +148,8 @@ function ActionRow({
 // ── Section 1: Activity tracking ─────────────────────────────────────────────
 
 function ActivityTrackingRow({ c }: { c: C }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [optedIn, setOptedIn] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -179,12 +189,12 @@ function ActivityTrackingRow({ c }: { c: C }) {
   }, []);
 
   return (
-    <View style={layout.row}>
+    <View style={[layout.row, accessibilityLayout && layout.rowAccessibility]}>
       <Ionicons
         name="eye-outline"
         size={18}
         color={c.ink3}
-        style={{ marginRight: 12, width: 20 }}
+        style={{ marginRight: 12, width: 20, marginTop: accessibilityLayout ? 2 : 0 }}
       />
       <View style={{ flex: 1, paddingRight: 8 }}>
         <Text style={{ fontSize: 14, color: c.ink }}>Activity tracking</Text>
@@ -193,13 +203,15 @@ function ActivityTrackingRow({ c }: { c: C }) {
         </Text>
       </View>
       {loading ? (
-        <ActivityIndicator size="small" color={c.amber} />
+        <ActivityIndicator size="small" color={c.amber} style={accessibilityLayout ? layout.trailingAccessibility : undefined} />
       ) : (
-        <NativeSwitch
-          value={optedIn}
-          onValueChange={handleToggle}
-          colors={c}
-        />
+        <View style={accessibilityLayout ? layout.trailingAccessibility : undefined}>
+          <NativeSwitch
+            value={optedIn}
+            onValueChange={handleToggle}
+            colors={c}
+          />
+        </View>
       )}
     </View>
   );
@@ -241,7 +253,9 @@ function DataExportRow({ c }: { c: C }) {
     } catch (err) {
       Alert.alert(
         'Export unavailable',
-        'Data export is not yet available. Contact privacy@beebeeb.io.',
+        err instanceof ApiError && err.status === 409
+          ? 'You already requested an export in the last 24 hours. Try again later.'
+          : 'Data export is not available right now. Try again later or contact privacy@beebeeb.io.',
       );
     } finally {
       setRequesting(false);
@@ -249,37 +263,22 @@ function DataExportRow({ c }: { c: C }) {
   }, [startPoll]);
 
   const handleDownload = useCallback(async () => {
-    const url = exportStatus?.download_url;
-    if (!url || downloading) return;
+    if (downloading) return;
     setDownloading(true);
     try {
-      // In-app AUTHENTICATED download (task 0781): the system browser carries no
-      // Bearer token, so opening the URL there 401s ("am I even authenticated?").
-      // Fetch it with the session token to a temp file, then hand it to the native
-      // share/save sheet so the user picks where to store it. No token ever rides
-      // in a URL — the server endpoint is Bearer-scoped to the caller's own export.
-      const token = await getToken();
-      const dest = `${FileSystem.cacheDirectory}beebeeb-data-export-${exportStatus?.export_id ?? 'latest'}.zip`;
-      // Task 1593 round 3 — plaintext writer, gated by the sign-out purge.
-      const { uri, status } = await gatedPlaintextWrite('data export', dest, FileSystem, () =>
-        FileSystem.downloadAsync(url, dest, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-        }),
+      // In-app AUTHENTICATED download: the system browser carries no Bearer token.
+      // The ZIP goes to a temporary file, is offered through the share sheet and
+      // deleted afterwards (src/lib/data-export-download.ts).
+      await downloadDataExport(
+        { url: exportStatus?.download_url, exportId: exportStatus?.export_id },
+        { fs: FileSystem, sharing: Sharing, gatedWrite: gatedPlaintextWrite, getToken },
       );
-      if (status !== 200) throw new Error(`download failed (${status})`);
-      if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(uri, {
-          mimeType: 'application/zip',
-          UTI: 'public.zip-archive',
-          dialogTitle: 'Save your data export',
-        });
-      } else {
-        Alert.alert('Export downloaded', 'Your data export was saved to the app’s files.');
-      }
-    } catch {
+    } catch (err) {
       Alert.alert(
         'Download failed',
-        'We couldn’t download your export. Please try again in a moment.',
+        err instanceof DataExportDownloadError
+          ? err.message
+          : 'We couldn’t download your export. Please try again in a moment.',
       );
     } finally {
       setDownloading(false);

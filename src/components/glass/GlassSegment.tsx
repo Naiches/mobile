@@ -12,7 +12,7 @@
  */
 
 import React from 'react';
-import { StyleSheet, Text, TouchableOpacity, View, type StyleProp, type ViewStyle } from 'react-native';
+import { StyleSheet, Text, TouchableOpacity, useWindowDimensions, View, type StyleProp, type ViewStyle } from 'react-native';
 
 import { GlassSurface } from './GlassSurface';
 import { GLASS_RADII, glassMaterial, type GlassScheme } from './glass-recipe';
@@ -43,6 +43,8 @@ export function GlassSegment<T extends string>({
 }: GlassSegmentProps<T>) {
   const { resolved } = useTheme();
   const material = glassMaterial(scheme ?? resolved);
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   return (
     <GlassSurface
@@ -51,7 +53,7 @@ export function GlassSegment<T extends string>({
       style={style}
       contentStyle={styles.track}
     >
-      <View style={styles.row} accessibilityRole="tablist" accessibilityLabel={accessibilityLabel}>
+      <View style={[styles.row, accessibilityLayout && styles.rowAccessibility]} accessibilityRole="tablist" accessibilityLabel={accessibilityLabel}>
         {options.map((option) => {
           const selected = option.value === value;
           return (
@@ -59,6 +61,7 @@ export function GlassSegment<T extends string>({
               key={option.value}
               style={[
                 styles.item,
+                accessibilityLayout && styles.itemAccessibility,
                 selected
                   ? [
                       material.bubbleShadow,
@@ -75,7 +78,7 @@ export function GlassSegment<T extends string>({
               accessibilityLabel={option.label}
             >
               <Text
-                numberOfLines={1}
+                numberOfLines={accessibilityLayout ? undefined : 1}
                 style={[
                   styles.label,
                   {
@@ -97,6 +100,7 @@ export function GlassSegment<T extends string>({
 const styles = StyleSheet.create({
   track: { padding: 4 },
   row: { flexDirection: 'row' },
+  rowAccessibility: { flexDirection: 'column' },
   item: {
     flex: 1,
     paddingVertical: 8,
@@ -107,6 +111,7 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: 'transparent',
   },
+  itemAccessibility: { flex: 0, minHeight: 52, paddingHorizontal: 12 },
   label: { fontSize: 14, letterSpacing: -0.1 },
 });
 

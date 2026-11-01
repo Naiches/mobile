@@ -1,5 +1,13 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { View, Text, TouchableOpacity, ActivityIndicator, Linking } from 'react-native'
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  ActivityIndicator,
+  Linking,
+  ScrollView,
+  useWindowDimensions,
+} from 'react-native'
 import { useTheme } from '../lib/theme-context'
 import { runDiagnostics, type DiagnosticResult, type DiagnosticCheck } from '../lib/diagnostics'
 import * as SecureStore from 'expo-secure-store'
@@ -24,6 +32,8 @@ interface Props {
 
 export function DiagnosticPanel({ onRetry, onSignIn }: Props) {
   const { colors: c } = useTheme()
+  const { fontScale } = useWindowDimensions()
+  const accessibilityLayout = fontScale >= 1.3
   const [result, setResult] = useState<DiagnosticResult | null>(null)
   const [lastConnected, setLastConnected] = useState<string | null>(null)
 
@@ -58,7 +68,11 @@ export function DiagnosticPanel({ onRetry, onSignIn }: Props) {
   }, [runChecks, onRetry])
 
   return (
-    <View style={{ paddingHorizontal: 32, alignItems: 'center', width: '100%' }}>
+    <ScrollView
+      style={{ width: '100%', flexShrink: 1 }}
+      contentContainerStyle={{ paddingHorizontal: 32, alignItems: 'center' }}
+      showsVerticalScrollIndicator={accessibilityLayout}
+    >
       <Text style={{ color: c.ink, fontSize: 16, fontWeight: '600', textAlign: 'center', marginBottom: 4 }}>
         Couldn't reach our servers
       </Text>
@@ -68,7 +82,7 @@ export function DiagnosticPanel({ onRetry, onSignIn }: Props) {
 
       <View style={{ width: '100%', maxWidth: 300 }}>
         {result?.checks.map(check => (
-          <CheckRow key={check.id} check={check} />
+          <CheckRow key={check.id} check={check} accessibilityLayout={accessibilityLayout} fontScale={fontScale} />
         ))}
       </View>
 
@@ -84,16 +98,16 @@ export function DiagnosticPanel({ onRetry, onSignIn }: Props) {
         </Text>
       ) : null}
 
-      <View style={{ flexDirection: 'row', gap: 12, marginTop: 24 }}>
+      <View style={{ flexDirection: accessibilityLayout ? 'column' : 'row', gap: 12, marginTop: 24, width: accessibilityLayout ? '100%' : undefined, maxWidth: 300 }}>
         <TouchableOpacity
           onPress={onRetry}
-          style={{ paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8, backgroundColor: c.amber }}
+          style={{ paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8, backgroundColor: c.amber, minHeight: accessibilityLayout ? 48 : undefined, alignItems: 'center', justifyContent: 'center' }}
         >
           <Text style={{ color: '#1a1a2e', fontSize: 14, fontWeight: '600' }}>Retry</Text>
         </TouchableOpacity>
         <TouchableOpacity
           onPress={onSignIn}
-          style={{ paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8, borderWidth: 1, borderColor: c.line }}
+          style={{ paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8, borderWidth: 1, borderColor: c.line, minHeight: accessibilityLayout ? 48 : undefined, alignItems: 'center', justifyContent: 'center' }}
         >
           <Text style={{ color: c.ink2, fontSize: 14 }}>Sign in</Text>
         </TouchableOpacity>
@@ -107,30 +121,35 @@ export function DiagnosticPanel({ onRetry, onSignIn }: Props) {
           status.beebeeb.io
         </Text>
       </TouchableOpacity>
-    </View>
+    </ScrollView>
   )
 }
 
-function CheckRow({ check }: { check: DiagnosticCheck }) {
+function CheckRow({ check, accessibilityLayout, fontScale }: {
+  check: DiagnosticCheck
+  accessibilityLayout: boolean
+  fontScale: number
+}) {
   const { colors: c } = useTheme()
   const icon = STATUS_ICONS[check.status]
+  const iconWidth = accessibilityLayout ? Math.ceil(18 * fontScale) : 18
   const iconColor = check.status === 'pass' ? c.green
     : check.status === 'fail' ? c.red
     : check.status === 'running' ? c.amber
     : c.ink4
 
   return (
-    <View style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 4 }}>
+    <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: accessibilityLayout ? 'wrap' : 'nowrap', paddingVertical: 4 }}>
       {check.status === 'running' ? (
-        <ActivityIndicator size="small" color={c.amber} style={{ width: 18 }} />
+        <ActivityIndicator size="small" color={c.amber} style={{ width: iconWidth }} />
       ) : (
-        <Text style={{ color: iconColor, fontSize: 14, width: 18, fontWeight: '600' }}>{icon}</Text>
+        <Text style={{ color: iconColor, fontSize: 14, width: iconWidth, fontWeight: '600' }}>{icon}</Text>
       )}
       <Text style={{ color: c.ink2, fontSize: 13, flex: 1, marginLeft: 8 }}>{check.label}</Text>
       {check.durationMs !== undefined ? (
-        <Text style={{ color: c.ink4, fontSize: 11, fontFamily: 'JetBrainsMono-Regular' }}>{check.durationMs}ms</Text>
+        <Text style={{ color: c.ink4, fontSize: 11, fontFamily: 'JetBrainsMono-Regular', flexBasis: accessibilityLayout ? '100%' : undefined, marginLeft: accessibilityLayout ? iconWidth + 8 : undefined }}>{check.durationMs}ms</Text>
       ) : check.detail ? (
-        <Text style={{ color: check.status === 'fail' ? c.red : c.ink4, fontSize: 11, fontFamily: 'JetBrainsMono-Regular' }}>
+        <Text style={{ color: check.status === 'fail' ? c.red : c.ink4, fontSize: 11, fontFamily: 'JetBrainsMono-Regular', flexBasis: accessibilityLayout ? '100%' : undefined, marginLeft: accessibilityLayout ? iconWidth + 8 : undefined }}>
           {check.detail}
         </Text>
       ) : null}

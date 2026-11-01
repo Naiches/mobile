@@ -17,7 +17,7 @@
  *     master key reaches the vault through `ports.adoptVault` and nowhere else.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Linking, Text, TouchableOpacity, View } from 'react-native';
+import { Linking, Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
 import { usePreventScreenCapture } from 'expo-screen-capture';
 import { clampCodeLength, shownTermsVersion } from '../../lib/onboarding/limits';
 import { useAppSwitcherProtection, useCaptureGuard } from './screen-privacy';
@@ -202,6 +202,8 @@ function PilotKeyStep({ ctx }: { ctx: Ctx }) {
 function VerifyEmailCodeStep({ ctx }: { ctx: Ctx }) {
   const { policy, session, ports, screen } = ctx;
   const { s } = useOnboardingStyles();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const length = clampCodeLength(typeof screen.step.params.length === 'number' ? screen.step.params.length : policy.emailCode.length);
   const codeRef = useRef<DigitCodeInputHandle>(null);
   const [code, setCode] = useState('');
@@ -312,7 +314,7 @@ function VerifyEmailCodeStep({ ctx }: { ctx: Ctx }) {
       <View style={{ marginTop: spacing.xl }}>
         <PrimaryButton label="Verify" onPress={() => void submit(code)} busy={busy} disabled={code.length !== length} testID="signup-code-verify" />
       </View>
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: spacing.lg }}>
+      <View style={{ flexDirection: accessibilityLayout ? 'column' : 'row', justifyContent: 'space-between', alignItems: accessibilityLayout ? 'stretch' : 'center', gap: accessibilityLayout ? spacing.md : 0, marginTop: spacing.lg }}>
         <TouchableOpacity onPress={() => ctx.undo('enter_email')} accessibilityRole="button" testID="signup-use-different-email">
           <Text style={s.linkText}>Use a different email</Text>
         </TouchableOpacity>

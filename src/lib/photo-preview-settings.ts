@@ -53,12 +53,12 @@ export async function loadPhotoPreviewSettingStrict(): Promise<PhotoPreviewSetti
   return settingFromStored(await getPreferenceValueStrict(PREFERENCE_KEY));
 }
 
-export async function savePhotoPreviewSetting(setting: PhotoPreviewSetting): Promise<void> {
+export async function savePhotoPreviewSetting(setting: PhotoPreviewSetting, signal?: AbortSignal): Promise<void> {
   await setPreferenceValue(PREFERENCE_KEY, {
     enabled: setting.enabled,
     format: setting.format,
     px: setting.px,
-  });
+  }, signal);
 }
 
 /** Long edge becomes min(px, longEdge); aspect kept; never upscales. */

@@ -63,9 +63,9 @@ export default function RecoveryPhraseVerifyScreen() {
     inputsCard: { backgroundColor: c.paper, borderRadius: radii.lg, borderWidth: 1, borderColor: c.line, marginBottom: 24, overflow: 'hidden' },
     inputRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12 },
     inputRowBorder: { borderBottomWidth: 1, borderBottomColor: c.line },
-    posLabel: { width: 28, height: 28, borderRadius: radii.sm, backgroundColor: c.paper2, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
+    posLabel: { minWidth: 28, minHeight: 28, paddingHorizontal: 6, paddingVertical: 4, borderRadius: radii.sm, backgroundColor: c.paper2, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
     posNumber: { fontSize: 12, fontWeight: '700', color: c.ink3 },
-    input: { flex: 1, height: 36, fontSize: 14, color: c.ink, fontFamily: fonts.mono },
+    input: { flex: 1, minHeight: 36, paddingVertical: 8, fontSize: 14, color: c.ink, fontFamily: fonts.mono },
     inputError: { color: c.red },
     button: { backgroundColor: c.ink, borderRadius: radii.md, paddingVertical: 15, alignItems: 'center', marginBottom: 14 },
     buttonDisabled: { opacity: 0.4 },
@@ -205,4 +205,3 @@ export default function RecoveryPhraseVerifyScreen() {
     </KeyboardAvoidingView>
   );
 }
-

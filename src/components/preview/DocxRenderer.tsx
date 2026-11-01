@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
@@ -42,9 +43,17 @@ interface DocxRendererProps {
    */
   topInset?: number;
   bottomInset?: number;
+  onScrollOffsetChange?: (offset: number) => void;
 }
 
-function buildDocxHtml(bodyHtml: string, c: Colors, isDark: boolean, topInset: number, bottomInset: number): string {
+function buildDocxHtml(
+  bodyHtml: string,
+  c: Colors,
+  isDark: boolean,
+  topInset: number,
+  bottomInset: number,
+  fontScale: number,
+): string {
   const bg = c.paper;
   const ink = c.ink;
   const ink3 = c.ink3;
@@ -62,7 +71,7 @@ function buildDocxHtml(bodyHtml: string, c: Colors, isDark: boolean, topInset: n
     html, body { background: ${bg}; color: ${ink}; margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif;
-      font-size: 16px;
+      font-size: ${16 * fontScale}px;
       line-height: 1.6;
       padding: ${24 + topInset}px 20px ${96 + bottomInset}px;
       -webkit-text-size-adjust: 100%;
@@ -102,7 +111,8 @@ ${bodyHtml}
 </html>`;
 }
 
-export function DocxRenderer({ data, colors: c, isDark, topInset = 0, bottomInset = 0 }: DocxRendererProps) {
+export function DocxRenderer({ data, colors: c, isDark, topInset = 0, bottomInset = 0, onScrollOffsetChange }: DocxRendererProps) {
+  const { fontScale } = useWindowDimensions();
   const [html, setHtml] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -115,7 +125,14 @@ export function DocxRenderer({ data, colors: c, isDark, topInset = 0, bottomInse
         const result = await mammoth.convertToHtml({ arrayBuffer: data });
         if (cancelled) return;
         const body = (result?.value as string) ?? '';
-        setHtml(buildDocxHtml(body || '<p><em>This document is empty.</em></p>', c, isDark, topInset, bottomInset));
+        setHtml(buildDocxHtml(
+          body || '<p><em>This document is empty.</em></p>',
+          c,
+          isDark,
+          topInset,
+          bottomInset,
+          fontScale,
+        ));
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : 'Failed to convert document.');
@@ -125,7 +142,7 @@ export function DocxRenderer({ data, colors: c, isDark, topInset = 0, bottomInse
     return () => {
       cancelled = true;
     };
-  }, [data, c, isDark, topInset, bottomInset]);
+  }, [data, c, isDark, topInset, bottomInset, fontScale]);
 
   if (error) {
     // 1346 review finding — `colors` here was the module-level STATIC
@@ -173,6 +190,8 @@ export function DocxRenderer({ data, colors: c, isDark, topInset = 0, bottomInse
         source={{ html: isolatePreviewHtml(html) }}
         style={[styles.docxWebView, { backgroundColor: c.paper }]}
         showsVerticalScrollIndicator
+        scrollEventThrottle={16}
+        onScroll={(event) => onScrollOffsetChange?.(event.nativeEvent.contentOffset.y)}
       />
     </View>
   );

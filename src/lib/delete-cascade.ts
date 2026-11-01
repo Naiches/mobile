@@ -16,8 +16,9 @@
  * module call. All steps are best-effort: one failing store never blocks another.
  */
 
-import { markRemoteDeletedByFileIds } from '../services/BackupDatabase';
+import { resetUploadedState } from '../services/BackupDatabase';
 import { invalidateBackupFolderCacheIfDeleted } from '../services/BackupService';
+import { wakePhotoBackupDrain } from '../../modules/beebeeb-crypto';
 import { offlineManager } from './offline-manager';
 import { invalidateCachedThumbnails, invalidateNativeThumbnailCache } from './thumbnail-cache';
 import { pruneNameCache } from './name-cache';
@@ -28,6 +29,10 @@ export interface DeleteCascadeOptions {
   /** True when `ids` already includes a folder's expanded subtree. Advisory —
    *  the dispatcher treats every id uniformly. */
   subtree?: boolean;
+  /** Whether the server operation moved the row to Trash or removed it. Both
+   * make a camera-roll backup incomplete; the distinction is retained for
+   * call-site evidence and future non-backup cleanup. */
+  kind?: 'trash' | 'permanent';
 }
 
 type DeletedListener = (ids: string[]) => void;
@@ -48,7 +53,7 @@ export function subscribeFilesDeleted(listener: DeletedListener): () => void {
  */
 export async function onFilesDeleted(
   ids: string[],
-  _opts: DeleteCascadeOptions = {},
+  opts: DeleteCascadeOptions = {},
 ): Promise<void> {
   const unique = [...new Set(ids)].filter(Boolean);
   if (unique.length === 0) return;
@@ -60,10 +65,12 @@ export async function onFilesDeleted(
   const writeTicket = backupWriteTicket();
   const idSet = new Set(unique);
 
-  // 1. Backup manifest — EXPLICIT delete: mark remote_deleted (NOT re-queued —
-  //    the user deleted these, so they must not silently re-upload; contrast
-  //    with the reconcile's re-queue when the server lost them unexpectedly).
-  await markRemoteDeletedByFileIds(unique, writeTicket).catch(() => {});
+  // 1. Backup manifest. Trash is not a valid backup location: moving or
+  // permanently deleting the remote copy requeues the matching local photo.
+  // Unknown sync deletes are requeued too, so a missing classification can
+  // never strand the manifest as uploaded.
+  const requeued = await resetUploadedState(unique, writeTicket).catch(() => 0);
+  if (requeued > 0) await wakePhotoBackupDrain().catch(() => {});
 
   // 2. Offline-pinned copies — drop the on-disk copy + manifest entry. A pinned
   //    folder id is removed as a folder; everything else as a file.

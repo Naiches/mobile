@@ -180,16 +180,19 @@ export function createRateLimitedFetch(options: RateLimitedFetchOptions = {}): F
     }
 
     const state = stateFor(bucket);
-    const task = state.chain.then(async () => {
+    // The chain owns launch slots only. A slow response must not hold every
+    // later file/list/upload request behind it; the server-facing cadence is
+    // enforced by `nextAt`, while responses settle independently.
+    const launch = state.chain.then(async () => {
       const waitMs = Math.max(0, state.nextAt - now());
       if (waitMs > 0) await sleep(waitMs);
       state.nextAt = Math.max(now(), state.nextAt) + minSpacing;
-      const response = await fetchImpl(input, init);
-      await applyResponsePacing(bucket, response);
-      return response;
     });
-    state.chain = task.then(() => undefined, () => undefined);
-    return task;
+    state.chain = launch.then(() => undefined, () => undefined);
+    await launch;
+    const response = await fetchImpl(input, init);
+    await applyResponsePacing(bucket, response);
+    return response;
   };
 }
 

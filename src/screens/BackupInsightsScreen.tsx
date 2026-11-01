@@ -13,6 +13,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
+  Linking,
   Platform,
   RefreshControl,
   ScrollView,
@@ -20,6 +22,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -40,15 +43,26 @@ import {
   type BackupAssetStatus,
   type VerificationRecord,
 } from '../services/BackupDatabase';
+import { getDeviceManifest, type DeviceManifest } from '../services/BackupService';
 import {
-  getDeviceManifest,
-  type BackupCategoryState,
-  type DeviceManifest,
-} from '../services/BackupService';
+  deriveCategoryBackupStatus,
+  formatPreviousBackup,
+  timeAgoFromIso,
+  type CategoryKind,
+  type CategoryRowStatus,
+  type PreviousBackup,
+} from '../lib/category-backup-status';
+import {
+  buildCategoryActivity,
+  latestVerificationAttempt,
+  loadPreviousBackups,
+} from '../lib/category-previous-backups';
+import { listFiles, listFileVersions } from '../lib/api';
 import { useBackup } from '../lib/backup-context';
 import NetInfo from '@react-native-community/netinfo';
 import { recordRuntimeTrace } from '../lib/runtime-trace';
 import { formatBytes } from '../lib/format';
+import { getRunHistoryLines } from '../lib/run-diagnostics-runtime';
 import * as BeebeebCrypto from '../../modules/beebeeb-crypto';
 
 let MediaLibrary: { getAssetsAsync: (opts: { first: number; mediaType?: string[] }) => Promise<{ totalCount: number }>; MediaType?: { photo: string; video: string } } = {
@@ -101,18 +115,6 @@ function formatDateLabel(dateStr: string): string {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
-function formatCategoryBackupState(state: BackupCategoryState | undefined, itemLabel: string): string {
-  if (!state?.enabled) return 'Off';
-  if (state.last_sync) {
-    const synced = state.items_synced ?? 0;
-    const countLabel = synced > 0
-      ? ` · ${synced.toLocaleString()} ${itemLabel}${synced === 1 ? '' : 's'}`
-      : '';
-    return `${timeAgo(new Date(state.last_sync).getTime())}${countLabel}`;
-  }
-  return 'On · waiting for first run';
-}
-
 function withTimeout<T>(promise: Promise<T>, fallback: T, timeoutMs: number): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const timer = new Promise<T>((resolve) => {
@@ -143,6 +145,7 @@ function emptyStatusCounts(): Record<BackupAssetStatus, number> {
 
 const layout = StyleSheet.create({
   root: { flex: 1 },
+  scrollViewport: { flex: 1, overflow: 'hidden' },
   scroll: { flex: 1 },
   scrollContent: { paddingHorizontal: 14, paddingBottom: 48 },
   section: { marginBottom: 14 },
@@ -153,6 +156,7 @@ const layout = StyleSheet.create({
     paddingVertical: 11,
     paddingHorizontal: 12,
   },
+  rowAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap', gap: 8 },
   divider: { height: 1, marginLeft: 12 },
   backButton: {
     flexDirection: 'row',
@@ -190,11 +194,26 @@ function StatRow({
   mono?: boolean;
   c: C;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
+
   return (
-    <View style={layout.row}>
-      <Text style={{ flex: 1, fontSize: 14, color: c.ink }}>{label}</Text>
+    <View style={[layout.row, accessibilityLayout && layout.rowAccessibility]}>
       <Text
         style={{
+          flex: accessibilityLayout ? undefined : 1,
+          flexGrow: 1,
+          flexBasis: accessibilityLayout ? '55%' : undefined,
+          fontSize: 14,
+          color: c.ink,
+        }}
+      >
+        {label}
+      </Text>
+      <Text
+        style={{
+          flexShrink: 1,
+          textAlign: 'right',
           fontSize: 13,
           color: c.ink2,
           fontFamily: mono ? fonts.mono : fonts.sans,
@@ -261,6 +280,98 @@ function ActionButton({
   );
 }
 
+// ── Contacts / Calendar rows ─────────────────────────────────────────────────
+
+function CategoryStatusRow({
+  label,
+  status,
+  c,
+  onAction,
+  testID,
+}: {
+  label: string;
+  status: CategoryRowStatus;
+  c: C;
+  onAction: () => void;
+  testID: string;
+}) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
+  const isError = status.state === 'error';
+  const color = isError ? c.red : c.ink2;
+  const showBar = status.state === 'running' && status.fraction != null;
+  return (
+    <TouchableOpacity
+      style={{ paddingVertical: 11, paddingHorizontal: 12, gap: 6 }}
+      activeOpacity={isError && status.action ? 0.6 : 1}
+      disabled={!(isError && status.action)}
+      onPress={onAction}
+      accessibilityRole={isError && status.action ? 'button' : 'text'}
+      accessibilityLabel={`${label}: ${status.text}`}
+      testID={testID}
+    >
+      <View style={{ flexDirection: 'row', alignItems: 'flex-start', flexWrap: 'wrap', gap: 10 }}>
+        <Text style={{ fontSize: 14, color: c.ink }}>{label}</Text>
+        <Text
+          style={{
+            flex: accessibilityLayout ? undefined : 1,
+            flexGrow: 1,
+            flexBasis: accessibilityLayout ? '55%' : undefined,
+            textAlign: 'right',
+            fontSize: 13,
+            color,
+          }}
+        >
+          {status.text}
+        </Text>
+      </View>
+      {showBar && (
+        <View style={{ height: 4, borderRadius: 2, backgroundColor: c.line, overflow: 'hidden' }}>
+          <View
+            style={{
+              height: '100%',
+              width: `${Math.max((status.fraction ?? 0) * 100, 1)}%`,
+              backgroundColor: c.amber,
+              borderRadius: 2,
+            }}
+          />
+        </View>
+      )}
+    </TouchableOpacity>
+  );
+}
+
+function PreviousBackupsList({
+  title,
+  entries,
+  one,
+  many,
+  c,
+}: {
+  title: string;
+  entries: PreviousBackup[] | null;
+  one: string;
+  many: string;
+  c: C;
+}) {
+  return (
+    <View style={{ paddingVertical: 10, paddingHorizontal: 12, gap: 4 }}>
+      <Text style={{ fontSize: 12, fontWeight: '600', color: c.ink3 }}>{title}</Text>
+      {entries === null ? (
+        <Text style={{ fontSize: 12, color: c.ink4 }}>Loading…</Text>
+      ) : entries.length === 0 ? (
+        <Text style={{ fontSize: 12, color: c.ink4 }}>No earlier versions yet</Text>
+      ) : (
+        entries.map((entry) => (
+          <Text key={entry.at} style={{ fontSize: 12, color: c.ink2, fontFamily: fonts.mono }}>
+            {formatPreviousBackup(entry, one, many)}
+          </Text>
+        ))
+      )}
+    </View>
+  );
+}
+
 // ── Status indicator dot ─────────────────────────────────────────────────────
 
 function StatusDot({
@@ -289,7 +400,7 @@ function StatusDot({
           backgroundColor: dotColor,
         }}
       />
-      <Text style={{ fontSize: 15, fontWeight: '600', color: c.ink }}>
+      <Text style={{ flexShrink: 1, fontSize: 15, fontWeight: '600', color: c.ink }}>
         {label}
       </Text>
     </View>
@@ -314,8 +425,11 @@ export default function BackupInsightsScreen() {
   const { colors: c } = useTheme();
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   // 1315 — measured floating-header height feeding the scroll inset.
   const [headerHeight, setHeaderHeight] = useState(0);
+  const headerInset = headerHeight || SCROLL_EDGE.chromeFallback;
   const [isScrolled, setIsScrolled] = useState(false);
   const backup = useBackup();
   const [data, setData] = useState<InsightsData | null>(null);
@@ -325,6 +439,10 @@ export default function BackupInsightsScreen() {
   const [retrying, setRetrying] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [isPhotoAlbumSelectionActive, setIsPhotoAlbumSelectionActive] = useState(false);
+  const [previousBackups, setPreviousBackups] = useState<Record<CategoryKind, PreviousBackup[] | null>>({
+    contacts: null,
+    calendar: null,
+  });
   const dataRef = useRef<InsightsData | null>(null);
   const isPhotoAlbumSelectionActiveRef = useRef(false);
   const loadInFlightRef = useRef<Promise<void> | null>(null);
@@ -475,6 +593,98 @@ export default function BackupInsightsScreen() {
     loadData,
   ]);
 
+  // ── Contacts and Calendar: status from the setting + native, never the manifest ──
+
+  const contactsRow = deriveCategoryBackupStatus({
+    kind: 'contacts',
+    settingEnabled: backup.isContactsBackupEnabled,
+    native: backup.contactsBackupStatus,
+    manifest: data?.manifest?.backups.contacts ?? null,
+  });
+  const calendarRow = deriveCategoryBackupStatus({
+    kind: 'calendar',
+    settingEnabled: backup.isCalendarBackupEnabled,
+    native: backup.calendarBackupStatus,
+    manifest: data?.manifest?.backups.calendar ?? null,
+  });
+
+  const loadPrevious = useCallback(async (kind: CategoryKind) => {
+    const status = kind === 'contacts' ? backup.contactsBackupStatus : backup.calendarBackupStatus;
+    try {
+      const entries = await loadPreviousBackups({
+        parentFolderId: status?.parentFolderId ?? null,
+        runs: status?.runs ?? [],
+        listFiles: (parent) => listFiles(parent),
+        listFileVersions: (id) => listFileVersions(id),
+      });
+      setPreviousBackups((prev) => ({ ...prev, [kind]: entries }));
+    } catch {
+      setPreviousBackups((prev) => ({ ...prev, [kind]: prev[kind] ?? [] }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backup.contactsBackupStatus, backup.calendarBackupStatus]);
+
+  // Re-read the version history when a run finishes (a new version exists).
+  const contactsRunKey = `${backup.contactsBackupStatus?.parentFolderId ?? ''}|${backup.contactsBackupStatus?.lastRunAt ?? ''}|${backup.contactsBackupStatus?.running ? 1 : 0}`;
+  const calendarRunKey = `${backup.calendarBackupStatus?.parentFolderId ?? ''}|${backup.calendarBackupStatus?.lastRunAt ?? ''}|${backup.calendarBackupStatus?.running ? 1 : 0}`;
+  useEffect(() => {
+    if (backup.isContactsBackupEnabled && !backup.contactsBackupStatus?.running) void loadPrevious('contacts');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backup.isContactsBackupEnabled, contactsRunKey]);
+  useEffect(() => {
+    if (backup.isCalendarBackupEnabled && !backup.calendarBackupStatus?.running) void loadPrevious('calendar');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backup.isCalendarBackupEnabled, calendarRunKey]);
+
+  // Read the native status as soon as the screen opens, not at the next tick.
+  const { refreshCategoryStatus } = backup;
+  useEffect(() => {
+    void refreshCategoryStatus();
+  }, [refreshCategoryStatus]);
+
+  const handleCategoryAction = useCallback((kind: CategoryKind, status: CategoryRowStatus) => {
+    if (status.action === 'open_settings') {
+      void Linking.openSettings();
+    } else if (status.action === 'backup_anyway' && status.confirmText) {
+      Alert.alert('Back up anyway?', status.confirmText, [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Back up anyway',
+          style: 'destructive',
+          onPress: () => {
+            setActionError(null);
+            setRetrying(true);
+            void backup.runCategoryBackupNow(kind, { force: true })
+              .catch((error) => setActionError(error instanceof Error ? error.message : 'Backup could not start.'))
+              .finally(() => setRetrying(false));
+          },
+        },
+      ]);
+    } else if (status.action === 'retry') {
+      setActionError(null);
+      setRetrying(true);
+      void backup.runCategoryBackupNow(kind)
+        .catch((error) => setActionError(error instanceof Error ? error.message : 'Backup could not start.'))
+        .finally(() => setRetrying(false));
+    }
+  }, [backup]);
+
+  const categoryActivity = buildCategoryActivity(
+    backup.isContactsBackupEnabled ? backup.contactsBackupStatus?.runs ?? [] : [],
+    backup.isCalendarBackupEnabled ? backup.calendarBackupStatus?.runs ?? [] : [],
+  );
+
+  const lastVerificationAttempt = latestVerificationAttempt({
+    photo: data?.lastVerification
+      ? {
+          verifiedAt: data.lastVerification.verified_at,
+          success: data.lastVerification.success,
+        }
+      : null,
+    contacts: backup.isContactsBackupEnabled ? backup.contactsBackupStatus : null,
+    calendar: backup.isCalendarBackupEnabled ? backup.calendarBackupStatus : null,
+  });
+
   // ── Determine sync state ───────────────────────────────────────────────────
 
   const pendingCount =
@@ -561,6 +771,8 @@ export default function BackupInsightsScreen() {
         ),
       ];
 
+      lines.push('', ...(await getRunHistoryLines()));
+
       if (failedAssets.length > 0) {
         lines.push('', '--- Failed Assets ---');
         for (const asset of failedAssets) {
@@ -625,8 +837,8 @@ export default function BackupInsightsScreen() {
 
   return (
     <View style={[layout.root, { backgroundColor: c.paper }]}>
-      {/* 1315 — content runs under the chrome. */}
-      {isScrolled ? <ScrollEdgeBlur height={headerHeight || SCROLL_EDGE.chromeFallback} /> : null}
+      {/* The title stays absolute; the clipped viewport begins below it. */}
+      {isScrolled ? <ScrollEdgeBlur height={headerInset} /> : null}
       <View
         style={{
           position: 'absolute',
@@ -666,28 +878,29 @@ export default function BackupInsightsScreen() {
         </Text>
       </View>
 
-      {loading ? (
-        <View
-          style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}
-        >
-          <ActivityIndicator size="large" color={c.amber} />
-        </View>
-      ) : (
-        <ScrollView
-          style={layout.scroll}
-          contentContainerStyle={[layout.scrollContent, { paddingTop: headerHeight }]}
-          onScroll={(e) => setIsScrolled(e.nativeEvent.contentOffset.y > 0)}
-          scrollEventThrottle={100}
-          showsVerticalScrollIndicator={false}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={handleRefresh}
-              tintColor={c.amber}
-              colors={[c.amber]}
-            />
-          }
-        >
+      <View style={[layout.scrollViewport, { marginTop: headerInset }]}>
+        {loading ? (
+          <View
+            style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}
+          >
+            <ActivityIndicator size="large" color={c.amber} />
+          </View>
+        ) : (
+          <ScrollView
+            style={layout.scroll}
+            contentContainerStyle={layout.scrollContent}
+            onScroll={(e) => setIsScrolled(e.nativeEvent.contentOffset.y > 0)}
+            scrollEventThrottle={100}
+            showsVerticalScrollIndicator={false}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={handleRefresh}
+                tintColor={c.amber}
+                colors={[c.amber]}
+              />
+            }
+          >
           <View style={{ height: 16 }} />
 
           {/* ── ACTIVE native engine card ─────────────────────────────── */}
@@ -738,8 +951,9 @@ export default function BackupInsightsScreen() {
                     <>
                       <View
                         style={{
-                          flexDirection: 'row',
+                          flexDirection: accessibilityLayout ? 'column' : 'row',
                           justifyContent: 'space-between',
+                          gap: accessibilityLayout ? 4 : 0,
                         }}
                       >
                         <Text style={{ fontSize: 12, color: c.ink3 }}>
@@ -758,8 +972,9 @@ export default function BackupInsightsScreen() {
 
                       <View
                         style={{
-                          flexDirection: 'row',
+                          flexDirection: accessibilityLayout ? 'column' : 'row',
                           justifyContent: 'space-between',
+                          gap: accessibilityLayout ? 4 : 0,
                         }}
                       >
                         <Text style={{ fontSize: 12, color: c.ink3 }}>
@@ -782,34 +997,42 @@ export default function BackupInsightsScreen() {
 
                   <View
                     style={{
-                      flexDirection: 'row',
+                      flexDirection: accessibilityLayout ? 'column' : 'row',
                       justifyContent: 'space-between',
-                      alignItems: 'center',
+                      alignItems: accessibilityLayout ? 'flex-start' : 'center',
+                      gap: accessibilityLayout ? 4 : 0,
                     }}
                   >
-                    <Text style={{ fontSize: 12, color: c.ink3 }}>
-                      Last verified
+                    <Text
+                      style={{
+                        fontSize: 12,
+                        color: lastVerificationAttempt?.success === false ? c.red : c.ink3,
+                      }}
+                    >
+                      {lastVerificationAttempt
+                        ? (lastVerificationAttempt.success ? 'Last verified' : 'Verification failed')
+                        : 'Last verified'}
                     </Text>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                      {data?.lastVerification && (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+                      {lastVerificationAttempt && (
                         <View
                           style={{
                             width: 6,
                             height: 6,
                             borderRadius: 3,
-                            backgroundColor: data.lastVerification.success ? c.green : c.red,
+                            backgroundColor: lastVerificationAttempt.success ? c.green : c.red,
                           }}
                         />
                       )}
                       <Text
                         style={{
                           fontSize: 12,
-                          color: c.ink2,
+                          color: lastVerificationAttempt?.success === false ? c.red : c.ink2,
                           fontFamily: fonts.mono,
                         }}
                       >
-                        {data?.lastVerification
-                          ? timeAgo(new Date(data.lastVerification.verified_at).getTime())
+                        {lastVerificationAttempt
+                          ? timeAgoFromIso(lastVerificationAttempt.at)
                           : 'Not yet'}
                       </Text>
                     </View>
@@ -875,9 +1098,10 @@ export default function BackupInsightsScreen() {
                     <>
                       <View
                         style={{
-                          flexDirection: 'row',
+                          flexDirection: accessibilityLayout ? 'column' : 'row',
                           justifyContent: 'space-between',
-                          alignItems: 'baseline',
+                          alignItems: accessibilityLayout ? 'flex-start' : 'baseline',
+                          gap: accessibilityLayout ? 4 : 0,
                         }}
                       >
                         <Text style={{ fontSize: 12, color: c.ink3 }}>
@@ -949,17 +1173,45 @@ export default function BackupInsightsScreen() {
                 { backgroundColor: c.paper2, borderColor: c.line },
               ]}
             >
-              <StatRow
+              <CategoryStatusRow
                 label="Contacts"
-                value={formatCategoryBackupState(data?.manifest?.backups.contacts, 'contact')}
+                status={contactsRow}
                 c={c}
+                onAction={() => handleCategoryAction('contacts', contactsRow)}
+                testID="insights-contacts-status"
               />
+              {backup.isContactsBackupEnabled && (
+                <>
+                  <Divider c={c} />
+                  <PreviousBackupsList
+                    title="Previous contacts backups"
+                    entries={previousBackups.contacts}
+                    one="contact"
+                    many="contacts"
+                    c={c}
+                  />
+                </>
+              )}
               <Divider c={c} />
-              <StatRow
+              <CategoryStatusRow
                 label="Calendar"
-                value={formatCategoryBackupState(data?.manifest?.backups.calendar, 'event')}
+                status={calendarRow}
                 c={c}
+                onAction={() => handleCategoryAction('calendar', calendarRow)}
+                testID="insights-calendar-status"
               />
+              {backup.isCalendarBackupEnabled && (
+                <>
+                  <Divider c={c} />
+                  <PreviousBackupsList
+                    title="Previous calendar backups"
+                    entries={previousBackups.calendar}
+                    one="event"
+                    many="events"
+                    c={c}
+                  />
+                </>
+              )}
             </View>
           </View>
 
@@ -972,11 +1224,24 @@ export default function BackupInsightsScreen() {
                 { backgroundColor: c.paper2, borderColor: c.line },
               ]}
             >
+              {categoryActivity.map((entry, i) => (
+                <React.Fragment key={`${entry.kind}-${entry.at}`}>
+                  {i > 0 && <Divider c={c} />}
+                  <View style={[layout.row, accessibilityLayout && layout.rowAccessibility]}>
+                    <Text style={{ flex: 1, fontSize: 14, color: c.ink }}>
+                      {entry.kind === 'contacts' ? 'Contacts' : 'Calendar'} · {timeAgoFromIso(entry.at)}
+                    </Text>
+                    <Text style={{ flexShrink: 1, textAlign: 'right', fontSize: 13, color: c.ink2, fontFamily: fonts.mono }}>
+                      {entry.count.toLocaleString('en-US')} {entry.kind === 'contacts' ? (entry.count === 1 ? 'contact' : 'contacts') : (entry.count === 1 ? 'event' : 'events')}
+                    </Text>
+                  </View>
+                </React.Fragment>
+              ))}
               {data?.recentActivity && data.recentActivity.length > 0 ? (
                 data.recentActivity.map((entry, i) => (
                   <React.Fragment key={entry.date}>
-                    {i > 0 && <Divider c={c} />}
-                    <View style={layout.row}>
+                    {(i > 0 || categoryActivity.length > 0) && <Divider c={c} />}
+                    <View style={[layout.row, accessibilityLayout && layout.rowAccessibility]}>
                       <Text
                         style={{
                           flex: 1,
@@ -988,6 +1253,8 @@ export default function BackupInsightsScreen() {
                       </Text>
                       <Text
                         style={{
+                          flexShrink: 1,
+                          textAlign: 'right',
                           fontSize: 13,
                           color: c.ink2,
                           fontFamily: fonts.mono,
@@ -999,7 +1266,7 @@ export default function BackupInsightsScreen() {
                     </View>
                   </React.Fragment>
                 ))
-              ) : (
+              ) : categoryActivity.length > 0 ? null : (
                 <View
                   style={{
                     padding: 14,
@@ -1040,13 +1307,13 @@ export default function BackupInsightsScreen() {
                           color: c.ink,
                           fontFamily: fonts.mono,
                         }}
-                        numberOfLines={1}
+                        numberOfLines={accessibilityLayout ? undefined : 1}
                       >
                         {asset.local_asset_id}
                       </Text>
                       <Text
                         style={{ fontSize: 11, color: c.red }}
-                        numberOfLines={2}
+                        numberOfLines={accessibilityLayout ? undefined : 2}
                       >
                         {asset.error_message ?? 'Unknown error'}
                       </Text>
@@ -1111,11 +1378,14 @@ export default function BackupInsightsScreen() {
                     <View style={{ paddingHorizontal: 12, paddingVertical: 9, gap: 2 }}>
                       <Text
                         style={{ fontSize: 12, color: c.ink2, fontFamily: fonts.mono }}
-                        numberOfLines={1}
+                        numberOfLines={accessibilityLayout ? undefined : 1}
                       >
                         {asset.local_asset_id}
                       </Text>
-                      <Text style={{ fontSize: 11, color: c.ink4 }} numberOfLines={1}>
+                      <Text
+                        style={{ fontSize: 11, color: c.ink4 }}
+                        numberOfLines={accessibilityLayout ? undefined : 1}
+                      >
                         {asset.error_message ?? 'Photo no longer available locally'}
                       </Text>
                     </View>
@@ -1181,8 +1451,9 @@ export default function BackupInsightsScreen() {
           </View>
 
           <View style={{ height: 20 }} />
-        </ScrollView>
-      )}
+          </ScrollView>
+        )}
+      </View>
     </View>
   );
 }

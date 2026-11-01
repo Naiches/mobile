@@ -15,6 +15,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -60,6 +61,8 @@ export default function FileRequestsScreen({
   const insets = useSafeAreaInsets();
   const { colors: c } = useTheme();
   const { isUnlocked, rebuildRequestPublicKey } = useCrypto();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   const [requests, setRequests] = useState<FileRequest[]>([]);
   const [loading, setLoading] = useState(true);
@@ -139,7 +142,7 @@ export default function FileRequestsScreen({
   return (
     <View style={[styles.root, { backgroundColor: c.paper }]}>
       {!embedded && (
-        <View style={[styles.header, { paddingTop: insets.top + 10, borderBottomColor: c.line }]}>
+        <View style={[styles.header, accessibilityLayout && styles.headerAccessibility, { paddingTop: insets.top + 10, borderBottomColor: c.line }]}>
           <TouchableOpacity
             onPress={() => navigation.goBack()}
             style={styles.iconButton}
@@ -148,7 +151,7 @@ export default function FileRequestsScreen({
           >
             <Ionicons name="chevron-back" size={24} color={c.ink} />
           </TouchableOpacity>
-          <Text style={[styles.title, { color: c.ink }]}>File requests</Text>
+          <Text style={[styles.title, { color: c.ink }]} numberOfLines={accessibilityLayout ? 2 : 1}>File requests</Text>
           <TouchableOpacity
             onPress={() => navigation.navigate('CreateFileRequest')}
             style={styles.iconButton}
@@ -190,8 +193,8 @@ export default function FileRequestsScreen({
             const status = statusOf(r);
             return (
               <View key={r.id} style={[styles.card, { borderColor: c.line2, backgroundColor: c.paper2 }]}>
-                <View style={styles.cardTop}>
-                  <Text style={[styles.cardTitle, { color: c.ink }]} numberOfLines={1}>
+                <View style={[styles.cardTop, accessibilityLayout && styles.cardTopAccessibility]}>
+                  <Text style={[styles.cardTitle, accessibilityLayout && styles.cardTitleAccessibility, { color: c.ink }]} numberOfLines={accessibilityLayout ? undefined : 1}>
                     {r.title}
                   </Text>
                   <View style={[styles.pill, { backgroundColor: status === 'open' ? c.amberBg : c.paper }]}>
@@ -201,7 +204,7 @@ export default function FileRequestsScreen({
                   </View>
                 </View>
                 {r.description ? (
-                  <Text style={[styles.cardDesc, { color: c.ink3 }]} numberOfLines={2}>
+                  <Text style={[styles.cardDesc, { color: c.ink3 }]} numberOfLines={accessibilityLayout ? undefined : 2}>
                     {r.description}
                   </Text>
                 ) : null}
@@ -220,7 +223,7 @@ export default function FileRequestsScreen({
                     </Text>
                   ) : null}
                 </View>
-                <View style={[styles.actions, { borderTopColor: c.line }]}>
+                <View style={[styles.actions, accessibilityLayout && styles.actionsAccessibility, { borderTopColor: c.line }]}>
                   {status === 'open' && (
                     <TouchableOpacity
                       onPress={() => handleCopyLink(r)}
@@ -266,8 +269,9 @@ const styles = StyleSheet.create({
     paddingBottom: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
+  headerAccessibility: { alignItems: 'flex-start' },
   iconButton: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
-  title: { fontSize: 17, fontWeight: '600' },
+  title: { flex: 1, fontSize: 17, fontWeight: '600', textAlign: 'center' },
   scroll: { flex: 1 },
   muted: { fontSize: 13, textAlign: 'center', marginTop: 40 },
   empty: { borderWidth: 1, borderRadius: 14, padding: 28, alignItems: 'center', gap: 8 },
@@ -275,7 +279,9 @@ const styles = StyleSheet.create({
   emptyBody: { fontSize: 12, textAlign: 'center', marginBottom: 8 },
   card: { borderWidth: 1, borderRadius: 12, padding: 14, marginBottom: 12 },
   cardTop: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  cardTopAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   cardTitle: { flex: 1, fontSize: 14, fontWeight: '600' },
+  cardTitleAccessibility: { flexBasis: '70%' },
   pill: { borderRadius: 999, paddingHorizontal: 8, paddingVertical: 2 },
   pillText: { fontSize: 10.5, fontWeight: '600' },
   cardDesc: { fontSize: 12, marginTop: 4 },
@@ -288,7 +294,8 @@ const styles = StyleSheet.create({
     paddingTop: 10,
     borderTopWidth: StyleSheet.hairlineWidth,
   },
-  action: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  actionsAccessibility: { flexWrap: 'wrap', gap: 16 },
+  action: { flexDirection: 'row', alignItems: 'center', gap: 6, minHeight: 44, paddingVertical: 8 },
   actionRight: { marginLeft: 'auto' },
   actionText: { fontSize: 12, fontWeight: '500' },
   cta: { borderRadius: 10, paddingVertical: 11, paddingHorizontal: 20, marginTop: 6 },

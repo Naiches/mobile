@@ -171,6 +171,20 @@ enum FencedManifestWrites {
     return .written(inserted: inserted, entered: entered ?? 0)
   }
 
+  /// Incremental PhotoKit removals are manifest writes and use the same ticket
+  /// taken at observer entry as inserts from that change notification.
+  static func markMissing(
+    _ db: OpaquePointer?,
+    fence: ManifestWriteFence,
+    ticket: ManifestWriteFence.Ticket?,
+    localAssetIds: Set<String>,
+    nowMs: Int64
+  ) -> Int? {
+    guard fence.admits(ticket, writer: "photo_library_change.remove") else { return nil }
+    guard let db else { return nil }
+    return BackupManifestStore.markLocalAssetsMissing(db, localAssetIds: localAssetIds, nowMs: nowMs)
+  }
+
   /// Rebuild step 1: claim the manifest for the account (a write), then "does
   /// it hold nothing this account uploaded?". nil = fenced or failed.
   static func needsRebuild(
@@ -262,6 +276,24 @@ enum FencedManifestWrites {
     guard let db else { return false }
     BackupManifestStore.recordServerMarked(db, assetId: assetId, fileId: fileId, nowMs: nowMs)
     return true
+  }
+
+  /// Exact mark 404: settle the mark by CAS-requeueing the vanished remote.
+  /// A stale response for an already-moved row is settled; fence/SQL failure
+  /// remains distinct so the mark loop can stop safely.
+  static func requeueRemoteGone(
+    _ db: OpaquePointer?,
+    fence: ManifestWriteFence,
+    ticket: ManifestWriteFence.Ticket?,
+    assetId: String,
+    fileId: String,
+    nowMs: Int64
+  ) -> BackupManifestStore.RemoteGoneRequeue {
+    guard fence.admits(ticket, writer: "server_mark.file_gone") else { return .failed }
+    guard let db else { return .failed }
+    return BackupManifestStore.requeueRemoteGone(
+      db, assetId: assetId, fileId: fileId, nowMs: nowMs
+    )
   }
 
   /// The sign-out mark flush's row load: adopt pre-column rows, then read

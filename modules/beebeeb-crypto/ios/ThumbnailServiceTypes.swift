@@ -72,6 +72,61 @@ enum ThumbnailVariantPolicy {
   }
 }
 
+/// Pure interaction rules shared by the native Photos grid and its Swift harness.
+enum PhotoGridDragSelectionPolicy {
+  static let edgeThreshold: CGFloat = 80
+  static let maximumAutoscrollSpeed: CGFloat = 420
+
+  /// Points per second. Negative scrolls toward older content above the viewport.
+  static func autoscrollVelocity(
+    pointerY: CGFloat,
+    visibleMinY: CGFloat,
+    visibleMaxY: CGFloat
+  ) -> CGFloat {
+    guard visibleMaxY > visibleMinY else { return 0 }
+
+    if pointerY < visibleMinY + edgeThreshold {
+      return -speed(distanceFromEdge: pointerY - visibleMinY)
+    }
+    if pointerY > visibleMaxY - edgeThreshold {
+      return speed(distanceFromEdge: visibleMaxY - pointerY)
+    }
+    return 0
+  }
+
+  static func selectedRange(from start: Int, to end: Int, itemCount: Int) -> ClosedRange<Int>? {
+    guard itemCount > 0,
+          start >= 0, start < itemCount,
+          end >= 0, end < itemCount else {
+      return nil
+    }
+    return min(start, end)...max(start, end)
+  }
+
+  static func isUserScrollingEnabled(isDragSelecting: Bool) -> Bool {
+    !isDragSelecting
+  }
+
+  /// A long press may seed the first range only while that same press is still
+  /// active. Once the finger has lifted, a later drag starts at its own cell.
+  static func anchor<Index>(
+    forNewDragAt touchedIndex: Index,
+    pendingLongPressAnchor: Index?,
+    longPressIsActive: Bool
+  ) -> Index {
+    guard longPressIsActive, let pendingLongPressAnchor else {
+      return touchedIndex
+    }
+    return pendingLongPressAnchor
+  }
+
+  private static func speed(distanceFromEdge: CGFloat) -> CGFloat {
+    let normalizedDistance = min(1, max(0, distanceFromEdge / edgeThreshold))
+    let pressure = 1 - normalizedDistance
+    return maximumAutoscrollSpeed * pressure * pressure
+  }
+}
+
 /// Result of one `small` download attempt.
 enum SmallFetchOutcome: Equatable {
   /// The small thumbnail was downloaded.

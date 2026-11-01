@@ -11,16 +11,29 @@ import {
   enablePhotoBackup,
   enableContactsBackup,
   enableCalendarBackup,
+  prepareContactsBackup,
+  prepareCalendarBackup,
   resumeContactsBackup,
   resumeCalendarBackup,
+  getContactsBackupStatus,
+  getCalendarBackupStatus,
+  runContactsBackupNow,
+  runCalendarBackupNow,
   getBackupProgress,
   triggerImmediateBackup,
   mirrorBackupClientSession,
   getPhotoBackupIncludeVideos,
   setPhotoBackupIncludeVideos,
   type NativeBackupProgress,
+  type NativeCategoryBackupStatus,
 } from '../../modules/beebeeb-crypto';
 import { startAccountRefusalPoll } from './account-refusal-poll';
+import {
+  launchBackupWork,
+  prepareCategoryBackupForIntent,
+  runPreparedCategoryBackup,
+  startPhotoBackupBeforeDestinationPreparation,
+} from './backup-startup';
 import { isPhoneBackupSupported } from './backup-platform-support';
 import { syncBackupDeviceIdToNative } from './backup-device-id-handoff';
 import { ensureBackupFolders, reconcileDerivedStateAgainstServer, type BackupCategory } from '../services/BackupService';
@@ -243,7 +256,19 @@ export interface BackupContextValue {
   setBackgroundUpload: (value: boolean) => Promise<void>;
   backupProgress: BackupProgress;
   lastBackupAt: string | null;
-  triggerBackupNow: () => Promise<void>;
+  /** `skipCategories` leaves Contacts and Calendar alone (a photo-album change is not a request to back them up). */
+  triggerBackupNow: (options?: { skipCategories?: boolean }) => Promise<void>;
+  /**
+   * Native status of the Contacts and Calendar backups on this device (run in
+   * flight and its progress, last run, verification). null until the first
+   * read, or while the category is off. Feed it to `deriveCategoryBackupStatus`.
+   */
+  contactsBackupStatus: NativeCategoryBackupStatus | null;
+  calendarBackupStatus: NativeCategoryBackupStatus | null;
+  /** Re-read both statuses now (the provider also polls while a run is in flight). */
+  refreshCategoryStatus: () => Promise<void>;
+  /** Bind/configure the native category first, then start one visible run. */
+  runCategoryBackupNow: (kind: 'contacts' | 'calendar', options?: { force?: boolean }) => Promise<void>;
   /**
    * Task 1594: set when the backup refused to run because this device's vault
    * key cannot read the account's folder names (a wrong key — never build a
@@ -334,6 +359,10 @@ export const BackupContext = createContext<BackupContextValue>({
   backupProgress: EMPTY_PROGRESS,
   lastBackupAt: null,
   triggerBackupNow: async () => {},
+  contactsBackupStatus: null,
+  calendarBackupStatus: null,
+  refreshCategoryStatus: async () => {},
+  runCategoryBackupNow: async () => {},
   backupBlockedReason: null,
   accountMismatchReason: null,
   ownerUnconfirmedReason: null,
@@ -775,110 +804,221 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
     setServerCheckPausedReason(nativeServerCheckPausedReason(p));
   }, []);
 
+  const [contactsBackupStatus, setContactsBackupStatus] = useState<NativeCategoryBackupStatus | null>(null);
+  const [calendarBackupStatus, setCalendarBackupStatus] = useState<NativeCategoryBackupStatus | null>(null);
+  const categoryEnabledRef = useRef({ contacts: false, calendar: false });
+  categoryEnabledRef.current = { contacts: isContactsBackupEnabled, calendar: isCalendarBackupEnabled };
+  const toggleEnabledRef = useRef({
+    camera_roll: isPhotoBackupEnabled,
+    contacts: isContactsBackupEnabled,
+    calendar: isCalendarBackupEnabled,
+  });
+  toggleEnabledRef.current = {
+    camera_roll: isPhotoBackupEnabled,
+    contacts: isContactsBackupEnabled,
+    calendar: isCalendarBackupEnabled,
+  };
+  const backupIntentGenerationRef = useRef<Record<BackupCategory, number>>({
+    camera_roll: 0,
+    contacts: 0,
+    calendar: 0,
+  });
+
+  const refreshCategoryStatus = useCallback(async () => {
+    if (Platform.OS === 'web') return;
+    if (!isPhoneBackupSupported()) return;
+    const keep = <T,>(prev: T | null, next: T | null): T | null =>
+      JSON.stringify(prev) === JSON.stringify(next) ? prev : next;
+    const { contacts, calendar } = categoryEnabledRef.current;
+    if (contacts) {
+      const st = await getContactsBackupStatus().catch(() => null);
+      setContactsBackupStatus((prev) => keep(prev, st));
+      // Access was granted in iOS Settings after a denial: back up now.
+      if (st && st.lastError === 'permission_denied' && !st.permissionDenied && !st.running) {
+        void runContactsBackupNow().catch(() => {});
+      }
+    } else {
+      setContactsBackupStatus(null);
+    }
+    if (calendar) {
+      const st = await getCalendarBackupStatus().catch(() => null);
+      setCalendarBackupStatus((prev) => keep(prev, st));
+      if (st && st.lastError === 'permission_denied' && !st.permissionDenied && !st.running) {
+        void runCalendarBackupNow().catch(() => {});
+      }
+    } else {
+      setCalendarBackupStatus(null);
+    }
+  }, []);
+
   const refreshNativeProgress = useCallback(async () => {
     if (Platform.OS === 'web') return;
     // Task 2303 — the Android module registers no `getBackupProgress`.
     if (!isPhoneBackupSupported()) return;
     const p: NativeBackupProgress = await getBackupProgress();
     applyNativeProgress(p);
-  }, [applyNativeProgress]);
+    await refreshCategoryStatus();
+  }, [applyNativeProgress, refreshCategoryStatus]);
 
-  const enableNativeBackup = useCallback(async (category: BackupCategory, options: { runNow?: boolean } = {}) => {
-    if (Platform.OS === 'web') return;
+  const enableNativeBackup = useCallback(async (
+    category: BackupCategory,
+    options: {
+      runNow?: boolean;
+      bindOnly?: boolean;
+      requireReady?: boolean;
+      isCurrent?: () => boolean;
+    } = {},
+  ): Promise<boolean> => {
+    const isCurrent = options.isCurrent ?? (() => true);
+    const unavailable = (message: string): false => {
+      if (options.requireReady) throw new Error(message);
+      return false;
+    };
+    if (!isCurrent()) return false;
+    if (Platform.OS === 'web') return unavailable('Phone backup is not available on the web.');
     // Task 2303 — the ONE gate: no Android UI path may reach a backup native
     // function the Android module does not register.
-    if (!isPhoneBackupSupported()) return;
+    if (!isPhoneBackupSupported()) return unavailable('Phone backup is not available on this device.');
     if (accountBlockedRef.current) {
       setBackupBlockedReason(accountBlockedRef.current);
       recordRuntimeTrace('backup.native.enable.blocked', { category, reason: 'account_read_only' });
-      return;
+      return unavailable(accountBlockedRef.current);
     }
     const token = await getStoredToken();
-    if (!token) return;
+    if (!isCurrent()) return false;
+    if (!token) return unavailable('Sign in again before starting backup.');
     if (!isUnlocked) {
       recordRuntimeTrace('backup.native.enable.deferred', {
         category,
         reason: 'vault_locked',
         runNow: options.runNow !== false,
       });
-      return;
+      return unavailable('Unlock your vault before starting backup.');
     }
 
-    let categoryFolderId: string;
-    try {
-      ({ categoryFolderId } = await ensureBackupFolders(category));
-    } catch (err) {
-      // Task 1594: a vault key that cannot read the folder names must stop the
-      // backup — surface why instead of the silent catch the callers have.
+    const handleEnableError = (err: unknown): void => {
       if (isVaultKeyMismatchError(err)) {
         setBackupBlockedReason(err.message);
         recordRuntimeTrace('backup.native.enable.blocked', { category, reason: 'vault_key_mismatch' });
         return;
       }
-      throw err;
-    }
-    setBackupBlockedReason(null);
-    await configureBackupFolder(category, categoryFolderId);
-    recordRuntimeTrace('backup.native.folder_configured', {
-      category,
-      hasParentFolder: categoryFolderId.length > 0,
-      runNow: options.runNow !== false,
-    });
+      console.warn(`[backup] ${category} startup failed:`, err);
+      setBackupBlockedReason('Backup setup could not finish. Tap Back up now to retry.');
+      recordRuntimeTrace('backup.native.enable.failed', {
+        category,
+        error: err instanceof Error ? err.message : 'Unknown error',
+      });
+    };
+
+    const prepareDestination = async (): Promise<string> => {
+      const { categoryFolderId } = await ensureBackupFolders(category);
+      return categoryFolderId;
+    };
+
+    const configureDestination = async (categoryFolderId: string): Promise<void> => {
+      setBackupBlockedReason(null);
+      await configureBackupFolder(category, categoryFolderId);
+      recordRuntimeTrace('backup.native.folder_configured', {
+        category,
+        hasParentFolder: categoryFolderId.length > 0,
+        runNow: options.runNow !== false,
+      });
+    };
 
     if (category === 'camera_roll') {
-      // Task 1531 [P0]: userId tags newly-staged assets with the account
-      // they were encrypted for, and lets the native engine purge any
-      // staged-but-unuploaded asset left over from a DIFFERENT account on
-      // this device before draining anything under this session. Without a
-      // known userId there is nothing to tag/compare against, so skip
-      // rather than call the native side with an empty account id.
+      // PhotoKit scanning is local. Start it before any whole-vault index or
+      // Drive-folder work so camera-roll and limited-library backup are never
+      // coupled to the Photos tab's display sources.
       if (!canEnableNativeCameraBackup(userId)) {
         recordRuntimeTrace('backup.native.enable.deferred', {
           category,
           reason: 'no_user_id',
           runNow: options.runNow !== false,
         });
-        return;
+        return unavailable('Backup needs a signed-in account.');
       }
-      await setPhotoBackupIncludeVideos(includeVideosRef.current).catch(() => false);
-      await mirrorBackupSessionForNative();
-      await enablePhotoBackup(token, userId);
-    } else if (category === 'contacts') {
-      // Task 1531 [P0]: same account-binding rationale as camera_roll above
-      // — `canEnableNativeCameraBackup` is just a non-empty-string check
-      // despite its name, reused here so Contacts uploads are bound to an
-      // account the same way. Without a known userId there is nothing to
-      // bind, so skip rather than call the native side with no account id.
-      if (!canEnableNativeCameraBackup(userId)) {
-        recordRuntimeTrace('backup.native.enable.deferred', {
-          category,
-          reason: 'no_user_id',
-          runNow: options.runNow !== false,
-        });
-        return;
+      startPhotoBackupBeforeDestinationPreparation({
+        isCurrent,
+        startEngine: async (stillCurrent) => {
+          // A destination persisted from a prior launch may have been moved
+          // or deleted out of band. Clear it before starting: the engine may
+          // scan/queue immediately but cannot drain until this run validates
+          // and configures the folder below.
+          await configureBackupFolder('camera_roll', null);
+          if (!stillCurrent()) return;
+          // This local native handoff must precede enable so the first scan
+          // has the canonical device/session identity. The include-videos
+          // setting is mirrored in the same turn before either promise waits.
+          await mirrorBackupSessionForNative();
+          if (!stillCurrent()) return;
+          const includePromise = setPhotoBackupIncludeVideos(includeVideosRef.current).catch(() => false);
+          const startPromise = enablePhotoBackup(token, userId);
+          await includePromise;
+          await startPromise;
+        },
+        prepareDestination,
+        configureDestination,
+        onError: handleEnableError,
+      });
+      return true;
+    }
+
+    if (!canEnableNativeCameraBackup(userId)) {
+      recordRuntimeTrace('backup.native.enable.deferred', {
+        category,
+        reason: 'no_user_id',
+        runNow: options.runNow !== false,
+      });
+      return unavailable('Backup needs a signed-in account.');
+    }
+
+    try {
+      return await prepareCategoryBackupForIntent({
+        prepareDestination,
+        configureDestination,
+        isCurrent,
+        bindNative: async () => {
+          if (category === 'contacts') {
+            if (options.bindOnly) await prepareContactsBackup(token, userId);
+            else if (options.runNow === false) await resumeContactsBackup(token, userId);
+            else await enableContactsBackup(token, userId);
+          } else {
+            if (options.bindOnly) await prepareCalendarBackup(token, userId);
+            else if (options.runNow === false) await resumeCalendarBackup(token, userId);
+            else await enableCalendarBackup(token, userId);
+          }
+        },
+      });
+    } catch (err) {
+      if (isVaultKeyMismatchError(err)) {
+        setBackupBlockedReason(err.message);
+        recordRuntimeTrace('backup.native.enable.blocked', { category, reason: 'vault_key_mismatch' });
+        if (options.requireReady) throw err;
+        return false;
       }
-      if (options.runNow === false) {
-        await resumeContactsBackup(token, userId);
-      } else {
-        await enableContactsBackup(token, userId);
-      }
-    } else {
-      // Task 1531 [P0]: same account-binding rationale as camera_roll above.
-      if (!canEnableNativeCameraBackup(userId)) {
-        recordRuntimeTrace('backup.native.enable.deferred', {
-          category,
-          reason: 'no_user_id',
-          runNow: options.runNow !== false,
-        });
-        return;
-      }
-      if (options.runNow === false) {
-        await resumeCalendarBackup(token, userId);
-      } else {
-        await enableCalendarBackup(token, userId);
-      }
+      throw err;
     }
   }, [isUnlocked, userId]);
+
+  const runCategoryBackupNow = useCallback(async (
+    kind: 'contacts' | 'calendar',
+    options: { force?: boolean } = {},
+  ): Promise<void> => {
+    await runPreparedCategoryBackup(kind, { force: options.force === true }, {
+      prepare: async (category) => {
+        await enableNativeBackup(category, {
+          runNow: false,
+          bindOnly: true,
+          requireReady: true,
+        });
+      },
+      run: async (category, runOptions) => {
+        const run = category === 'contacts' ? runContactsBackupNow : runCalendarBackupNow;
+        await run({ force: runOptions.force });
+      },
+      refresh: refreshCategoryStatus,
+    });
+  }, [enableNativeBackup, refreshCategoryStatus]);
 
   // Task 1667 round 12 (review item 7): hand the canonical device id to
   // native at every launch, not only at enable, so a background task never
@@ -1078,6 +1218,19 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
     };
   }, [isPhotoBackupEnabled, isContactsBackupEnabled, isCalendarBackupEnabled, refreshNativeProgress]);
 
+  // Contacts/Calendar progress ("340 of 1,234") moves faster than the 5 s tick:
+  // read their status every second, but only while a run is in flight and the
+  // app is in the foreground.
+  const categoryRunning = Boolean(contactsBackupStatus?.running || calendarBackupStatus?.running);
+  useEffect(() => {
+    if (!categoryRunning || Platform.OS === 'web') return;
+    const id = setInterval(() => {
+      if (shouldPauseBackupPolls(appStateRef.current)) return;
+      void refreshCategoryStatus();
+    }, 1000);
+    return () => clearInterval(id);
+  }, [categoryRunning, refreshCategoryStatus]);
+
   // Task 1686 — track AppState for both polls. A ref (not state): polls read
   // it at tick time without re-mounting the effects, and the listeners above
   // also write it on 'change'. Synced from AppState.currentState at mount so
@@ -1119,27 +1272,37 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
     // shown there, and this guard keeps any stale caller from flipping a
     // preference that would claim backup is on.
     if (!isPhoneBackupSupported()) return;
-    const next = !isPhotoBackupEnabled;
+    const next = !toggleEnabledRef.current.camera_roll;
+    toggleEnabledRef.current.camera_roll = next;
+    const generation = ++backupIntentGenerationRef.current.camera_roll;
+    const isCurrent = () => (
+      backupIntentGenerationRef.current.camera_roll === generation &&
+      toggleEnabledRef.current.camera_roll === next
+    );
     setIsPhotoBackupEnabled(next);
     // Task 1667 (sim rung 5b): turning backup on shows nothing until native
     // answers (the poll reads at once), never the progress kept from before
     // it was turned off, and the empty state lets that answer through even
     // when it is identical.
     if (next) setShownNativeProgress(null);
-    try {
-      await setScopedBackupPref(BACKUP_PHOTO_KEY, userId, next ? 'true' : 'false');
-      if (Platform.OS !== 'web') {
+    launchBackupWork(
+      () => setScopedBackupPref(BACKUP_PHOTO_KEY, userId, next ? 'true' : 'false'),
+      (error) => console.warn('[backup] could not save camera-roll preference:', error),
+    );
+    if (Platform.OS !== 'web') {
+      launchBackupWork(async () => {
         if (next) {
-          await enableNativeBackup('camera_roll');
+          await enableNativeBackup('camera_roll', { isCurrent });
+          if (!isCurrent()) return;
           await refreshNativeProgress().catch(() => {});
         } else {
           await disablePhotoBackup();
+          if (!isCurrent()) return;
           await clearMobileIosBackupClientSession().catch(() => {});
+          if (!isCurrent()) return;
           await configureBackupFolder('camera_roll', null);
         }
-      }
-    } catch {
-      // Native module not linked yet
+      }, (error) => console.warn('[backup] camera-roll toggle failed:', error));
     }
   }, [enableNativeBackup, isPhotoBackupEnabled, refreshNativeProgress, userId]);
 
@@ -1149,21 +1312,30 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
     // shown there, and this guard keeps any stale caller from flipping a
     // preference that would claim backup is on.
     if (!isPhoneBackupSupported()) return;
-    const next = !isContactsBackupEnabled;
+    const next = !toggleEnabledRef.current.contacts;
+    toggleEnabledRef.current.contacts = next;
+    const generation = ++backupIntentGenerationRef.current.contacts;
+    const isCurrent = () => (
+      backupIntentGenerationRef.current.contacts === generation &&
+      toggleEnabledRef.current.contacts === next
+    );
     setIsContactsBackupEnabled(next);
-    try {
-      await setScopedBackupPref(BACKUP_CONTACTS_KEY, userId, next ? 'true' : 'false');
-      if (Platform.OS !== 'web') {
+    launchBackupWork(
+      () => setScopedBackupPref(BACKUP_CONTACTS_KEY, userId, next ? 'true' : 'false'),
+      (error) => console.warn('[backup] could not save contacts preference:', error),
+    );
+    if (Platform.OS !== 'web') {
+      launchBackupWork(async () => {
         if (next) {
-          await enableNativeBackup('contacts');
+          await enableNativeBackup('contacts', { isCurrent });
+          if (!isCurrent()) return;
           await refreshNativeProgress().catch(() => {});
         } else {
           await disableContactsBackup();
+          if (!isCurrent()) return;
           await configureBackupFolder('contacts', null);
         }
-      }
-    } catch {
-      // Native module not linked yet
+      }, (error) => console.warn('[backup] contacts toggle failed:', error));
     }
   }, [enableNativeBackup, isContactsBackupEnabled, refreshNativeProgress, userId]);
 
@@ -1173,21 +1345,30 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
     // shown there, and this guard keeps any stale caller from flipping a
     // preference that would claim backup is on.
     if (!isPhoneBackupSupported()) return;
-    const next = !isCalendarBackupEnabled;
+    const next = !toggleEnabledRef.current.calendar;
+    toggleEnabledRef.current.calendar = next;
+    const generation = ++backupIntentGenerationRef.current.calendar;
+    const isCurrent = () => (
+      backupIntentGenerationRef.current.calendar === generation &&
+      toggleEnabledRef.current.calendar === next
+    );
     setIsCalendarBackupEnabled(next);
-    try {
-      await setScopedBackupPref(BACKUP_CALENDAR_KEY, userId, next ? 'true' : 'false');
-      if (Platform.OS !== 'web') {
+    launchBackupWork(
+      () => setScopedBackupPref(BACKUP_CALENDAR_KEY, userId, next ? 'true' : 'false'),
+      (error) => console.warn('[backup] could not save calendar preference:', error),
+    );
+    if (Platform.OS !== 'web') {
+      launchBackupWork(async () => {
         if (next) {
-          await enableNativeBackup('calendar');
+          await enableNativeBackup('calendar', { isCurrent });
+          if (!isCurrent()) return;
           await refreshNativeProgress().catch(() => {});
         } else {
           await disableCalendarBackup();
+          if (!isCurrent()) return;
           await configureBackupFolder('calendar', null);
         }
-      }
-    } catch {
-      // Native module not linked yet
+      }, (error) => console.warn('[backup] calendar toggle failed:', error));
     }
   }, [enableNativeBackup, isCalendarBackupEnabled, refreshNativeProgress, userId]);
 
@@ -1222,7 +1403,7 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
     }
   }, [userId]);
 
-  const triggerBackupNow = useCallback(async () => {
+  const triggerBackupNow = useCallback(async (options?: { skipCategories?: boolean }) => {
     // Task 2303 — no native backup bridge on Android.
     if (!isPhoneBackupSupported()) return;
     if (accountBlockedRef.current) {
@@ -1247,12 +1428,34 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
 
       const token = await getStoredToken();
       if (!token) return;
+      // Contacts and Calendar: run their backups too, so "Back up now" shows
+      // their progress as well.
+      let categoryStartError: unknown = null;
+      if (!options?.skipCategories) {
+        if (categoryEnabledRef.current.contacts) {
+          try {
+            await runCategoryBackupNow('contacts');
+          } catch (error) {
+            categoryStartError ??= error;
+          }
+        }
+        if (categoryEnabledRef.current.calendar) {
+          try {
+            await runCategoryBackupNow('calendar');
+          } catch (error) {
+            categoryStartError ??= error;
+          }
+        }
+      }
       // Task 1531 [P2-4]: `triggerImmediateBackup` binds/checks the engine's
       // account with `userId` the same way `enablePhotoBackup` does — without
       // a known userId there is nothing to bind, so skip rather than call
       // the native side with no account id (mirrors the `canEnableNativeCameraBackup`
       // guard already used for `enablePhotoBackup` below).
-      if (!canEnableNativeCameraBackup(userId)) return;
+      if (!canEnableNativeCameraBackup(userId)) {
+        if (categoryStartError) throw categoryStartError;
+        return;
+      }
       try {
         const { categoryFolderId } = await ensureBackupFolders('camera_roll');
         await configureBackupFolder('camera_roll', categoryFolderId);
@@ -1270,14 +1473,17 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
         }
         console.warn('[backup] native photo backup warm-up failed:', err);
         if (canEnableNativeCameraBackup(userId)) {
+          await mirrorBackupSessionForNative();
           await enablePhotoBackup(token, userId);
         }
         await refreshNativeProgress().catch(() => {});
       }
+      if (categoryStartError) throw categoryStartError;
     } catch (err) {
       console.warn('[backup] triggerBackupNow failed:', err);
+      throw err;
     }
-  }, [applyNativeProgress, refreshNativeProgress, wifiOnly, userId]);
+  }, [applyNativeProgress, refreshNativeProgress, runCategoryBackupNow, wifiOnly, userId]);
 
   // Task 1667 (sim rung 5b): camera backup off shows the empty state, derived
   // here instead of written into the shown state (writing EMPTY_PROGRESS
@@ -1310,6 +1516,10 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
     backupProgress,
     lastBackupAt,
     triggerBackupNow,
+    contactsBackupStatus,
+    calendarBackupStatus,
+    refreshCategoryStatus,
+    runCategoryBackupNow,
     backupBlockedReason,
     accountMismatchReason,
     ownerUnconfirmedReason,

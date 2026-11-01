@@ -27,13 +27,13 @@ print_failure_blocks() {
 check_log() {
   local log="$1" code="$2" lines n fail files broken
   if [ ! -s "$log" ]; then echo "UNIT SUITE GATE: FAIL (empty log)"; return 1; fi
-  lines="$(grep -cE '^isolated: [0-9]+ pass, [0-9]+ fail across [0-9]+ files' "$log" || true)"
+  lines="$(grep -cE '^isolated: [0-9]+ pass, [0-9]+ fail across [0-9]+ files$' "$log" || true)"
   if [ "$lines" != "1" ]; then
     echo "UNIT SUITE GATE: FAIL (expected exactly 1 'isolated: N pass, F fail across X files' line, found $lines)"
     return 1
   fi
   local line
-  line="$(grep -E '^isolated: [0-9]+ pass, [0-9]+ fail across [0-9]+ files' "$log")"
+  line="$(grep -E '^isolated: [0-9]+ pass, [0-9]+ fail across [0-9]+ files$' "$log")"
   n="$(printf '%s' "$line" | sed -E 's/^isolated: ([0-9]+) pass.*/\1/')"
   fail="$(printf '%s' "$line" | sed -E 's/^isolated: [0-9]+ pass, ([0-9]+) fail.*/\1/')"
   files="$(printf '%s' "$line" | sed -E 's/.* across ([0-9]+) files.*/\1/')"
@@ -62,6 +62,7 @@ self_test() {
   expect "N=0 is RED (green with no count)"     1 '\nisolated: 0 pass, 0 fail across 149 files\n' 0
   expect "0 files is RED"                       1 '\nisolated: 5 pass, 0 fail across 0 files\n' 0
   expect "a failing test is RED"                1 '\nisolated: 1791 pass, 1 fail across 149 files — 1 file(s) failing\n' 1
+  expect "a leaked-temp suffix is RED"          1 '\nisolated: 1792 pass, 0 fail across 149 files — failed because of 1 leaked temp folder(s)\n' 0
   expect "failing count with exit 0 is RED"     1 '\nisolated: 1791 pass, 1 fail across 149 files\n' 0
   expect "exit code 1 with a clean line is RED" 1 '\nisolated: 1792 pass, 0 fail across 149 files\n' 1
   expect "missing truth line is RED"            1 'ok   a.test.ts  (3 pass, 0 fail)\n' 0
@@ -77,7 +78,7 @@ self_test() {
     echo "  BAD  failure diagnostic dropped filename or error bodies"; failures=$((failures + 1))
   fi
   if [ "$failures" != "0" ]; then echo "SELF-TEST: FAIL ($failures wrong verdicts)"; return 1; fi
-  echo "SELF-TEST: PASS (11 verdicts correct, 10 of them red-proofs; 1 diagnostic check)"
+  echo "SELF-TEST: PASS (12 verdicts correct, 11 of them red-proofs; 1 diagnostic check)"
 }
 
 case "${1:-}" in
@@ -85,7 +86,12 @@ case "${1:-}" in
   --check) check_log "${2:?log file}" "${3:?exit code}"; exit $? ;;
   "")
     cd "$ROOT" || exit 1
-    LOG="${UNIT_SUITE_LOG:-$(mktemp)}"
+    if [ -n "${UNIT_SUITE_LOG:-}" ]; then
+      LOG="$UNIT_SUITE_LOG"
+    else
+      LOG="$(mktemp)"
+      trap 'rm -f "$LOG"' EXIT
+    fi
     bun run test > "$LOG" 2>&1
     CODE=$?
     # keep the tail visible in the job log even when the gate passes

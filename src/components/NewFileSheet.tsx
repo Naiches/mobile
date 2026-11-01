@@ -130,7 +130,7 @@ function DocOutlineIcon({ width, color, label }: { width: number; color: string;
           }}
         />
         <Text
-          allowFontScaling={false}
+          maxFontSizeMultiplier={1.3}
           numberOfLines={1}
           adjustsFontSizeToFit
           minimumFontScale={0.7}
@@ -159,7 +159,8 @@ function DocOutlineIcon({ width, color, label }: { width: number; color: string;
 export default function NewFileSheet({ visible, onClose, existingNames, folderLabel, onCreate }: Props) {
   const { colors: c, resolved } = useTheme();
   const dark = resolved === 'dark';
-  const { width: screenW } = useWindowDimensions();
+  const { width: screenW, fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   const [modalMounted, setModalMounted] = useState(visible);
   const [step, setStep] = useState<Step>({ kind: 'types' });
@@ -199,7 +200,8 @@ export default function NewFileSheet({ visible, onClose, existingNames, folderLa
     [dark, c.amber, c.paper2],
   );
 
-  const colW = (screenW - SIDE * 2 - COL_GAP * (COLS - 1)) / COLS;
+  const columns = accessibilityLayout ? 2 : COLS;
+  const colW = (screenW - SIDE * 2 - COL_GAP * (columns - 1)) / columns;
   const well = Math.round(Math.min(72, colW * 0.83));
   const iconW = Math.round(well * 0.494);
 
@@ -326,7 +328,7 @@ export default function NewFileSheet({ visible, onClose, existingNames, folderLa
                 </View>
               </View>
               <Text
-                numberOfLines={1}
+                numberOfLines={accessibilityLayout ? 2 : 1}
                 style={[
                   styles.tileName,
                   { color: accent ? c.ink : c.ink2, fontWeight: accent ? '600' : '500', opacity: live ? 1 : 0.35 },
@@ -377,6 +379,7 @@ export default function NewFileSheet({ visible, onClose, existingNames, folderLa
               backgroundColor: pal.fieldBg,
               borderColor: shownError ? c.red : c.amber,
             },
+            accessibilityLayout && styles.fieldAccessibility,
           ]}
         >
           <TextInput
@@ -404,6 +407,7 @@ export default function NewFileSheet({ visible, onClose, existingNames, folderLa
                   backgroundColor: pal.extBg,
                   borderLeftColor: errorField === 'extension' ? c.red : c.line,
                 },
+                accessibilityLayout && styles.extSegmentAccessibility,
               ]}
             >
               <Text style={[styles.extDot, { color: c.ink2 }]}>.</Text>
@@ -424,7 +428,10 @@ export default function NewFileSheet({ visible, onClose, existingNames, folderLa
               />
             </View>
           ) : (
-            <Text style={[styles.fixedExt, { color: c.ink3 }]} accessibilityLabel="Extension .md, fixed">
+            <Text
+              style={[styles.fixedExt, accessibilityLayout && styles.fixedExtAccessibility, { color: c.ink3 }]}
+              accessibilityLabel="Extension .md, fixed"
+            >
               .md
             </Text>
           )}
@@ -468,9 +475,9 @@ export default function NewFileSheet({ visible, onClose, existingNames, folderLa
           </View>
         ) : null}
 
-        <View style={[styles.kv, { borderTopColor: c.line }]}>
+        <View style={[styles.kv, accessibilityLayout && styles.kvAccessibility, { borderTopColor: c.line }]}>
           <Text style={[styles.kvKey, { color: c.ink3 }]}>Saves to</Text>
-          <Text style={[styles.kvVal, { color: c.ink }]} numberOfLines={1}>
+          <Text style={[styles.kvVal, { color: c.ink }]} numberOfLines={accessibilityLayout ? undefined : 1}>
             {folderLabel}
           </Text>
         </View>
@@ -535,7 +542,7 @@ const styles = StyleSheet.create({
   backText: { fontSize: 14 },
   sectionLabel: { fontFamily: MONO_MEDIUM, fontSize: 10.5, letterSpacing: 1.3, marginTop: 16, marginBottom: 12 },
   grid: { flexDirection: 'row', flexWrap: 'wrap', columnGap: COL_GAP, rowGap: 16 },
-  tile: { alignItems: 'center' },
+  tile: { alignItems: 'center', minHeight: 108 },
   well: { alignItems: 'center', justifyContent: 'center' },
   tileName: { fontSize: 12, marginTop: 7, textAlign: 'center' },
   soon: { fontFamily: MONO_MEDIUM, fontSize: 9.5, letterSpacing: 0.8, marginTop: 2 },
@@ -547,6 +554,7 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     marginTop: 10,
   },
+  fieldAccessibility: { flexDirection: 'column' },
   baseInput: { flex: 1, fontSize: 17, fontWeight: '500', paddingHorizontal: 14, paddingVertical: 13 },
   extSegment: {
     flexDirection: 'row',
@@ -556,9 +564,15 @@ const styles = StyleSheet.create({
     paddingRight: 12,
     minWidth: 76,
   },
+  extSegmentAccessibility: {
+    borderLeftWidth: 0,
+    borderTopWidth: StyleSheet.hairlineWidth * 2,
+    paddingVertical: 4,
+  },
   extDot: { fontFamily: fonts.mono, fontSize: 15 },
   extInput: { fontFamily: fonts.mono, fontSize: 15, minWidth: 44, paddingVertical: 13 },
   fixedExt: { fontFamily: fonts.mono, fontSize: 15, alignSelf: 'center', paddingRight: 14 },
+  fixedExtAccessibility: { alignSelf: 'stretch', paddingHorizontal: 14, paddingVertical: 10 },
   message: { fontSize: 13, lineHeight: 18, marginTop: 8, marginBottom: 12 },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 7, marginBottom: 12 },
   chip: { borderWidth: 1, borderRadius: 99, paddingHorizontal: 11, paddingVertical: 6 },
@@ -570,6 +584,7 @@ const styles = StyleSheet.create({
     paddingVertical: 11,
     gap: 12,
   },
+  kvAccessibility: { flexDirection: 'column', justifyContent: 'flex-start' },
   kvKey: { fontSize: 14 },
   kvVal: { fontSize: 14, flexShrink: 1 },
   cta: { marginTop: 8, borderRadius: 99, paddingVertical: 14, alignItems: 'center' },

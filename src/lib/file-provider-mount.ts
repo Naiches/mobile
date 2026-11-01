@@ -189,6 +189,19 @@ export async function removeFromFileProviderCache(ids: string[]): Promise<void> 
 }
 
 /**
+ * Tell the Files app extension which folder is the protected root "Backups" (null clears it).
+ * Best-effort and no-op off iOS: the app still protects the folder itself.
+ */
+export async function setFileProviderProtectedBackupsRoot(id: string | null): Promise<void> {
+  if (Platform.OS !== 'ios') return;
+  try {
+    await BeebeebCrypto.setFileProviderProtectedFolder(id);
+  } catch {
+    // best-effort — the next backup folder resolve publishes it again
+  }
+}
+
+/**
  * Parse decrypted metadata plaintext. The server stores filename as either a
  * bare string (legacy) or as `{"name":"...", "mime_type":"..."}` (current).
  */

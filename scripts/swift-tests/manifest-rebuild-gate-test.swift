@@ -51,7 +51,6 @@ func runBounded<T>(watchdog: TimeInterval = 10, _ op: @escaping () async -> T) -
 let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-gate-\(UUID().uuidString)", isDirectory: true)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 
 // The columns the store's statements touch (NativeBackupEngine.ensureTables).
 let schema = """
@@ -350,11 +349,14 @@ do {
 
 // MARK: - Report
 
+let exitCode: Int32
 if failures.isEmpty {
   print("ManifestRebuildGateTests: \(total) assertions, 0 failed")
-  exit(0)
+  exitCode = 0
 } else {
   for f in failures { print("FAIL: \(f)") }
   print("ManifestRebuildGateTests: \(failures.count) of \(total) assertions FAILED")
-  exit(1)
+  exitCode = 1
 }
+try? fm.removeItem(at: root)
+exit(exitCode)

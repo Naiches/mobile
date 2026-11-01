@@ -6,7 +6,7 @@ import TestRenderer, { act } from 'react-test-renderer';
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 let flag = { enabled: false, loading: false };
 let calls = 0;
-mock.module('react-native', () => ({ View: 'View', Text: 'Text', TextInput: 'Input', TouchableOpacity: 'Button', ActivityIndicator: 'Spinner', Share: {}, Platform: { OS: 'ios' }, StyleSheet: { create: x => x } }));
+mock.module('react-native', () => ({ View: 'View', Text: 'Text', TextInput: 'Input', TouchableOpacity: 'Button', ActivityIndicator: 'Spinner', Share: {}, Platform: { OS: 'ios' }, StyleSheet: { create: x => x }, useWindowDimensions: () => ({ width: 390, height: 844, fontScale: 1, scale: 3 }) }));
 mock.module('@react-navigation/native', () => ({ useNavigation: () => ({ goBack() {} }), useRoute: () => ({ params: { fileId: 'f', fileName: 'Photos', isFolder: true } }) }));
 mock.module('expo-clipboard', () => ({})); mock.module('expo-haptics', () => ({}));
 mock.module('../lib/theme-context', () => ({ useTheme: () => ({ colors: {}, resolved: 'light' }) }));

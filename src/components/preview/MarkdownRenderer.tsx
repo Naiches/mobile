@@ -358,7 +358,7 @@ const styles = StyleSheet.create({
     fontFamily: fonts.sans,
     fontSize: 15,
     lineHeight: 22,
-    width: 20,
+    minWidth: 20,
   },
   taskIcon: {
     width: 20,

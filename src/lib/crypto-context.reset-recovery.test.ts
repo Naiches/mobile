@@ -177,6 +177,7 @@ mock.module('../../modules/beebeeb-crypto', () => cryptoMock);
 mock.module('../services/BackupService', () => ({
   setBackupEncryption: () => {},
   getKeepVaultUnlocked: async () => false,
+  resolveProtectedBackupsRoot: async () => null,
 }));
 mock.module('./runtime-trace', () => ({
   recordRuntimeTrace: () => null,

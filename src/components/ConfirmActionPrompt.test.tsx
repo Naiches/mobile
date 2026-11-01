@@ -54,6 +54,7 @@ const Modal = (props: Record<string, unknown>) => React.createElement(React.Frag
 mock.module('react-native', () => ({
   View, Text, TextInput, TouchableOpacity, ActivityIndicator, Modal,
   StyleSheet: { create: (s: unknown) => s },
+  useWindowDimensions: () => ({ width: 390, height: 844, scale: 3, fontScale: 1 }),
 }));
 
 mock.module('react-native-gesture-handler', () => ({

@@ -18,6 +18,7 @@ import {
   saveIndex,
   searchIndex,
   updateIndexEntry,
+  updateIndexEntries,
   type SearchIndex,
   type SearchIndexEntry,
   type SearchResult,
@@ -33,6 +34,8 @@ export interface UseSearchIndex {
   search: (query: string) => SearchResult[]
   /** Insert/update an entry; schedules a debounced server save. */
   indexFile: (fileId: string, entry: SearchIndexEntry) => void
+  /** Insert/update a batch with one full-index clone and one save schedule. */
+  indexFiles: (entries: readonly { fileId: string; entry: SearchIndexEntry }[]) => void
   /** Remove an entry; schedules a debounced server save. */
   unindexFile: (fileId: string) => void
   /** Ids currently present in the in-memory index — for the full-vault reconcile
@@ -115,6 +118,15 @@ export function useSearchIndex(): UseSearchIndex {
     scheduleSave()
   }, [scheduleSave])
 
+  const indexFiles = useCallback((entries: readonly { fileId: string; entry: SearchIndexEntry }[]) => {
+    if (!indexRef.current || entries.length === 0) return
+    indexRef.current = updateIndexEntries(
+      indexRef.current,
+      entries.map(({ fileId, entry }) => [fileId, entry] as const),
+    )
+    scheduleSave()
+  }, [scheduleSave])
+
   const unindexFile = useCallback((fileId: string) => {
     if (!indexRef.current) return
     indexRef.current = removeIndexEntry(indexRef.current, fileId)
@@ -156,5 +168,5 @@ export function useSearchIndex(): UseSearchIndex {
     }
   }, [])
 
-  return { ready, search, indexFile, unindexFile, getIndexedIds, allEntries }
+  return { ready, search, indexFile, indexFiles, unindexFile, getIndexedIds, allEntries }
 }

@@ -204,7 +204,6 @@ func client(device: String = deviceId) -> PhotoBackupServerClient {
 let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-server-check-\(UUID().uuidString)", isDirectory: true)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 
 let schema = """
 CREATE TABLE IF NOT EXISTS backup_assets (
@@ -1087,4 +1086,6 @@ expect(indexRequestsSeen == 0, "k1: native code never asked for /api/v1/files/in
 print("pending-upload-server-check-test: \(failures.isEmpty ? "PASS" : "FAIL")")
 for f in failures { print("  FAILED: \(f)") }
 print("pending-upload-server-check-test: \(total) assertions, \(failures.count) failed")
-exit(failures.isEmpty ? 0 : 1)
+let exitCode: Int32 = failures.isEmpty ? 0 : 1
+try? fm.removeItem(at: root)
+exit(exitCode)

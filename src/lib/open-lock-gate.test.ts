@@ -37,7 +37,7 @@ mock.module('expo-local-authentication', () => ({
   },
 }));
 
-const { passesOpenLockGate, openFilesEntry } = await import('./open-lock-gate');
+const { createOpenFilesEntryGuard, passesOpenLockGate, openFilesEntry } = await import('./open-lock-gate');
 const { checkLockedFileIds, isPagerPageGated } = await import('./preview-lock-gate');
 const { lockFile } = await import('./file-locks');
 const LocalAuthentication = await import('expo-local-authentication');
@@ -141,24 +141,117 @@ describe('locked folders still gate navigation in FilesScreen (no Preview behind
   });
 });
 
+describe('FilesScreen per-entry open single-flight', () => {
+  test('two overlapping taps on the same id run readiness and navigation once', async () => {
+    let releaseReady!: (ready: boolean) => void;
+    const ready = new Promise<boolean>((resolve) => { releaseReady = resolve; });
+    let readinessCalls = 0;
+    let previewCalls = 0;
+    const guard = createOpenFilesEntryGuard();
+    const entry = { id: 'same-file', is_folder: false };
+    const deps = {
+      navigateToFolder: () => {},
+      handlePendingUpload: async () => {},
+      ensureFileReady: async () => {
+        readinessCalls += 1;
+        return ready;
+      },
+      openPreview: () => { previewCalls += 1; },
+    };
+
+    const first = guard(entry, deps);
+    const second = guard(entry, deps);
+    expect(second).toBe(first);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(readinessCalls).toBe(1);
+
+    releaseReady(true);
+    expect(await Promise.all([first, second])).toEqual(['preview', 'preview']);
+    expect(previewCalls).toBe(1);
+
+    // Settling releases the key, so a later intentional tap can open again.
+    expect(await guard(entry, deps)).toBe('preview');
+    expect(readinessCalls).toBe(2);
+    expect(previewCalls).toBe(2);
+  });
+
+  test('different ids are not serialized behind each other', async () => {
+    const releases = new Map<string, (ready: boolean) => void>();
+    const started: string[] = [];
+    const opened: string[] = [];
+    const guard = createOpenFilesEntryGuard<{ id: string; is_folder: boolean }>();
+    const deps = {
+      navigateToFolder: () => {},
+      handlePendingUpload: async () => {},
+      ensureFileReady: (entry: { id: string }) => {
+        started.push(entry.id);
+        return new Promise<boolean>((resolve) => { releases.set(entry.id, resolve); });
+      },
+      openPreview: (entry: { id: string }) => { opened.push(entry.id); },
+    };
+
+    const first = guard({ id: 'first', is_folder: false }, deps);
+    const second = guard({ id: 'second', is_folder: false }, deps);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(['first', 'second']);
+
+    releases.get('second')!(true);
+    expect(await second).toBe('preview');
+    expect(opened).toEqual(['second']);
+    releases.get('first')!(true);
+    expect(await first).toBe('preview');
+    expect(opened).toEqual(['second', 'first']);
+  });
+
+  test('a rejection releases the id so the next tap can retry', async () => {
+    let attempts = 0;
+    const guard = createOpenFilesEntryGuard();
+    const entry = { id: 'retry-file', is_folder: false };
+    const deps = {
+      navigateToFolder: () => {},
+      handlePendingUpload: async () => {},
+      ensureFileReady: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('readiness failed');
+        return true;
+      },
+      openPreview: () => {},
+    };
+
+    await expect(guard(entry, deps)).rejects.toThrow('readiness failed');
+    await expect(guard(entry, deps)).resolves.toBe('preview');
+    expect(attempts).toBe(2);
+  });
+});
+
 describe('FilesScreen.openFile (the original bug site) delegates to openFilesEntry', () => {
   const src = readFileSync(new URL('../screens/FilesScreen.tsx', import.meta.url), 'utf8');
   const start = src.indexOf('const openFile = useCallback(');
   const end = src.indexOf('const handleRefresh = useCallback(', start);
   const body = start >= 0 && end > start ? src.slice(start, end) : '';
+  const readinessStart = src.indexOf('const ensureFileReady = useCallback(');
+  const readinessEnd = src.indexOf('const openFile = useCallback(', readinessStart);
+  const readinessBody = readinessStart >= 0 && readinessEnd > readinessStart
+    ? src.slice(readinessStart, readinessEnd)
+    : '';
 
   test('the openFile body was found (this check did something)', () => {
     expect(body.length).toBeGreaterThan(200);
     expect(body).toContain("navigation.navigate('Preview'");
   });
 
-  test('openFile routes the tap through openFilesEntry', () => {
-    expect(body).toContain('await openFilesEntry(file,');
+  test('openFile routes the tap through the stable per-entry guard', () => {
+    expect(body).toContain('await openFilesEntryGuardRef.current!(file,');
   });
 
   test('openFile has no lock check or Face ID prompt of its own', () => {
     expect(body).not.toMatch(/\bisFileLocked\s*\(/);
     expect(body).not.toMatch(/\bauthenticateAsync\s*\(/);
     expect(body).not.toMatch(/\bpassesOpenLockGate\s*\(/);
+  });
+
+  test('cached rows do not make a status request before opening', () => {
+    expect(readinessBody.length).toBeGreaterThan(100);
+    expect(readinessBody).not.toContain('getUploadStatus(');
   });
 });

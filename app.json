@@ -28,6 +28,7 @@
         "NSCameraUsageDescription": "Beebeeb scans the amber constellation pattern to pair a new device.",
         "NSPhotoLibraryUsageDescription": "Beebeeb backs up your photos with end-to-end encryption.",
         "NSPhotoLibraryAddUsageDescription": "Beebeeb saves downloaded photos to your library.",
+        "PHPhotoLibraryPreventAutomaticLimitedAccessAlert": true,
         "NSCalendarsUsageDescription": "Beebeeb backs up your calendar with end-to-end encryption.",
         "NSCalendarsFullAccessUsageDescription": "Beebeeb backs up your calendar with end-to-end encryption.",
         "NSContactsUsageDescription": "Beebeeb backs up your contacts with end-to-end encryption.",

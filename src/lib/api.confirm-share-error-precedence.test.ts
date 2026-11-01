@@ -15,7 +15,8 @@
  * native module `api.ts` touches is mocked here too (mobile/CLAUDE.md
  * "Tests").
  */
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, jest, mock, test } from 'bun:test';
+import { DEFAULT_SCREEN_REQUEST_TIMEOUT_MS } from './fetch-deadline';
 
 const store = new Map<string, string>();
 const fetchCalls: Array<{ url: string; init: RequestInit }> = [];
@@ -99,7 +100,26 @@ beforeEach(() => {
   store.set(TOKEN_KEY, 'session-token');
 });
 
+afterEach(() => {
+  jest.useRealTimers();
+});
+
 describe('confirmActionPlaintext: legacy-account step-up prefers `message` over `error`', () => {
+  test('confirmation cannot remain pending forever before response headers', async () => {
+    jest.useFakeTimers();
+    fetchQueue.push(() => new Promise<Response>(() => {}));
+
+    const { ApiError, confirmAction } = await loadFreshApi();
+    const pending = confirmAction('correct horse battery staple').catch((caught) => caught);
+    while (fetchCalls.length === 0) await Promise.resolve();
+    jest.advanceTimersByTime(DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
+
+    const error = await pending;
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(0);
+    expect(fetchCalls).toHaveLength(1);
+  });
+
   test('confirm-opaque-start 409 opaque_unavailable falls back to plaintext /auth/confirm, whose error body surfaces `message` not `error`', async () => {
     // 1. confirm-opaque-start -> 409, legacy account, no opaque_password_file.
     fetchQueue.push(async () => jsonResponse({ opaque_unavailable: true }, 409));
@@ -135,6 +155,20 @@ describe('confirmActionPlaintext: legacy-account step-up prefers `message` over 
 });
 
 describe('downloadSharedFileBlob: public share download prefers `message` over `error`', () => {
+  test('a share request cannot remain pending forever before response headers', async () => {
+    jest.useFakeTimers();
+    fetchQueue.push(() => new Promise<Response>(() => {}));
+
+    const { ApiError, downloadSharedFileBlob } = await loadFreshApi();
+    const pending = downloadSharedFileBlob('tok123').catch((caught) => caught);
+    await Promise.resolve();
+    jest.advanceTimersByTime(DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
+
+    const error = await pending;
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(0);
+  });
+
   test('a 403 carrying both fields surfaces the human message, not the machine code', async () => {
     fetchQueue.push(async () => jsonResponse({
       error: 'share_passphrase_required',

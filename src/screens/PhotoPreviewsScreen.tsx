@@ -7,6 +7,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import Slider from '@react-native-community/slider';
@@ -21,14 +22,12 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { RootStackParamList } from '../App';
 import { estimatePhotoPreviewBytes } from '../../modules/beebeeb-crypto';
 import { NativeSwitch } from '../components/NativeSwitch';
-import { serverSupportsPhotoPreviews, getPhotoPreviewSummary, type FileEntry } from '../lib/api';
-import { mapInBatches } from '../lib/async-batch';
+import { serverSupportsPhotoPreviews, type FileEntry } from '../lib/api';
 import { useCrypto } from '../lib/crypto-context';
 import { encryptedMetadataPayloadToBytes } from '../lib/encrypted-metadata';
 import { loadFileIndex } from '../lib/file-index-loader';
 import { formatBytes } from '../lib/format';
 import { ensurePhotoPermission } from '../lib/photo-permissions';
-import { mediaMimeType } from '../lib/photo-candidates';
 import { encodePreviewSample } from '../lib/photo-compare-samples';
 import { planApply, turnOffPreviews } from '../lib/photo-preview-apply';
 import {
@@ -46,15 +45,25 @@ import {
   type PhotoPreviewRunOutcome,
 } from '../lib/photo-preview-runner';
 import {
-  estimateEntryFromResult,
   estimateTotals,
-  estimateView,
+  immediatePreviewEstimate,
   pickSampleAsset,
   pickSampleIds,
   shouldStartEstimate,
-  storageToAdd,
   type EstimateEntry,
 } from '../lib/photo-preview-estimate';
+import {
+  mergePreviewScopeMimes,
+  partitionPreviewScope,
+  remainingPreviewScopeBudget,
+} from '../lib/photo-preview-scope';
+import {
+  previewCompareIdentifier,
+  previewPrimaryAction,
+  previewStorageAddition,
+  previewSupportState,
+} from '../lib/photo-preview-screen-state';
+import { createPhotoPreviewToggleCoordinator } from '../lib/photo-preview-toggle';
 import {
   DEFAULT_PHOTO_PREVIEW_SETTING,
   PREVIEW_SIZE_OPTIONS,
@@ -64,15 +73,24 @@ import {
   type PreviewPx,
 } from '../lib/photo-preview-settings';
 import { loadSettingForScreen, mirrorPhotoPreviewSetting, onPhotoPreviewSettingChange } from '../lib/photo-preview-sync';
+import {
+  PreviewTimeoutError,
+  withAbortablePreviewTimeout,
+  withPreviewTimeout,
+} from '../lib/photo-preview-timeout';
+import { recordRuntimeTrace } from '../lib/runtime-trace';
 import { useTheme } from '../lib/theme-context';
 import { useToast } from '../lib/toast-context';
 import { getRemoteToLocalMap } from '../services/BackupDatabase';
 
 type Nav = NativeStackNavigationProp<RootStackParamList>;
-type PlanFile = Pick<FileEntry, 'id' | 'has_preview' | 'preview_format' | 'preview_px' | 'mime_type'>;
+type PlanFile = Pick<FileEntry, 'id' | 'has_preview' | 'preview_format' | 'preview_px' | 'preview_bytes' | 'mime_type'>;
 
 const GB = 1024 * 1024 * 1024;
-const SAMPLE_COUNT = 10;
+const SAMPLE_COUNT = 3;
+const SCREEN_LOAD_TIMEOUT_MS = 8_000;
+const METADATA_BATCH_TIMEOUT_MS = 4_000;
+const ESTIMATE_SAMPLE_TIMEOUT_MS = 5_000;
 const FORMATS: { label: string; value: PreviewFormat }[] = [
   { label: 'HEIC', value: 'heic' },
   { label: 'JPEG', value: 'jpeg' },
@@ -95,6 +113,8 @@ export default function PhotoPreviewsScreen() {
   const navigation = useNavigation<Nav>();
   const insets = useSafeAreaInsets();
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const { showToast } = useToast();
   const { decryptMetadata } = useCrypto();
 
@@ -108,13 +128,14 @@ export default function PhotoPreviewsScreen() {
   const [files, setFiles] = useState<PlanFile[]>([]);
   const [localIds, setLocalIds] = useState<Map<string, string>>(new Map());
   const [scopeLoading, setScopeLoading] = useState(true);
+  const [scopeFailed, setScopeFailed] = useState(false);
   const [scopeTick, setScopeTick] = useState<{ n: number; force: boolean }>({ n: 0, force: false });
 
   // Estimate, one entry per format:size. Results are stored under their own key,
   // so a re-render (photo list re-read after Apply, a setting change) never drops one.
   const [estimates, setEstimates] = useState<Record<string, EstimateEntry>>({});
   const estimatesInFlight = useRef(new Set<string>());
-  const sampleIdsRef = useRef<string[] | null>(null);
+  const [estimateTick, setEstimateTick] = useState(0);
 
   // Space limit
   const [limitBytes, setLimitBytes] = useState<number | null>(null);
@@ -124,13 +145,17 @@ export default function PhotoPreviewsScreen() {
 
   // Large preview of the newest photo
   const [newestId, setNewestId] = useState<string | null>(null);
-  const [sample, setSample] = useState<{ uri: string; bytes: number } | null>(null);
+  const [sample, setSample] = useState<{ uri: string; bytes: number; localIdentifier: string } | null>(null);
+  const [sampleStatus, setSampleStatus] = useState<'idle' | 'loading' | 'failed'>('idle');
+  const [sampleTick, setSampleTick] = useState(0);
   const [originalBytes, setOriginalBytes] = useState<number | null>(null);
 
   // Work in progress. Apply/Rebuild run in the app-level runner: leaving this
   // screen does not stop them; the screen only follows their progress.
   const [applyProgress, setApplyProgress] = useState<{ done: number; total: number } | null>(() => photoPreviewRunProgress());
-  const [busy, setBusy] = useState<null | 'off' | 'clear'>(null);
+  const [busy, setBusy] = useState<null | 'off' | 'clear' | 'save'>(null);
+  const [togglePending, setTogglePending] = useState(false);
+  const toggleCoordinatorRef = useRef(createPhotoPreviewToggleCoordinator());
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
 
@@ -172,27 +197,40 @@ export default function PhotoPreviewsScreen() {
     if (mountedRef.current) setSetting(next);
   }), []);
 
-  const disabled = supported !== true || !settingLoaded || settingFailed || scopeLoading;
-  const working = applyProgress !== null || busy !== null;
+  const disabled = supported !== true || !settingLoaded || settingFailed;
+  const working = applyProgress !== null || busy !== null || togglePending;
   const controlsOff = disabled || working;
 
   // ── Account setting (retryable) ──────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
     setSettingFailed(false);
+    setSettingLoaded(false);
     void (async () => {
-      const ok = await serverSupportsPhotoPreviews();
-      if (cancelled) return;
-      setSupported(ok);
-      if (!ok) return;
-      const result = await loadSettingForScreen();
-      if (cancelled) return;
-      if (result.status === 'loaded') {
-        setSetting(result.setting);
-        setSettingLoaded(true);
-        setSettingFailed(false);
-      } else {
-        setSettingFailed(true);
+      try {
+        const ok = await withPreviewTimeout(
+          serverSupportsPhotoPreviews(),
+          SCREEN_LOAD_TIMEOUT_MS,
+          'Photo preview support check',
+        );
+        if (cancelled) return;
+        setSupported(ok);
+        if (!ok) return;
+        const result = await withPreviewTimeout(
+          loadSettingForScreen(),
+          SCREEN_LOAD_TIMEOUT_MS,
+          'Photo preview setting',
+        );
+        if (cancelled) return;
+        if (result.status === 'loaded') {
+          setSetting(result.setting);
+          setSettingLoaded(true);
+          setSettingFailed(false);
+        } else {
+          setSettingFailed(true);
+        }
+      } catch {
+        if (!cancelled) setSettingFailed(true);
       }
     })();
 
@@ -247,41 +285,81 @@ export default function PhotoPreviewsScreen() {
   // ── Photos list (first load, and again after Apply, Rebuild or Off) ─────
   useEffect(() => {
     let cancelled = false;
+    const scopeStartedAt = Date.now();
+    let baseFiles: PlanFile[] | null = null;
+    const openedMimes = new Map<string, string>();
     setScopeLoading(true);
+    setScopeFailed(false);
     void (async () => {
       try {
-        const index = (await loadFileIndex(scopeTick.force ? { force: true } : undefined)).files ?? [];
-        const map = await getRemoteToLocalMap();
-        const media = index.filter((f) => !f.is_folder && !f.is_uploading && mediaMimeType(f));
-        const mimes = new Map<string, string>();
-        await mapInBatches(media, 16, async (f) => {
-          let mime = mediaMimeType(f);
-          const raw = f.name_encrypted ?? '';
-          if (map.has(f.id) && raw.startsWith('{')) {
+        const [loaded, map] = await Promise.all([
+          withPreviewTimeout(
+            loadFileIndex(scopeTick.force ? { force: true } : undefined),
+            SCREEN_LOAD_TIMEOUT_MS,
+            'Photo list',
+          ),
+          withPreviewTimeout(getRemoteToLocalMap(), SCREEN_LOAD_TIMEOUT_MS, 'Photos on this iPhone'),
+        ]);
+        if (cancelled) return;
+        const partition = partitionPreviewScope(loaded.files ?? [], map);
+        setLocalIds(map);
+        baseFiles = partition.files.map(({ entry, mime }) => ({
+          id: entry.id,
+          has_preview: entry.has_preview,
+          preview_format: entry.preview_format,
+          preview_px: entry.preview_px,
+          preview_bytes: entry.preview_bytes,
+          mime_type: mime,
+        }));
+        setFiles(baseFiles);
+
+        // Production does not expose plaintext MIME. Open only ambiguous rows
+        // whose originals are local, in small yielding batches. The first
+        // batch paints promptly; later results are accumulated and merged in
+        // one pass so a large vault cannot trigger an O(N²) render loop.
+        for (let offset = 0; offset < partition.localEncrypted.length; offset += 8) {
+          const batch = partition.localEncrypted.slice(offset, offset + 8);
+          const batchBudget = remainingPreviewScopeBudget(
+            scopeStartedAt,
+            Date.now(),
+            SCREEN_LOAD_TIMEOUT_MS,
+            METADATA_BATCH_TIMEOUT_MS,
+          );
+          if (batchBudget === 0) {
+            throw new PreviewTimeoutError('Photo metadata', SCREEN_LOAD_TIMEOUT_MS);
+          }
+          const opened = await withPreviewTimeout(Promise.all(batch.map(async (entry) => {
+            let mime: string | null = null;
+            const raw = entry.name_encrypted ?? '';
             try {
               const payload = encryptedMetadataPayloadToBytes(raw);
               if (payload) {
-                mime = decryptedMime(await decryptMetadata(f.id, payload.nonce, payload.ciphertext)) ?? mime;
+                mime = decryptedMime(await decryptMetadata(entry.id, payload.nonce, payload.ciphertext));
               }
             } catch {
-              // Keep the index-derived guess.
+              // One unreadable metadata row does not block the rest of the scope.
             }
+            return { id: entry.id, mime };
+          })), batchBudget, 'Photo metadata');
+          if (cancelled) return;
+          for (const item of opened) {
+            if (item.mime) openedMimes.set(item.id, item.mime);
           }
-          if (mime) mimes.set(f.id, mime);
-        });
-        if (cancelled) return;
-        setLocalIds(map);
-        setFiles(media.map((f) => ({
-          id: f.id,
-          has_preview: f.has_preview,
-          preview_format: f.preview_format,
-          preview_px: f.preview_px,
-          mime_type: mimes.get(f.id) ?? null,
-        })));
+          if (offset === 0 && openedMimes.size > 0 && baseFiles) {
+            setFiles(mergePreviewScopeMimes(baseFiles, openedMimes));
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          if (cancelled) return;
+        }
       } catch {
-        // No list: counts stay at zero.
+        if (!cancelled) setScopeFailed(true);
       } finally {
-        if (!cancelled) setScopeLoading(false);
+        if (!cancelled) {
+          if (baseFiles && openedMimes.size > 0) {
+            setFiles(mergePreviewScopeMimes(baseFiles, openedMimes));
+          }
+          setScopeLoading(false);
+        }
       }
     })();
     return () => { cancelled = true; };
@@ -296,54 +374,112 @@ export default function PhotoPreviewsScreen() {
     [files, localIds],
   );
   const photoCount = imageIdsOnPhone.length;
+  const fallbackPreviewId = imageIdsOnPhone[0] ?? null;
   const plan = useMemo(() => planApply(files, setting, localIds), [files, setting, localIds]);
 
   // ── Estimate and large preview, per format/size ─────────────────────────
   const key = `${setting.format}:${setting.px}`;
   useEffect(() => {
     if (supported !== true || imageIdsOnPhone.length === 0) return;
-    if (!sampleIdsRef.current) sampleIdsRef.current = pickSampleIds(imageIdsOnPhone, SAMPLE_COUNT);
     const runKey = key;
     if (shouldStartEstimate(estimates[runKey], estimatesInFlight.current.has(runKey))) {
       estimatesInFlight.current.add(runKey);
       setEstimates((prev) => ({ ...prev, [runKey]: { status: 'loading' } }));
-      void estimatePhotoPreviewBytes(sampleIdsRef.current, setting.format, setting.px)
-        .then((r) => estimateEntryFromResult(r))
-        .catch((): EstimateEntry => ({ status: 'failed' }))
-        .then((entry) => {
-          estimatesInFlight.current.delete(runKey);
-          if (mountedRef.current) setEstimates((prev) => ({ ...prev, [runKey]: entry }));
-        });
+      const ids = pickSampleIds(imageIdsOnPhone, SAMPLE_COUNT);
+      void (async () => {
+        let totalBytes = 0;
+        let sampled = 0;
+        for (const id of ids) {
+          try {
+            const result = await withPreviewTimeout(
+              estimatePhotoPreviewBytes([id], setting.format, setting.px),
+              ESTIMATE_SAMPLE_TIMEOUT_MS,
+              'Preview size sample',
+            );
+            if (result.sampled > 0 && result.averageBytes > 0) {
+              totalBytes += result.averageBytes;
+              sampled += result.sampled;
+              if (mountedRef.current) {
+                const entry: EstimateEntry = { status: 'done', avgBytes: Math.round(totalBytes / sampled), sampled };
+                setEstimates((prev) => ({ ...prev, [runKey]: entry }));
+              }
+            }
+          } catch (error) {
+            // A timed-out PhotoKit/iCloud request may still finish natively. Do
+            // not start more requests behind it; the local estimate stays live.
+            if (error instanceof PreviewTimeoutError) break;
+          }
+        }
+        estimatesInFlight.current.delete(runKey);
+        if (mountedRef.current && sampled === 0) {
+          setEstimates((prev) => ({ ...prev, [runKey]: { status: 'failed' } }));
+        }
+      })();
     }
   // `estimates` is read, not a trigger: a landed result must not start another run.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, supported, imageIdsOnPhone]);
+  }, [key, supported, imageIdsOnPhone, estimateTick]);
 
   useEffect(() => {
-    if (supported !== true || imageIdsOnPhone.length === 0) {
+    const forPreview = newestId ?? fallbackPreviewId;
+    if (supported !== true || !forPreview) {
       setSample(null);
+      setSampleStatus('idle');
       return;
     }
     let cancelled = false;
-    const forPreview = newestId ?? imageIdsOnPhone[0];
+    setSample(null);
+    setSampleStatus('loading');
     void encodePreviewSample(forPreview, setting.format, setting.px)
-      .then((r) => { if (!cancelled) setSample({ uri: r.path.startsWith('file://') ? r.path : `file://${r.path}`, bytes: r.bytes }); })
-      .catch(() => { if (!cancelled) setSample(null); });
+      .then((r) => {
+        if (cancelled) return;
+        setSample({
+          uri: r.path.startsWith('file://') ? r.path : `file://${r.path}`,
+          bytes: r.bytes,
+          localIdentifier: forPreview,
+        });
+        setSampleStatus('idle');
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSample(null);
+          setSampleStatus('failed');
+        }
+      });
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, supported, photoCount > 0, newestId]);
+  }, [key, supported, newestId, fallbackPreviewId, sampleTick]);
 
-  const view = estimateView(estimates[key], photoCount > 0);
-  const avgBytes = view.kind === 'ready' ? view.avgBytes : null;
+  const immediateEstimate = useMemo(
+    () => immediatePreviewEstimate(setting.format, setting.px, files),
+    [setting.format, setting.px, files],
+  );
+  const measuredEstimate = estimates[key]?.status === 'done' ? estimates[key] : null;
+  const avgBytes = photoCount > 0 ? measuredEstimate?.avgBytes ?? immediateEstimate.avgBytes : null;
   const effectiveLimit = Math.min(limitBytes ?? 20 * GB, maxLimitBytes);
   const totals = avgBytes != null ? estimateTotals(avgBytes, photoCount, effectiveLimit) : null;
-  const storageAdd = storageToAdd(view, plan.toCreate.length);
+  const storageAdd = previewStorageAddition({
+    scopeLoading,
+    scopeFailed,
+    toCreate: plan.toCreate.length,
+    avgBytes,
+  });
+  const compareIdentifier = previewCompareIdentifier({
+    newestId,
+    fallbackId: fallbackPreviewId,
+    sampledId: sample?.localIdentifier ?? null,
+  });
+  const supportState = previewSupportState({ supported, loadFailed: settingFailed });
 
   // ── Actions ──────────────────────────────────────────────────────────────
   const persist = useCallback(async (next: PhotoPreviewSetting, prev: PhotoPreviewSetting): Promise<boolean> => {
     setSetting(next);
     try {
-      await savePhotoPreviewSetting(next);
+      await withAbortablePreviewTimeout(
+        signal => savePhotoPreviewSetting(next, signal),
+        SCREEN_LOAD_TIMEOUT_MS,
+        'Saving photo preview setting',
+      );
       mirrorPhotoPreviewSetting(next);
       return true;
     } catch {
@@ -353,60 +489,92 @@ export default function PhotoPreviewsScreen() {
     }
   }, [showToast]);
 
-  const toggleEnabled = useCallback(async (on: boolean) => {
+  const toggleEnabled = useCallback((on: boolean) => {
     const prev = setting;
-    if (on) {
-      await persist({ ...prev, enabled: true }, prev);
-      return;
-    }
-    let freed: number | null = null;
-    try {
-      const summary = await getPhotoPreviewSummary();
-      if (summary) freed = summary.total_bytes;
-    } catch {
-      // The confirmation then leaves the amount out.
-    }
-    Alert.alert(
-      'Turn off photo previews?',
-      turnOffConfirmMessage(freed),
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Turn off',
-          style: 'destructive',
-          onPress: () => {
-            void (async () => {
-              setBusy('off');
-              try {
-                if (!(await persist({ ...prev, enabled: false }, prev))) return;
-                // A run still going would upload new previews after the delete.
-                stopPhotoPreviewRun();
-                try {
-                  const removed = await turnOffPreviews();
-                  if (mountedRef.current) setCacheBytes(0);
-                  showToast({
-                    type: 'success',
-                    message: removed > 0
-                      ? `${removed.toLocaleString()} previews removed.`
-                      : 'Photo previews are off. There were no stored previews to remove.',
-                  });
-                } catch {
-                  showToast({
-                    type: 'error',
-                    message: 'Could not remove the stored previews. Turn previews on and off again to retry.',
-                  });
-                }
-              } finally {
-                if (mountedRef.current) {
-                  setBusy(null);
-                  reloadScope(true);
-                }
-              }
-            })();
-          },
-        },
-      ],
-    );
+    const next = { ...prev, enabled: on };
+    const requestedAt = Date.now();
+    recordRuntimeTrace('photo_previews.toggle.request', { enabled: on });
+    toggleCoordinatorRef.current.request({
+      nextEnabled: on,
+      onPending: () => {
+        if (mountedRef.current) setTogglePending(true);
+      },
+      onSettled: () => {
+        recordRuntimeTrace('photo_previews.toggle.settled', {
+          enabled: on,
+          elapsedMs: Date.now() - requestedAt,
+        });
+        if (mountedRef.current) setTogglePending(false);
+      },
+      onError: () => {
+        showToast({ type: 'error', message: 'Could not change the photo previews setting.' });
+      },
+      confirmTurnOff: ({ confirm, cancel }) => {
+        recordRuntimeTrace('photo_previews.toggle.confirmation_shown', {
+          elapsedMs: Date.now() - requestedAt,
+        });
+        Alert.alert(
+          'Turn off photo previews?',
+          turnOffConfirmMessage(null),
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel',
+              onPress: () => {
+                recordRuntimeTrace('photo_previews.toggle.cancelled', {
+                  elapsedMs: Date.now() - requestedAt,
+                });
+                cancel();
+              },
+            },
+            {
+              text: 'Turn off',
+              style: 'destructive',
+              onPress: () => {
+                recordRuntimeTrace('photo_previews.toggle.confirmed', {
+                  elapsedMs: Date.now() - requestedAt,
+                });
+                confirm();
+              },
+            },
+          ],
+          { cancelable: true, onDismiss: cancel },
+        );
+      },
+      setOptimistic: () => {
+        setSetting(next);
+        recordRuntimeTrace('photo_previews.toggle.optimistic', {
+          enabled: on,
+          elapsedMs: Date.now() - requestedAt,
+        });
+      },
+      run: async () => {
+        if (!(await persist(next, prev)) || on) return;
+        // A run still going would upload new previews after the delete.
+        stopPhotoPreviewRun();
+        try {
+          const removed = await withAbortablePreviewTimeout(
+            signal => turnOffPreviews(signal),
+            SCREEN_LOAD_TIMEOUT_MS,
+            'Removing stored photo previews',
+          );
+          if (mountedRef.current) setCacheBytes(0);
+          showToast({
+            type: 'success',
+            message: removed > 0
+              ? `${removed.toLocaleString()} previews removed.`
+              : 'Photo previews are off. There were no stored previews to remove.',
+          });
+        } catch {
+          showToast({
+            type: 'error',
+            message: 'Could not remove the stored previews. Turn previews on and off again to retry.',
+          });
+        } finally {
+          if (mountedRef.current) reloadScope(true);
+        }
+      },
+    });
   }, [setting, persist, showToast, reloadScope]);
 
   const changeFormat = (format: PreviewFormat) => {
@@ -415,6 +583,15 @@ export default function PhotoPreviewsScreen() {
   const changeSize = (px: PreviewPx) => {
     if (px !== setting.px) void persist({ ...setting, px }, setting);
   };
+
+  const saveCurrentSetting = useCallback(() => {
+    setBusy('save');
+    void persist({ ...setting }, setting)
+      .then((saved) => {
+        if (saved) showToast({ type: 'success', message: 'Photo preview setting saved.' });
+      })
+      .finally(() => { if (mountedRef.current) setBusy(null); });
+  }, [persist, setting, showToast]);
 
   const runPlan = useCallback((kind: 'apply' | 'rebuild') => {
     const started = kind === 'apply'
@@ -428,7 +605,7 @@ export default function PhotoPreviewsScreen() {
   }, [plan, files, setting, localIds, showToast]);
 
   const onWifiNow = async (): Promise<boolean> => {
-    const net = await NetInfo.fetch().catch(() => null);
+    const net = await withPreviewTimeout(NetInfo.fetch(), 2_000, 'Network status').catch(() => null);
     return net?.type === 'wifi';
   };
 
@@ -499,7 +676,13 @@ export default function PhotoPreviewsScreen() {
     options, value, onChange, label,
   }: { options: { label: string; value: T }[]; value: T; onChange: (v: T) => void; label: string }) {
     return (
-      <View style={[styles.segment, { backgroundColor: c.paper, borderColor: c.line, opacity: dim }]}>
+      <View
+        style={[
+          styles.segment,
+          accessibilityLayout && styles.segmentAccessibility,
+          { backgroundColor: c.paper, borderColor: c.line, opacity: dim },
+        ]}
+      >
         {options.map((o) => {
           const selected = o.value === value;
           return (
@@ -523,6 +706,27 @@ export default function PhotoPreviewsScreen() {
   const sliderMin = 1 * GB;
   const sliderMax = Math.max(maxLimitBytes, sliderMin + GB);
   const applyCount = plan.toCreate.length;
+  const primaryAction = previewPrimaryAction({
+    controlsReady: !disabled,
+    working,
+    enabled: setting.enabled,
+    scopeReady: !scopeLoading,
+    applyCount,
+  });
+  const primaryDisabled = primaryAction === 'disabled';
+  const primaryVisible = primaryAction !== 'none' || applyProgress !== null;
+  const estimateEntry = estimates[key];
+  const estimateCaption = photoCount === 0
+    ? scopeLoading
+      ? 'Estimate unavailable until the photo count is ready.'
+      : scopeFailed
+        ? 'Estimate unavailable because the photo list could not be loaded.'
+        : 'No photos from this iPhone are backed up yet.'
+    : measuredEstimate
+      ? `Average ${formatBytes(measuredEstimate.avgBytes)} per photo, measured on ${measuredEstimate.sampled} of your photos`
+      : immediateEstimate.basis === 'known-previews'
+        ? `Estimated locally from ${immediateEstimate.sampled} matching stored previews${estimateEntry?.status === 'loading' ? ' · refining with a photo sample…' : ''}`
+        : `Estimated locally for this format and size${estimateEntry?.status === 'loading' ? ' · refining with a photo sample…' : ''}`;
 
   return (
     <View style={[styles.root, { backgroundColor: c.paper }]}>
@@ -538,7 +742,7 @@ export default function PhotoPreviewsScreen() {
         style={styles.scroll}
         contentContainerStyle={{ padding: 16, paddingBottom: insets.bottom + 40 }}
       >
-        {supported === false ? (
+        {supportState === 'unsupported' ? (
           <View style={[styles.card, { backgroundColor: c.paper2, borderColor: c.line }]}>
             <Text style={[styles.rowTitle, { color: c.ink }]}>Photo previews need a server update</Text>
             <Text style={[styles.caption, { color: c.ink3 }]}>
@@ -547,7 +751,7 @@ export default function PhotoPreviewsScreen() {
           </View>
         ) : null}
 
-        {supported === true && settingFailed ? (
+        {supportState === 'retry' ? (
           <View style={[styles.card, { backgroundColor: c.paper2, borderColor: c.line }]}>
             <Text style={[styles.rowTitle, { color: c.ink }]}>Couldn't load your preview setting.</Text>
             <TouchableOpacity
@@ -562,9 +766,9 @@ export default function PhotoPreviewsScreen() {
         ) : null}
 
         <View style={[styles.card, { backgroundColor: c.paper2, borderColor: c.line, marginTop: supported === false || settingFailed ? 12 : 0 }]}>
-          <View style={styles.row}>
+          <View style={[styles.row, accessibilityLayout && styles.rowAccessibility]}>
             <Text style={[styles.rowTitle, { color: c.ink, flex: 1 }]}>Photo previews</Text>
-            {supported === null || (supported && !settingLoaded && !settingFailed) ? (
+            {supportState === 'loading' || (supported && !settingLoaded && !settingFailed) ? (
               <ActivityIndicator color={c.amber} />
             ) : (
               <NativeSwitch
@@ -592,14 +796,26 @@ export default function PhotoPreviewsScreen() {
 
         <Text style={[styles.sectionTitle, { color: c.ink3 }]}>Preview — tap to compare</Text>
         <TouchableOpacity
-          disabled={controlsOff || !newestId}
-          onPress={() => newestId && navigation.navigate('PhotoPreviewCompare', { localIdentifier: newestId })}
+          disabled={controlsOff || !compareIdentifier}
+          onPress={() => compareIdentifier && navigation.navigate('PhotoPreviewCompare', { localIdentifier: compareIdentifier })}
           style={[styles.hero, { opacity: dim }]}
           accessibilityRole="button"
           accessibilityLabel="Compare full screen"
         >
           {/* contain, not cover: the whole photo shows; a cover crop of a tall photo (a screenshot) read as broken UI */}
           {sample ? <Image source={{ uri: sample.uri }} style={StyleSheet.absoluteFill} resizeMode="contain" /> : null}
+          {!sample && sampleStatus === 'loading' ? (
+            <View style={styles.heroStatus} pointerEvents="none">
+              <ActivityIndicator color="#fff" />
+              <Text style={styles.heroStatusText}>Loading preview…</Text>
+            </View>
+          ) : null}
+          {!sample && sampleStatus === 'failed' ? (
+            <View style={styles.heroStatus} pointerEvents="none">
+              <Ionicons name="image-outline" size={24} color="#fff" />
+              <Text style={styles.heroStatusText}>Preview unavailable</Text>
+            </View>
+          ) : null}
           <View style={styles.heroTag}>
             <Ionicons name="expand-outline" size={12} color="#fff" />
             <Text style={styles.heroTagText}>Compare full screen</Text>
@@ -609,95 +825,119 @@ export default function PhotoPreviewsScreen() {
           <Text style={[styles.hint, { color: c.ink3 }]}>
             {`Your newest photo · this setting ${formatBytes(sample.bytes)}${originalBytes != null ? ` · original ${formatBytes(originalBytes)}` : ''}`}
           </Text>
+        ) : sampleStatus === 'failed' ? (
+          <TouchableOpacity
+            onPress={() => setSampleTick((n) => n + 1)}
+            style={styles.linkButton}
+            accessibilityRole="button"
+            accessibilityLabel="Try loading the preview again"
+          >
+            <Text style={[styles.linkText, { color: c.amberDeep }]}>Try preview again</Text>
+          </TouchableOpacity>
         ) : null}
 
         <Text style={[styles.sectionTitle, { color: c.ink3 }]}>On this iPhone</Text>
         <View style={[styles.card, { backgroundColor: c.paper2, borderColor: c.line }]}>
+          <Text style={[styles.body, { color: c.ink }]}>
+            {`${scopeLoading ? 'Found' : 'All'} ${photoCount.toLocaleString()} photos at `}
+            <Text style={styles.bold}>{`${sizeLabel(setting.px)} ${setting.format.toUpperCase()}`}</Text>
+          </Text>
+          <Text style={[styles.big, { color: c.ink }]}>
+            {totals ? `≈ ${formatBytes(totals.totalBytes)}` : '—'}
+          </Text>
+          <Text style={[styles.caption, { color: c.ink3 }]}>{estimateCaption}</Text>
           {scopeLoading ? (
-            <ActivityIndicator color={c.amber} />
-          ) : (
-            <>
-              <Text style={[styles.body, { color: c.ink }]}>
-                {`All ${photoCount.toLocaleString()} photos at `}
-                <Text style={styles.bold}>{`${sizeLabel(setting.px)} ${setting.format.toUpperCase()}`}</Text>
-              </Text>
-              {view.kind === 'measuring' ? (
-                <ActivityIndicator color={c.amber} style={{ alignSelf: 'flex-start' }} />
-              ) : (
-                <Text style={[styles.big, { color: c.ink }]}>
-                  {totals ? `≈ ${formatBytes(totals.totalBytes)}` : '—'}
-                </Text>
-              )}
-              <Text style={[styles.caption, { color: c.ink3 }]}>
-                {view.kind === 'ready'
-                  ? `Average ${formatBytes(view.avgBytes)} per photo, measured on ${view.sampled} of your photos`
-                  : view.kind === 'measuring'
-                    ? 'Measuring on a few of your photos…'
-                    : view.kind === 'unavailable'
-                      ? 'No estimate available for these photos.'
-                      : 'No photos from this iPhone are backed up yet.'}
-              </Text>
+            <View style={styles.loadingRow}>
+              <ActivityIndicator color={c.amber} size="small" />
+              <Text style={[styles.caption, { color: c.ink3 }]}>Finding photos on this iPhone…</Text>
+            </View>
+          ) : null}
+          {scopeFailed ? (
+            <TouchableOpacity
+              onPress={() => reloadScope(true)}
+              style={styles.linkButton}
+              accessibilityRole="button"
+              accessibilityLabel="Try loading photos again"
+            >
+              <Text style={[styles.linkText, { color: c.amberDeep }]}>Try loading photos again</Text>
+            </TouchableOpacity>
+          ) : null}
+          {photoCount > 0 && estimateEntry?.status === 'failed' ? (
+            <TouchableOpacity
+              onPress={() => setEstimateTick((n) => n + 1)}
+              style={styles.linkButton}
+              accessibilityRole="button"
+              accessibilityLabel="Try measuring a photo again"
+            >
+              <Text style={[styles.linkText, { color: c.amberDeep }]}>Try photo sample again</Text>
+            </TouchableOpacity>
+          ) : null}
 
-              <Slider
-                style={styles.slider}
-                minimumValue={sliderMin}
-                maximumValue={sliderMax}
-                value={Math.min(Math.max(effectiveLimit, sliderMin), sliderMax)}
-                disabled={controlsOff}
-                onValueChange={(v) => setLimitBytes(Math.round(v))}
-                onSlidingComplete={commitLimit}
-                minimumTrackTintColor={c.amber}
-                maximumTrackTintColor={c.line2}
-                thumbTintColor={c.amber}
-                accessibilityLabel="Space for previews"
-              />
-              <View style={styles.sliderEnds}>
-                <Text style={[styles.caption, { color: c.ink3 }]}>1 GB</Text>
-                <Text style={[styles.caption, { color: c.ink3 }]}>50% of free space</Text>
-              </View>
-              <Text style={[styles.body, { color: c.ink }]}>
-                {'Space for previews: '}
-                <Text style={styles.bold}>{formatBytes(effectiveLimit)}</Text>
-                {totals ? (
-                  <Text style={{ color: totals.fitsAll ? c.green : c.amberDeep }}>
-                    {totals.fitsAll
-                      ? ' · all photos fit'
-                      : ` · ${totals.fitCount.toLocaleString()} of ${photoCount.toLocaleString()} fit`}
-                  </Text>
-                ) : null}
+          <Slider
+            style={styles.slider}
+            minimumValue={sliderMin}
+            maximumValue={sliderMax}
+            value={Math.min(Math.max(effectiveLimit, sliderMin), sliderMax)}
+            disabled={controlsOff}
+            onValueChange={(v) => setLimitBytes(Math.round(v))}
+            onSlidingComplete={commitLimit}
+            minimumTrackTintColor={c.amber}
+            maximumTrackTintColor={c.line2}
+            thumbTintColor={c.amber}
+            accessibilityLabel="Space for previews"
+          />
+          <View style={[styles.sliderEnds, accessibilityLayout && styles.sliderEndsAccessibility]}>
+            <Text style={[styles.caption, { color: c.ink3 }]}>1 GB</Text>
+            <Text style={[styles.caption, { color: c.ink3 }]}>50% of free space</Text>
+          </View>
+          <Text style={[styles.body, { color: c.ink }]}>
+            {'Space for previews: '}
+            <Text style={styles.bold}>{formatBytes(effectiveLimit)}</Text>
+            {totals ? (
+              <Text style={{ color: totals.fitsAll ? c.green : c.amberDeep }}>
+                {totals.fitsAll
+                  ? ' · all photos fit'
+                  : ` · ${totals.fitCount.toLocaleString()} of ${photoCount.toLocaleString()} fit`}
               </Text>
-              {diskInfo && diskInfo.total > 0 ? (
-                <Text style={[styles.caption, { color: c.ink3 }]}>
-                  {`${formatBytes(diskInfo.total)} phone · ${formatBytes(diskInfo.free)} free`}
-                  {cacheBytes != null ? ` · ${formatBytes(cacheBytes)} used by previews` : ''}
-                </Text>
-              ) : null}
-            </>
-          )}
+            ) : null}
+          </Text>
+          {diskInfo && diskInfo.total > 0 ? (
+            <Text style={[styles.caption, { color: c.ink3 }]}>
+              {`${formatBytes(diskInfo.total)} phone · ${formatBytes(diskInfo.free)} free`}
+              {cacheBytes != null ? ` · ${formatBytes(cacheBytes)} used by previews` : ''}
+            </Text>
+          ) : null}
         </View>
 
         <Text style={[styles.body, { color: c.ink2, marginTop: 14 }]}>
           {'In your Beebeeb storage: '}
           <Text style={[styles.bold, { color: c.ink }]}>
-            {storageAdd != null ? `+ ${formatBytes(storageAdd)}` : view.kind === 'measuring' ? '…' : '—'}
+            {storageAdd != null ? `+ ${formatBytes(storageAdd)}` : '—'}
           </Text>
         </Text>
 
-        <TouchableOpacity
-          style={[styles.primaryButton, { backgroundColor: controlsOff || !setting.enabled || applyCount === 0 ? c.line2 : c.amber }]}
-          disabled={controlsOff || !setting.enabled || applyCount === 0}
-          onPress={() => { void confirmApply(); }}
-          accessibilityRole="button"
-          accessibilityLabel={`Apply to ${applyCount} photos`}
-        >
-          {applyProgress ? (
-            <Text style={styles.primaryButtonText}>
-              {`Making previews… ${applyProgress.done.toLocaleString()} of ${applyProgress.total.toLocaleString()}`}
-            </Text>
-          ) : (
-            <Text style={styles.primaryButtonText}>{`Apply to ${applyCount.toLocaleString()} photos`}</Text>
-          )}
-        </TouchableOpacity>
+        {primaryVisible ? (
+          <TouchableOpacity
+            style={[styles.primaryButton, { backgroundColor: primaryDisabled ? c.line2 : c.amber }]}
+            disabled={primaryDisabled}
+            onPress={() => {
+              if (primaryAction === 'apply') void confirmApply();
+              else if (primaryAction === 'save') saveCurrentSetting();
+            }}
+            accessibilityRole="button"
+            accessibilityLabel={primaryAction === 'apply' ? `Apply to ${applyCount} photos` : 'Save photo preview setting'}
+          >
+            {applyProgress ? (
+              <Text style={styles.primaryButtonText}>
+                {`Making previews… ${applyProgress.done.toLocaleString()} of ${applyProgress.total.toLocaleString()}`}
+              </Text>
+            ) : (
+              <Text style={styles.primaryButtonText}>
+                {primaryAction === 'apply' ? `Apply to ${applyCount.toLocaleString()} photos` : 'Save setting'}
+              </Text>
+            )}
+          </TouchableOpacity>
+        ) : null}
         {applyProgress ? (
           <TouchableOpacity
             onPress={stopPhotoPreviewRun}
@@ -752,11 +992,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
   },
   iconButton: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
-  title: { fontSize: 20, fontWeight: '800' },
+  title: { flex: 1, fontSize: 20, fontWeight: '800', textAlign: 'center' },
   scroll: { flex: 1 },
   sectionTitle: { fontSize: 12, fontWeight: '800', letterSpacing: 1, textTransform: 'uppercase', marginTop: 18, marginBottom: 8 },
   card: { borderWidth: 1, borderRadius: 12, overflow: 'hidden', padding: 12, gap: 8 },
   row: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  rowAccessibility: { alignItems: 'flex-start' },
   rowTitle: { fontSize: 15, fontWeight: '800' },
   body: { fontSize: 14, lineHeight: 20 },
   bold: { fontWeight: '800' },
@@ -764,9 +1005,12 @@ const styles = StyleSheet.create({
   caption: { fontSize: 12, lineHeight: 17 },
   hint: { fontSize: 12, lineHeight: 17, marginTop: 6 },
   segment: { flexDirection: 'row', borderRadius: 10, overflow: 'hidden', borderWidth: 1 },
-  segmentItem: { flex: 1, paddingVertical: 10, alignItems: 'center' },
-  segmentText: { fontSize: 13, fontWeight: '800' },
+  segmentAccessibility: { flexDirection: 'column' },
+  segmentItem: { flex: 1, paddingHorizontal: 8, paddingVertical: 10, alignItems: 'center', justifyContent: 'center' },
+  segmentText: { fontSize: 13, fontWeight: '800', textAlign: 'center' },
   hero: { height: 180, borderRadius: 12, overflow: 'hidden', backgroundColor: '#000' },
+  heroStatus: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, alignItems: 'center', justifyContent: 'center', gap: 8 },
+  heroStatusText: { color: '#fff', fontSize: 13, fontWeight: '700' },
   heroTag: {
     position: 'absolute',
     right: 8,
@@ -778,12 +1022,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 12,
+    maxWidth: '90%',
   },
-  heroTagText: { color: '#fff', fontSize: 11, fontWeight: '700' },
+  heroTagText: { flexShrink: 1, color: '#fff', fontSize: 11, fontWeight: '700' },
   slider: { width: '100%', height: 36, marginTop: 4 },
+  loadingRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   sliderEnds: { flexDirection: 'row', justifyContent: 'space-between', marginTop: -6 },
-  primaryButton: { minHeight: 48, borderRadius: 12, alignItems: 'center', justifyContent: 'center', marginTop: 14, paddingHorizontal: 12 },
-  primaryButtonText: { color: '#16110a', fontSize: 15, fontWeight: '900' },
+  sliderEndsAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap', gap: 8 },
+  primaryButton: { minHeight: 48, borderRadius: 12, alignItems: 'center', justifyContent: 'center', marginTop: 14, paddingHorizontal: 12, paddingVertical: 12 },
+  primaryButtonText: { color: '#16110a', fontSize: 15, fontWeight: '900', textAlign: 'center' },
   linkButton: { alignSelf: 'center', paddingVertical: 10 },
   linkText: { fontSize: 14, fontWeight: '700' },
   secondaryButton: { borderWidth: 1, borderRadius: 12, padding: 12, gap: 2, marginTop: 12 },

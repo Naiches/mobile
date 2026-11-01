@@ -28,10 +28,10 @@ describe('settings information architecture', () => {
     expect(rows.filter((row) => row.home === null)).toEqual([]);
   });
   test('backup policy, photo display and security controls have distinct homes', () => {
-    for (const label of ['Back up camera roll', 'Include videos', 'Folders shown in Photos', 'Photo loading & quality', 'Trash']) {
+    for (const label of ['Back up camera roll', 'Include videos', 'Photo sources', 'Photo loading & quality', 'Trash']) {
       expect(rows.filter((row) => row.label === label)).toEqual([{ label, home: 'backups' }]);
     }
-    for (const label of ['Biometric lock', 'Two-factor authentication', 'Add a device']) {
+    for (const label of ['App lock', 'Two-factor authentication', 'Add a device']) {
       expect(rows.filter((row) => row.label === label)).toEqual([{ label, home: 'security' }]);
     }
     expect(rows.filter((row) => row.label === 'Sign out')).toEqual([{ label: 'Sign out', home: 'account' }]);
@@ -45,5 +45,27 @@ describe('settings information architecture', () => {
     expect(source.includes("handleBackupNotifPrefToggle('backupSummaries', v)")).toBe(true);
     expect(source.includes('title="Account notifications"')).toBe(true);
     expect(source.includes('title="On this device"')).toBe(true);
+  });
+
+  test('contact and calendar rows do not keep the retired local stats pipeline alive', () => {
+    for (const retiredName of [
+      'contactsStats',
+      'calendarStats',
+      'contactsLastSession',
+      'calendarLastSession',
+      'contactsNativeStatus',
+      'calendarNativeStatus',
+      'loadNativeContactCalendarBackupStatus',
+      'BeebeebCrypto.getContactsBackupStatus',
+      'BeebeebCrypto.getCalendarBackupStatus',
+      'CONTACTS_LAST_SCAN_KEY',
+      'CALENDAR_LAST_SCAN_KEY',
+      'CONTACTS_LAST_SCAN_COUNT_KEY',
+      'CALENDAR_LAST_SCAN_COUNT_KEY',
+      'beebeeb_contacts_last_scan',
+      'beebeeb_calendar_last_scan',
+    ]) {
+      expect(source).not.toContain(retiredName);
+    }
   });
 });

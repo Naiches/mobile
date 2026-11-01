@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react'
-import { AppState, Platform, Text, TouchableOpacity, View } from 'react-native'
+import { AppState, Platform, ScrollView, Text, TouchableOpacity, useWindowDimensions } from 'react-native'
 import { useTheme } from '../lib/theme-context'
 import { secureStorageUnavailableCopy } from '../lib/startup-auth'
 
@@ -16,6 +16,8 @@ interface Props {
  */
 export function SecureStoragePanel({ onRetry }: Props) {
   const { colors: c } = useTheme()
+  const { fontScale } = useWindowDimensions()
+  const accessibilityLayout = fontScale >= 1.3
   const copy = secureStorageUnavailableCopy(Platform.OS)
   const appState = useRef(AppState.currentState)
 
@@ -31,9 +33,11 @@ export function SecureStoragePanel({ onRetry }: Props) {
   }, [onRetry])
 
   return (
-    <View
+    <ScrollView
       testID="startup-secure-storage-error"
-      style={{ paddingHorizontal: 32, alignItems: 'center', width: '100%' }}
+      style={{ width: '100%', flexShrink: 1 }}
+      contentContainerStyle={{ paddingHorizontal: 32, alignItems: 'center' }}
+      showsVerticalScrollIndicator={accessibilityLayout}
     >
       <Text style={{ color: c.ink, fontSize: 16, fontWeight: '600', textAlign: 'center', marginBottom: 8 }}>
         {copy.title}
@@ -45,10 +49,10 @@ export function SecureStoragePanel({ onRetry }: Props) {
       <TouchableOpacity
         testID="startup-secure-storage-retry"
         onPress={onRetry}
-        style={{ marginTop: 24, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8, backgroundColor: c.amber }}
+        style={{ marginTop: 24, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8, backgroundColor: c.amber, minHeight: accessibilityLayout ? 48 : undefined, alignItems: 'center', justifyContent: 'center' }}
       >
         <Text style={{ color: '#1a1a2e', fontSize: 14, fontWeight: '600' }}>Try again</Text>
       </TouchableOpacity>
-    </View>
+    </ScrollView>
   )
 }

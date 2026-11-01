@@ -12,11 +12,17 @@
  * fail the upload itself, so a rejection or an empty id yields no header.
  */
 
-export const DEVICE_ID_HEADER = 'X-Beebeeb-Device-Id'
+import { settleWithDeadline } from './fetch-deadline'
 
-export async function deviceIdHeader(getId: () => Promise<string>): Promise<Record<string, string>> {
+export const DEVICE_ID_HEADER = 'X-Beebeeb-Device-Id'
+export const DEVICE_ID_HEADER_TIMEOUT_MS = 1_000
+
+export async function deviceIdHeader(
+  getId: () => Promise<string>,
+  timeoutMs: number = DEVICE_ID_HEADER_TIMEOUT_MS,
+): Promise<Record<string, string>> {
   try {
-    const id = await getId()
+    const id = await settleWithDeadline(getId, timeoutMs)
     return typeof id === 'string' && id.length > 0 ? { [DEVICE_ID_HEADER]: id } : {}
   } catch {
     return {}

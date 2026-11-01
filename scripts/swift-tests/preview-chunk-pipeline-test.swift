@@ -1,9 +1,17 @@
 import Foundation
 
 var assertionCount = 0
+var temporaryDirectories: [URL] = []
+
+func cleanupTemporaryDirectories() {
+  for directory in temporaryDirectories {
+    try? FileManager.default.removeItem(at: directory)
+  }
+}
 
 func fail(_ message: String) -> Never {
   fputs("preview-chunk-pipeline-test: FAIL: \(message)\n", stderr)
+  cleanupTemporaryDirectories()
   exit(1)
 }
 
@@ -35,6 +43,7 @@ struct PreviewChunkPipelineTest {
     let tempRoot = FileManager.default.temporaryDirectory
       .appendingPathComponent("preview-chunk-pipeline-test-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+    temporaryDirectories.append(tempRoot)
     defer { try? FileManager.default.removeItem(at: tempRoot) }
 
     let outputURL = tempRoot.appendingPathComponent("out.bin")

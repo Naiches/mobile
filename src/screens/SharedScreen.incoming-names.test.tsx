@@ -67,6 +67,7 @@ mock.module('react-native', () => {
   return {
     View: 'View', Text: 'Text', TouchableOpacity: 'Button', ActivityIndicator: 'Spinner',
     ScrollView: 'ScrollView', FlatList, RefreshControl: 'Refresh', StyleSheet: { create: (x) => x },
+    useWindowDimensions: () => ({ width: 390, height: 844, scale: 3, fontScale: 1 }),
   };
 });
 mock.module('@expo/vector-icons', () => ({ Ionicons: 'Icon' }));

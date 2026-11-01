@@ -22,6 +22,19 @@ enum FileProviderRefreshOutcome {
   }
 }
 
+/// Remembers, in the shared cache, that the extension told Files "Authentication Required".
+/// The app reads it at its next unlock: a recent timestamp means Files is waiting for the user,
+/// so the app says when Files is ready again. The app clears it; the extension never does, or
+/// the recovery itself would erase the reason before the app looked.
+enum FileProviderAuthRequirement {
+  /// The app (`BeebeebCryptoModule.swift`) reads the same literal; a guard test keeps them equal.
+  static let authRequiredAtKey = "files.authRequiredAt"
+
+  static func record(now: Date = Date()) {
+    CacheManager.shared.setSyncState(key: authRequiredAtKey, value: String(now.timeIntervalSince1970))
+  }
+}
+
 /// Synchronizes the local SQLite cache with the server.
 ///
 /// Calls that already have cached rows can treat failures as best-effort.
@@ -32,7 +45,9 @@ enum SyncEngine {
   /// when changes land.
   @discardableResult
   static func refreshContainer(containerId: String) async -> FileProviderRefreshOutcome {
-    let parentId: String? = (containerId == BeebeebConstants.rootContainerIdentifier) ? nil : containerId
+    // A normal folder, Trash's flat top level, or a trashed folder: where to ask, where to cache.
+    let listing = FilesTrash.listing(forContainer: containerId)
+    let parentId = listing.serverParent
 
     // Task 1593 round 7 (C1) — read BEFORE the network fetch below, which
     // can take an arbitrary amount of time. If a sign-out purge starts
@@ -46,9 +61,13 @@ enum SyncEngine {
     // names after the purge's sweep.
     let epochAtStart = CacheManager.shared.currentPurgeEpoch()
 
-    let entries: [ApiClient.FileEntryDto]
+    var entries: [ApiClient.FileEntryDto]
     do {
-      entries = try await ApiClient.shared.listFiles(parentId: parentId)
+      entries = try await ApiClient.shared.listFiles(
+        parentId: parentId,
+        trashed: listing.trashed,
+        maxEntries: listing.isTrashRoot ? FilesTrash.rootListingLimit : nil
+      )
     } catch {
       NSLog("[Beebeeb] refreshContainer(\(containerId)) failed: \(error)")
       return mapRefreshError(error)
@@ -66,7 +85,23 @@ enum SyncEngine {
       masterKeyHandle = nil
       NSLog("[Beebeeb] refreshContainer(\(containerId)) key unavailable: \(error)")
     }
-    let cached = CacheManager.shared.children(parent: parentId)
+    if listing.isTrashRoot {
+      entries = topLevelTrashed(entries)
+    }
+    // One stable parent per trashed id: a row already cached under another parent (a trashed
+    // folder, learned from a folder listing) is never written under this one, so it cannot move
+    // between Trash and a folder from one refresh to the next.
+    if listing.namespaced {
+      entries = entries.filter { dto in
+        guard let existing = CacheManager.shared.item(id: FilesTrash.cacheId(forServerId: dto.id)) else { return true }
+        return existing.parentId == listing.cacheParent
+      }
+    }
+    // Trashed items are cached under their own ids, so they never overwrite or prune a live row.
+    func rowId(_ dto: ApiClient.FileEntryDto) -> String {
+      listing.namespaced ? FilesTrash.cacheId(forServerId: dto.id) : dto.id
+    }
+    let cached = CacheManager.shared.children(parent: listing.cacheParent)
     let cachedById = Dictionary(uniqueKeysWithValues: cached.map { ($0.id, $0) })
 
     // Task 1722 (d): without the key, a listing with names only the key can
@@ -76,16 +111,18 @@ enum SyncEngine {
     // then. Names the app already decrypted, and legacy plaintext names,
     // still refresh without the key.
     if masterKeyHandle == nil,
-       entries.contains(where: { needsKeyForName($0, prior: cachedById[$0.id]) }) {
+       entries.contains(where: { needsKeyForName($0, prior: cachedById[rowId($0)]) }) {
       NSLog("[Beebeeb] refreshContainer(\(containerId)) refused: names need the vault key")
       return .notAuthenticated
     }
 
     var rowsToUpsert: [CachedItem] = []
 
+    // The internal backup manifest is never listed: the shared hide rule for it applies to
+    // `entries` here (and wherever else rows are built from a server listing).
     for dto in entries {
-      let prior = cachedById[dto.id]
-      let effectiveParentId = dto.parent_id ?? parentId
+      let prior = cachedById[rowId(dto)]
+      let effectiveParentId = listing.namespaced ? listing.cacheParent : (dto.parent_id ?? parentId)
       let decrypted = decryptName(
         dto: dto,
         masterKeyHandle: masterKeyHandle,
@@ -93,7 +130,7 @@ enum SyncEngine {
       )
 
       let item = CachedItem(
-        id: dto.id,
+        id: rowId(dto),
         parentId: effectiveParentId,
         nameEncrypted: dto.name_encrypted,
         nameDecrypted: decrypted.name,
@@ -113,7 +150,10 @@ enum SyncEngine {
     }
 
     let committed = CacheManager.shared.replaceChildren(
-      parent: parentId, with: rowsToUpsert, expectedEpoch: epochAtStart
+      parent: listing.cacheParent,
+      with: rowsToUpsert,
+      expectedEpoch: epochAtStart,
+      pruningNamespacePrefix: listing.isTrashRoot ? FilesTrash.itemPrefix : nil
     )
     guard committed else {
       // Task 1593 round 7 (C1) — a sign-out purge ran while this fetch was
@@ -141,10 +181,25 @@ enum SyncEngine {
     manager.signalEnumerator(for: itemIdentifier) { error in
       if let error { NSLog("[Beebeeb] signalEnumerator(\(containerId)) failed: \(error)") }
     }
-    manager.signalEnumerator(for: .workingSet) { error in
-      if let error { NSLog("[Beebeeb] signalEnumerator workingSet failed: \(error)") }
+    // Trash is not part of the working set: nothing in it is ever signalled there.
+    if !listing.namespaced {
+      manager.signalEnumerator(for: .workingSet) { error in
+        if let error { NSLog("[Beebeeb] signalEnumerator workingSet failed: \(error)") }
+      }
     }
     return .success
+  }
+
+  /// What the app's Trash shows: the server's flat trashed listing holds every trashed row, the
+  /// contents of a trashed folder included. When rows carry `parent_id`, Files shows the ones
+  /// trashed on their own (no parent, or a parent that is not itself trashed), newest first (the
+  /// app's order); a trashed folder lists its own contents when it is opened. A listing with no
+  /// `parent_id` at all cannot be told apart, so it is shown flat as it is.
+  static func topLevelTrashed(_ entries: [ApiClient.FileEntryDto]) -> [ApiClient.FileEntryDto] {
+    let ordered = entries.sorted { ($0.updated_at ?? "") > ($1.updated_at ?? "") }
+    guard entries.contains(where: { $0.parent_id != nil }) else { return ordered }
+    let ids = Set(entries.map(\.id))
+    return ordered.filter { entry in entry.parent_id.map { !ids.contains($0) } ?? true }
   }
 
   // MARK: - Materialized folders (task 1722 round 4, review round 2 minor 6)
@@ -190,7 +245,7 @@ enum SyncEngine {
       return max(listed, attempts[id] ?? 0)
     }
     let due = CacheManager.shared.materializedContainerIds()
-      .filter { $0 != BeebeebConstants.rootContainerIdentifier }
+      .filter { $0 != BeebeebConstants.rootContainerIdentifier && !FilesTrash.isTrashNamespace($0) }
       .map { (id: $0, seen: lastSeen($0)) }
       .filter { nowSeconds - $0.seen >= materializedRefreshInterval }
       .sorted { $0.seen < $1.seen }
@@ -352,6 +407,8 @@ final class MaterializedSetTracker {
     for item in items {
       let identifier = item.itemIdentifier
       if identifier == .rootContainer || identifier == .workingSet || identifier == .trashContainer { continue }
+      // Our own read-only Trash is not part of the working set.
+      if FilesTrash.isTrashNamespace(identifier.rawValue) { continue }
       let isFolder = (item.contentType?.conforms(to: .folder) ?? false)
         || (CacheManager.shared.item(id: identifier.rawValue)?.isFolder ?? false)
       if isFolder { folders.insert(identifier.rawValue) }

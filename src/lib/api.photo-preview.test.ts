@@ -81,6 +81,26 @@ test('deletePhotoPreview sends DELETE to the preview route', async () => {
   expect(fetchCalls.at(-1)!.init.method).toBe('DELETE');
 });
 
+test('photo preview mutations forward cancellation to the network request', async () => {
+  // The request wraps the caller's signal with its own deadline signal, so
+  // check the relay: a cancelled caller reaches the network request.
+  const preferenceAbort = new AbortController();
+  preferenceAbort.abort();
+  respondStatus(200, {});
+  await api.setPreferenceValue(
+    'photo_previews',
+    { enabled: true, format: 'heic', px: 2560 },
+    preferenceAbort.signal,
+  );
+  expect((fetchCalls.at(-1)!.init.signal as AbortSignal).aborted).toBe(true);
+
+  const deleteAbort = new AbortController();
+  deleteAbort.abort();
+  respondStatus(200, { removed: 2 });
+  expect(await api.deleteAllPhotoPreviews(deleteAbort.signal)).toBe(2);
+  expect((fetchCalls.at(-1)!.init.signal as AbortSignal).aborted).toBe(true);
+});
+
 test('getPhotoPreviewSummary returns the body, and null on 404', async () => {
   const body = { count: 2, total_bytes: 10, by_setting: [{ format: 'heic', px: 2560, count: 2 }] };
   respondStatus(200, body);
@@ -118,18 +138,18 @@ test('serverSupportsPhotoPreviews is false on 404', async () => {
   expect(await a.serverSupportsPhotoPreviews()).toBe(false);
 });
 
-test('serverSupportsPhotoPreviews is false on 500 and not cached', async () => {
+test('serverSupportsPhotoPreviews rethrows a 500 so the screen can offer retry, and does not cache it', async () => {
   const a = await freshApi('s500');
   respondStatus(500, { error: 'boom' });
-  expect(await a.serverSupportsPhotoPreviews()).toBe(false);
+  await expect(a.serverSupportsPhotoPreviews()).rejects.toThrow();
   respondStatus(200, { count: 0, total_bytes: 0, by_setting: [] });
   expect(await a.serverSupportsPhotoPreviews()).toBe(true);
 });
 
-test('serverSupportsPhotoPreviews is false on a network error and not cached', async () => {
+test('serverSupportsPhotoPreviews rethrows a network error so the screen can offer retry, and does not cache it', async () => {
   const a = await freshApi('snet');
   fetchQueue.push(async () => { throw new Error('offline'); });
-  expect(await a.serverSupportsPhotoPreviews()).toBe(false);
+  await expect(a.serverSupportsPhotoPreviews()).rejects.toThrow();
   respondStatus(200, { count: 0, total_bytes: 0, by_setting: [] });
   expect(await a.serverSupportsPhotoPreviews()).toBe(true);
 });

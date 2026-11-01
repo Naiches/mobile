@@ -2,7 +2,9 @@
 import { describe, expect, test } from 'bun:test';
 import {
   appendFolderToBreadcrumbStack,
+  buildFolderRouteParams,
   filterSelfChildEntries,
+  filesTabReselectAction,
   shouldApplyFilesForFolderToVisibleRows,
   shouldApplyFolderRequestToVisibleState,
   reduceVisibleFolderRequestState,
@@ -13,6 +15,38 @@ const root: BreadcrumbEntry = { id: null, name: 'Drive' };
 const backups: BreadcrumbEntry = { id: 'backups-root', name: 'Backups' };
 
 describe('folder breadcrumb navigation', () => {
+  const index = {
+    a: { name: 'Accounts', parent: null },
+    b: { name: '2026', parent: 'a' },
+    c: { name: 'Invoices', parent: 'b' },
+  };
+
+  test('builds the full root-to-folder route for a nested search result', () => {
+    expect(buildFolderRouteParams({ id: 'c', name: 'Invoices' }, index)).toEqual({
+      folderId: 'c',
+      name: 'Invoices',
+      path: [
+        root,
+        { id: 'a', name: 'Accounts' },
+        { id: 'b', name: '2026' },
+        { id: 'c', name: 'Invoices' },
+      ],
+    });
+  });
+
+  test('uses the same complete stack for pinned and deep-link folder entry', () => {
+    const pinned = buildFolderRouteParams({ id: 'b', name: '2026' }, index);
+    const deepLinked = buildFolderRouteParams({ id: 'c', name: 'Invoices' }, index);
+
+    expect(pinned.path.map((entry) => entry.id)).toEqual([null, 'a', 'b']);
+    expect(deepLinked.path.map((entry) => entry.id)).toEqual([null, 'a', 'b', 'c']);
+  });
+
+  test('a Files tab re-press requests root only when Files is already focused', () => {
+    expect(filesTabReselectAction(true)).toBe('root');
+    expect(filesTabReselectAction(false)).toBeNull();
+  });
+
   test('does not append another crumb when tapping the current folder again', () => {
     const stack = [root, backups];
 

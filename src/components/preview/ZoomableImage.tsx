@@ -35,6 +35,7 @@ import {
   type ViewStyle,
 } from 'react-native';
 import {
+  DOUBLE_TAP_ZOOM_SCALE,
   DOUBLE_TAP_MAX_DELAY_MS,
   MAX_ZOOM_SCALE,
   MIN_ZOOM_SCALE,
@@ -43,6 +44,7 @@ import {
   isDoubleTap,
   isTapGesture,
   isZoomed,
+  resolveProgrammaticZoomScale,
   shouldBlockPaging,
   type TapSample,
 } from '../../lib/preview-zoom';
@@ -80,6 +82,7 @@ export function ZoomableImage({
   const [viewport, setViewport] = useState<{ width: number; height: number } | null>(null);
   const [zoomed, setZoomed] = useState(false);
   const scaleRef = useRef(MIN_ZOOM_SCALE);
+  const programmaticZoomScaleRef = useRef<number | null>(null);
   const originRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const touchStartRef = useRef<TapSample | null>(null);
   const multiTouchRef = useRef(false);
@@ -101,6 +104,13 @@ export function ZoomableImage({
     setZoomed(next);
     onZoomChangeRef.current?.(next);
   }, []);
+
+  const publishZoomScale = useCallback((scale: number) => {
+    const next = clampZoomScale(scale);
+    scaleRef.current = next;
+    onScaleChangeRef.current?.(next);
+    setZoomedState(shouldBlockPaging(next));
+  }, [setZoomedState]);
 
   const clearSingleTapTimer = useCallback(() => {
     if (singleTapTimerRef.current) {
@@ -129,6 +139,7 @@ export function ZoomableImage({
     }
     lastTapRef.current = null;
     clearSingleTapTimer();
+    programmaticZoomScaleRef.current = null;
     if (isZoomed(scaleRef.current)) zoomToFull(false);
     scaleRef.current = MIN_ZOOM_SCALE;
     onScaleChangeRef.current?.(MIN_ZOOM_SCALE);
@@ -148,16 +159,20 @@ export function ZoomableImage({
   }, []);
 
   const handleScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
-    const scale = clampZoomScale(e.nativeEvent.zoomScale ?? MIN_ZOOM_SCALE);
-    scaleRef.current = scale;
-    onScaleChangeRef.current?.(scale);
-    setZoomedState(shouldBlockPaging(scale));
-  }, [setZoomedState]);
+    const resolution = resolveProgrammaticZoomScale(
+      e.nativeEvent.zoomScale,
+      scaleRef.current,
+      programmaticZoomScaleRef.current,
+    );
+    programmaticZoomScaleRef.current = resolution.pendingScale;
+    publishZoomScale(resolution.scale);
+  }, [publishZoomScale]);
 
   const handleTouchStart = useCallback((e: GestureResponderEvent) => {
     e.stopPropagation();
     const { pageX, pageY, touches } = e.nativeEvent;
     if ((touches?.length ?? 1) > 1) {
+      programmaticZoomScaleRef.current = null;
       multiTouchRef.current = true;
       return;
     }
@@ -187,6 +202,9 @@ export function ZoomableImage({
     if (ZOOM_SUPPORTED && viewport && isDoubleTap(lastTapRef.current, tap)) {
       lastTapRef.current = null;
       clearSingleTapTimer();
+      const targetScale = isZoomed(scaleRef.current)
+        ? MIN_ZOOM_SCALE
+        : DOUBLE_TAP_ZOOM_SCALE;
       const rect = doubleTapZoomRect({
         viewportWidth: viewport.width,
         viewportHeight: viewport.height,
@@ -194,6 +212,8 @@ export function ZoomableImage({
         tapY: tap.y - originRef.current.y,
         currentScale: scaleRef.current,
       });
+      programmaticZoomScaleRef.current = targetScale;
+      publishZoomScale(targetScale);
       scrollRef.current?.scrollResponderZoomTo({ ...rect, animated: true });
       return;
     }
@@ -204,7 +224,7 @@ export function ZoomableImage({
       lastTapRef.current = null;
       onSingleTapRef.current?.();
     }, DOUBLE_TAP_MAX_DELAY_MS);
-  }, [clearSingleTapTimer, viewport]);
+  }, [clearSingleTapTimer, publishZoomScale, viewport]);
 
   const handleTouchCancel = useCallback((e: GestureResponderEvent) => {
     e.stopPropagation();

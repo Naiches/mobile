@@ -27,7 +27,14 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import {
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  useWindowDimensions,
+  View,
+} from 'react-native';
 import Slider from '@react-native-community/slider';
 import { Ionicons } from '@expo/vector-icons';
 import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
@@ -57,6 +64,8 @@ export function AudioRenderer({
   topInset = 0,
   bottomInset = 0,
 }: AudioRendererProps) {
+  const { fontScale } = useWindowDimensions();
+  const largeText = fontScale >= 1.35;
   const player = useAudioPlayer(uri);
   const status = useAudioPlayerStatus(player);
   // While the user is actively dragging the thumb, show ITS position, not
@@ -167,8 +176,14 @@ export function AudioRenderer({
   };
 
   return (
-    <View
-      style={[styles.container, { paddingTop: topInset, paddingBottom: bottomInset }]}
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={[
+        styles.containerContent,
+        largeText && styles.containerContentLargeText,
+        { paddingTop: topInset, paddingBottom: bottomInset },
+      ]}
+      showsVerticalScrollIndicator={false}
       testID="audio-renderer"
     >
       <View style={styles.card}>
@@ -176,7 +191,11 @@ export function AudioRenderer({
           <Ionicons name="musical-notes" size={32} color={c.ink3} />
         </View>
 
-        <Text style={[styles.title, { color: c.ink }]} numberOfLines={2} testID="audio-title">
+        <Text
+          style={[styles.title, { color: c.ink }]}
+          numberOfLines={largeText ? undefined : 2}
+          testID="audio-title"
+        >
           {fileName}
         </Text>
         <Text style={[styles.formatLine, styles.mono, { color: c.ink3 }]} testID="audio-duration">
@@ -254,7 +273,7 @@ export function AudioRenderer({
           </>
         )}
       </View>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -263,9 +282,16 @@ const CARD_MAX_WIDTH = 360;
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    width: '100%',
+  },
+  containerContent: {
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 24,
+  },
+  containerContentLargeText: {
+    justifyContent: 'flex-start',
   },
   card: {
     width: '100%',

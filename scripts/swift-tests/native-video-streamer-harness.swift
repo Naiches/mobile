@@ -141,11 +141,26 @@ private func fetch(_ url: String, range: String? = nil, method: String = "GET", 
 }
 
 private var assertionCount = 0
+private let harnessTempDirectory: URL = {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("bb-video-streamer-\(UUID().uuidString)", isDirectory: true)
+  try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  return directory
+}()
+
+private func makeOutputURL() -> URL {
+  harnessTempDirectory.appendingPathComponent("stream-\(UUID().uuidString).mp4")
+}
+
+private func cleanupHarnessTempDirectory() {
+  try? FileManager.default.removeItem(at: harnessTempDirectory)
+}
 
 private func assert(_ condition: @autoclosure () -> Bool, _ message: String) {
   assertionCount += 1
   if !condition() {
     fputs("FAIL: \(message)\n", stderr)
+    cleanupHarnessTempDirectory()
     exit(1)
   }
 }
@@ -163,7 +178,7 @@ private func runEarlyRangeAndCancel() throws {
   let chunks = [frame("HEAD"), frame("MID!"), frame("TL")]
   let server = try ChunkServer(chunks: chunks, blockIndex: 1)
   defer { server.stop() }
-  let output = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("stream-harness-\(UUID().uuidString).mp4")
+  let output = makeOutputURL()
   var events: [[String: Any]] = []
   let progress = NativeVideoStreamProgress(requestId: "req-early", fileId: "file") { events.append($0) }
   let started = try NativeVideoStreamer.start(
@@ -216,7 +231,7 @@ private func runEarlyRangeAndCancel() throws {
 private func runAuthFailure() throws {
   let server = try ChunkServer(chunks: [frame("HEAD"), frame("MID!"), frame("TL", goodTag: false)])
   defer { server.stop() }
-  let output = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("stream-harness-\(UUID().uuidString).mp4")
+  let output = makeOutputURL()
   let progress = NativeVideoStreamProgress(requestId: "req-auth", fileId: "file") { _ in }
   do {
     _ = try NativeVideoStreamer.start(
@@ -244,7 +259,7 @@ private func runCancelAtPromotion() throws {
     server.stop()
     NativeVideoStreamer.beforePromotionForTest = nil
   }
-  let output = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("stream-harness-\(UUID().uuidString).mp4")
+  let output = makeOutputURL()
   var events: [[String: Any]] = []
   let eventLock = NSLock()
   let progress = NativeVideoStreamProgress(requestId: "req-promote", fileId: "file") { event in
@@ -290,7 +305,7 @@ private func runCancelAtPromotion() throws {
 private func runCancelDrain() throws {
   let server = try ChunkServer(chunks: [frame("HEAD"), frame("MID!"), frame("TL")], blockIndex: 1)
   defer { server.stop() }
-  let output = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("stream-harness-\(UUID().uuidString).mp4")
+  let output = makeOutputURL()
   let progress = NativeVideoStreamProgress(requestId: "req-cancel", fileId: "file") { _ in }
   _ = try NativeVideoStreamer.start(
     requestId: "req-cancel",
@@ -310,12 +325,67 @@ private func runCancelDrain() throws {
   assert(!FileManager.default.fileExists(atPath: output.path), "cancel before complete does not promote output")
 }
 
+// The file list can carry a stale chunk count (a single chunk for a file the
+// server actually holds as many). The chunk endpoint's count is authoritative
+// and every chunk is authenticated, so a wrong hint must not stop streaming;
+// the declared size is still checked.
+private func runStaleDeclaredChunkCount() throws {
+  let server = try ChunkServer(chunks: [frame("HEAD"), frame("MID!"), frame("TL")])
+  defer { server.stop() }
+  let output = makeOutputURL()
+  let progress = NativeVideoStreamProgress(requestId: "req-stale-count", fileId: "file") { _ in }
+  let started = try NativeVideoStreamer.start(
+    requestId: "req-stale-count",
+    master: FakeMasterKey(noHandle: .init()),
+    apiUrl: server.baseUrl,
+    token: "token",
+    fileId: "file",
+    outputUri: output.absoluteString,
+    declaredSizeBytes: 10,
+    declaredChunkCount: 1,
+    progress: progress,
+    onTerminal: {}
+  )
+  assert(started.chunkCount == 3, "endpoint chunk count wins over a stale declared count")
+  assert(started.plaintextSize == 10, "size inferred from the chunks")
+  let body = try fetch(started.streamUri, range: "bytes=0-9")
+  assert(body.0 == 206 && String(data: body.1, encoding: .utf8) == "HEADMID!TL", "stream serves the whole file")
+  assert(waitUntil(timeout: 2) { FileManager.default.fileExists(atPath: output.path) }, "finished stream is promoted")
+  let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: output.deletingLastPathComponent().path)) ?? []
+  assert(!leftovers.contains { $0.hasPrefix(".beebeeb-stream-file-") }, "a finished stream leaves no temp directory behind")
+  NativeVideoStreamer.cancelAll()
+
+  let wrongSize = try ChunkServer(chunks: [frame("HEAD"), frame("MID!"), frame("TL")])
+  defer { wrongSize.stop() }
+  let progress2 = NativeVideoStreamProgress(requestId: "req-wrong-size", fileId: "file") { _ in }
+  var rejected = false
+  do {
+    _ = try NativeVideoStreamer.start(
+      requestId: "req-wrong-size",
+      master: FakeMasterKey(noHandle: .init()),
+      apiUrl: wrongSize.baseUrl,
+      token: "token",
+      fileId: "file",
+      outputUri: output.absoluteString,
+      declaredSizeBytes: 999,
+      declaredChunkCount: 1,
+      progress: progress2,
+      onTerminal: {}
+    )
+  } catch {
+    rejected = true
+  }
+  assert(rejected, "a declared size that matches nothing is still rejected")
+}
+
 private enum HarnessMain {
   static func main() throws {
+    defer { cleanupHarnessTempDirectory() }
     try runEarlyRangeAndCancel()
     try runAuthFailure()
     try runCancelAtPromotion()
     try runCancelDrain()
+    try runStaleDeclaredChunkCount()
     print("native-video-streamer-harness: \(assertionCount) assertions, 0 failed")
   }
 }

@@ -86,6 +86,7 @@ struct Provider: TimelineProvider {
 }
 
 private let amberColor = Color(red: 0.96, green: 0.72, blue: 0.0)
+private let constrainedPercentageScaleCap: CGFloat = 1.3
 
 private func activityInlineRunning(completed: Int, total: Int, encrypted: Int, uploading: Int) -> String {
     if encrypted + uploading > 0 {
@@ -110,6 +111,10 @@ private func pendingBreakdown(waiting: Int, encrypted: Int, uploading: Int) -> S
 struct BeebeebWidgetView: View {
     let entry: BeebeebEntry
     @Environment(\.widgetFamily) var widgetFamily
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .caption2) private var smallTextSize: CGFloat = 10
+    @ScaledMetric(relativeTo: .caption) private var mediumTextSize: CGFloat = 11
+    @ScaledMetric(relativeTo: .caption2) private var accessoryPercentageFontSize: CGFloat = 10
 
     var usedBytes: Int64 { entry.data?.storageUsed ?? 0 }
     var quotaBytes: Int64 { entry.data?.storageTotal ?? 1 }
@@ -130,7 +135,11 @@ struct BeebeebWidgetView: View {
                         .foregroundColor(amberColor)
                 } currentValueLabel: {
                     Text("\(Int((backup != nil ? backupFraction : usedFraction) * 100))%")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .font(.system(
+                            size: min(accessoryPercentageFontSize, 10 * constrainedPercentageScaleCap),
+                            weight: .semibold,
+                            design: .monospaced
+                        ))
                 }
                 .gaugeStyle(.accessoryCircular)
                 .tint(amberColor)
@@ -151,33 +160,71 @@ struct BeebeebWidgetView: View {
     }
 
     var homeScreenView: some View {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                accessibilityHomeScreenContent
+            } else {
+                standardHomeScreenContent
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .beebeebWidgetBackground()
+    }
+
+    private var standardHomeScreenContent: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("beebeeb").font(.system(size: 11, weight: .bold)).foregroundColor(amberColor)
+            Text("beebeeb").font(.system(size: mediumTextSize, weight: .bold)).foregroundColor(amberColor)
             if let d = entry.data {
                 let pct = d.storageTotal > 0 ? Double(d.storageUsed) / Double(d.storageTotal) : 0
                 Gauge(value: pct) { EmptyView() }
                     .gaugeStyle(.accessoryLinearCapacity)
                     .tint(amberColor)
                 Text(formatBytes(d.storageUsed) + " of " + formatBytes(d.storageTotal))
-                    .font(.system(size: 10)).foregroundColor(.secondary)
+                    .font(.system(size: smallTextSize)).foregroundColor(.secondary)
                 if let backup = d.backup {
                     Divider().padding(.vertical, 3)
                     Text(backupTitle(backup))
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: mediumTextSize, weight: .semibold))
                     ProgressView(value: backup.total > 0 ? Double(backup.completed) / Double(backup.total) : 0)
                         .tint(amberColor)
                     Text(backupSubtitle(backup))
-                        .font(.system(size: 10))
+                        .font(.system(size: smallTextSize))
                         .foregroundColor(.secondary)
                         .lineLimit(2)
                 }
             } else {
-                Text("Open Beebeeb to load").font(.system(size: 10)).foregroundColor(.secondary)
+                Text("Open Beebeeb to load").font(.system(size: smallTextSize)).foregroundColor(.secondary)
             }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .beebeebWidgetBackground()
+    }
+
+    private var accessibilityHomeScreenContent: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("beebeeb")
+                .font(.system(size: mediumTextSize, weight: .bold))
+                .foregroundColor(amberColor)
+            if let data = entry.data, let backup = data.backup {
+                Text(backupTitle(backup))
+                    .font(.system(size: mediumTextSize, weight: .semibold))
+                ProgressView(value: backup.total > 0 ? Double(backup.completed) / Double(backup.total) : 0)
+                    .tint(amberColor)
+                Text("\(backup.completed) of \(backup.total) photos")
+                    .font(.system(size: smallTextSize))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let data = entry.data {
+                Text(formatBytes(data.storageUsed) + " of " + formatBytes(data.storageTotal))
+                    .font(.system(size: smallTextSize))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Open Beebeeb to load")
+                    .font(.system(size: smallTextSize))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     func formatBytes(_ bytes: Int64) -> String {
@@ -186,6 +233,19 @@ struct BeebeebWidgetView: View {
     }
 
     var accessoryInlineText: String {
+        if dynamicTypeSize.isAccessibilitySize {
+            guard let backup else { return formatBytes(usedBytes) }
+            switch backup.state {
+            case "preparing", "encrypting", "uploading", "running":
+                return "\(backup.completed)/\(backup.total) backed up"
+            case "waitingForAppOpen", "needsAppOpen":
+                return "Open Beebeeb"
+            case "waitingForWifi":
+                return "Waiting for connection"
+            default:
+                return backup.lastBackupAt == nil ? "Backup ready" : "Backup complete"
+            }
+        }
         guard let backup else {
             return "\(formatBytes(usedBytes)) / \(formatBytes(quotaBytes))"
         }
@@ -269,25 +329,101 @@ struct BeebeebStorageWidget: Widget {
 }
 
 @available(iOSApplicationExtension 16.1, *)
+private struct BackupActivityLockScreenView: View {
+    let percentage: String
+    let fraction: Double
+    let subtitle: String
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .footnote) private var titleFontSize: CGFloat = 13
+    @ScaledMetric(relativeTo: .caption) private var detailFontSize: CGFloat = 12
+
+    var body: some View {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                accessibilityContent
+            } else {
+                standardContent
+            }
+        }
+    }
+
+    private var standardContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Beebeeb Backup")
+                    .font(.system(size: titleFontSize, weight: .semibold))
+                Spacer()
+                Text(percentage)
+                    .font(.system(size: detailFontSize, weight: .semibold, design: .monospaced))
+                    .foregroundColor(amberColor)
+            }
+            ProgressView(value: fraction)
+                .tint(amberColor)
+            Text(subtitle)
+                .font(.system(size: detailFontSize))
+                .foregroundColor(.secondary)
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 1)
+        }
+    }
+
+    private var accessibilityContent: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Beebeeb Backup")
+                .font(.system(size: titleFontSize, weight: .semibold))
+            Text(percentage)
+                .font(.system(size: detailFontSize, weight: .semibold, design: .monospaced))
+                .foregroundColor(amberColor)
+            ProgressView(value: fraction)
+                .tint(amberColor)
+            Text(subtitle)
+                .font(.system(size: detailFontSize))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+@available(iOSApplicationExtension 16.1, *)
+private struct ExpandedActivityPercentageText: View {
+    let text: String
+    @ScaledMetric(relativeTo: .body) private var fontSize: CGFloat = 17
+
+    var body: some View {
+        Text(text)
+            .font(.system(
+                size: min(fontSize, 17 * constrainedPercentageScaleCap),
+                weight: .regular,
+                design: .monospaced
+            ))
+            .foregroundColor(amberColor)
+    }
+}
+
+@available(iOSApplicationExtension 16.1, *)
+private struct CompactActivityPercentageText: View {
+    let text: String
+    @ScaledMetric(relativeTo: .caption) private var fontSize: CGFloat = 11
+
+    var body: some View {
+        Text(text)
+            .font(.system(
+                size: min(fontSize, 11 * constrainedPercentageScaleCap),
+                weight: .semibold,
+                design: .monospaced
+            ))
+    }
+}
+
+@available(iOSApplicationExtension 16.1, *)
 struct BeebeebBackupActivityWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: BeebeebBackupActivityAttributes.self) { context in
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Beebeeb Backup")
-                        .font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                    Text(activityPercent(context.state))
-                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                        .foregroundColor(amberColor)
-                }
-                ProgressView(value: activityFraction(context.state))
-                    .tint(amberColor)
-                Text(activitySubtitle(context.state))
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-            }
+            BackupActivityLockScreenView(
+                percentage: activityPercent(context.state),
+                fraction: activityFraction(context.state),
+                subtitle: activitySubtitle(context.state)
+            )
             .padding()
             .activityBackgroundTint(Color(.systemBackground))
             .activitySystemActionForegroundColor(amberColor)
@@ -299,9 +435,7 @@ struct BeebeebBackupActivityWidget: Widget {
                         .foregroundColor(amberColor)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    Text(activityPercent(context.state))
-                        .font(.system(.body, design: .monospaced))
-                        .foregroundColor(amberColor)
+                    ExpandedActivityPercentageText(text: activityPercent(context.state))
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -316,8 +450,7 @@ struct BeebeebBackupActivityWidget: Widget {
                 Image(systemName: "lock.fill")
                     .foregroundColor(amberColor)
             } compactTrailing: {
-                Text(activityPercent(context.state))
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                CompactActivityPercentageText(text: activityPercent(context.state))
             } minimal: {
                 Image(systemName: "lock.fill")
                     .foregroundColor(amberColor)

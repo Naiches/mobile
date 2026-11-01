@@ -1,13 +1,14 @@
 // @ts-nocheck -- native helper only; no app/device or PhotoKit library access.
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const nativeTest = process.platform === 'darwin' ? test : test.skip;
 
 nativeTest('composition exports are bounded file sources, clean failures/cancel, and preserve original files', () => {
   const dir = mkdtempSync(join(tmpdir(), 'bb-video-source-'));
+  try {
   writeFileSync(join(dir, 'Driver.swift'), String.raw`
 import AVFoundation
 import Foundation
@@ -49,11 +50,15 @@ enum PlaintextStorageProtection { static func protect(_ url: URL) -> Bool { true
 `);
   execFileSync('swiftc', ['-module-cache-path', join(dir, 'modules'), join(import.meta.dir, '../../modules/beebeeb-crypto/ios/BackupVideoFileSource.swift'), join(dir, 'Driver.swift'), '-o', join(dir, 'video')], { timeout: 60000 });
   expect(execFileSync(join(dir, 'video'), [dir], {encoding: 'utf8', timeout: 15000})).toContain('video source: 6 assertions passed, 0 failed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90000);
 
 // Native recovery uses the same source file compiled by the app.
 nativeTest('backup startup sweeps abandoned exports while preserving active exports and originals', () => {
   const dir = mkdtempSync(join(tmpdir(), 'bb-video-recovery-'));
+  try {
   writeFileSync(join(dir, 'Driver.swift'), String.raw`
 import AVFoundation
 import Foundation
@@ -95,4 +100,7 @@ enum PlaintextStorageProtection { static func protect(_ url: URL) -> Bool { true
   const batch = engine.slice(engine.indexOf('func processBatch('));
   expect(batch.indexOf('BackupVideoFileSource.sweepAbandonedExports')).toBeGreaterThan(batch.indexOf('defer { finishBatchProcessing() }'));
   expect(batch.indexOf('BackupVideoFileSource.sweepAbandonedExports')).toBeLessThan(batch.indexOf('ensureManifestReadyForUploads'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90000);

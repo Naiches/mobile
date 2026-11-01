@@ -2,7 +2,7 @@
 // Fixture handles use real CryptoKit AES-GCM; they do not test Rust derivation or SE hardware.
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -136,7 +136,7 @@ while offset < payload.count {
 
 // Task 1722 (G5): decryptDownloadedFile streams from the downloaded ciphertext file into an output
 // file, one chunk at a time. Every case writes its ciphertext to disk and reads the output back.
-let scratch = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("beebeeb-codec-\(UUID().uuidString)", isDirectory: true)
+let scratch = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true).appendingPathComponent("codec-scratch", isDirectory: true)
 try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
 var files = 0
 func decryptFile(_ wire: Data, chunkSize: Int, chunkCount: Int, plaintextSize: Int, fileId: String = fileId,
@@ -234,13 +234,14 @@ expectThrows("wrong metadata key rejected", count: &count) {
 FileHandle.standardOutput.write(Data("PASS FileProvider codec cases=\\(count)\\n".utf8))
 `;
   const dir = mkdtempSync(join(tmpdir(), 'beebeeb-files-codec-'));
+  try {
   const swift = join(dir, 'main.swift');
   const binary = join(dir, 'runner');
   const output = join(dir, 'output.log');
   writeFileSync(swift, harness);
   execFileSync('swiftc', [swift, '-o', binary], { timeout: 60_000 });
   try {
-    execFileSync('/bin/sh', ['-c', '"$1" > "$2" 2>&1', 'files-codec-test', binary, output], { timeout: 30_000 });
+    execFileSync('/bin/sh', ['-c', '"$1" "$2" > "$3" 2>&1', 'files-codec-test', binary, dir, output], { timeout: 30_000 });
   } catch {
     // The failing precondition is in the output asserted below.
   }
@@ -248,4 +249,7 @@ FileHandle.standardOutput.write(Data("PASS FileProvider codec cases=\\(count)\\n
   // eslint-disable-next-line no-console
   if (!text.includes('PASS')) console.log(text);
   expect(text).toContain('PASS FileProvider codec cases=18');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90_000);

@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ScrollView, StyleSheet, Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -13,11 +13,18 @@ type Nav = NativeStackNavigationProp<RootStackParamList>;
 export default function DevicePairingShowScreen() {
   const navigation = useNavigation<Nav>();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   const html = useMemo(() => generateConstellationHTML(), []);
 
   return (
-    <View style={[styles.root, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
+    <ScrollView
+      style={styles.root}
+      contentContainerStyle={[styles.content, { paddingTop: insets.top, paddingBottom: insets.bottom }]}
+      scrollEnabled={accessibilityLayout}
+      showsVerticalScrollIndicator={false}
+    >
       <TouchableOpacity
         style={styles.backRow}
         onPress={() => navigation.goBack()}
@@ -29,7 +36,7 @@ export default function DevicePairingShowScreen() {
         <Text style={styles.backText}>Back</Text>
       </TouchableOpacity>
 
-      <View style={styles.constellation}>
+      <View style={[styles.constellation, accessibilityLayout && styles.constellationAccessibility]}>
         <WebView
           source={{ html }}
           style={styles.webview}
@@ -60,7 +67,7 @@ export default function DevicePairingShowScreen() {
           <Text style={styles.cancelText}>Cancel</Text>
         </TouchableOpacity>
       </View>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -69,6 +76,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: darkColors.darkBg,
   },
+  content: { flexGrow: 1 },
   backRow: {
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
@@ -81,6 +89,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: darkColors.darkBg,
   },
+  constellationAccessibility: { minHeight: 320 },
   webview: {
     flex: 1,
     backgroundColor: darkColors.darkBg,
@@ -99,6 +108,7 @@ const styles = StyleSheet.create({
     color: darkColors.ink2,
     letterSpacing: 0.3,
     marginBottom: spacing.lg,
+    textAlign: 'center',
   },
   cancelButton: {
     paddingHorizontal: spacing.xl,

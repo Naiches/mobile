@@ -8,6 +8,7 @@ const primitive = (name) => (props) => React.createElement(name, props, props.ch
 mock.module('react-native', () => ({
   Text: primitive('Text'), View: primitive('View'), TouchableOpacity: primitive('Button'),
   Platform: { OS: 'ios' }, StyleSheet: { create: (s) => s },
+  useWindowDimensions: () => ({ width: 390, height: 844, scale: 3, fontScale: 1 }),
 }));
 mock.module('@expo/vector-icons', () => ({ Ionicons: () => null }));
 const { SETTINGS_CATEGORIES, SettingsCategory, SettingsCategoryList } = await import('./SettingsCategories');

@@ -1,9 +1,11 @@
 // @ts-nocheck
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, jest, mock, test } from 'bun:test';
 
 // In-memory SecureStore so the canonical-id migration is testable without the
 // native keychain module. The module under test imports `* as SecureStore`.
 const store = new Map<string, string>();
+let secureStoreGet: (key: string) => Promise<string | null>;
+const secureStoreWrites: Array<{ key: string; value: string }> = [];
 mock.module('@react-native-async-storage/async-storage', () => ({
   default: {
     getItem: async () => null,
@@ -14,8 +16,11 @@ mock.module('@react-native-async-storage/async-storage', () => ({
   },
 }));
 mock.module('expo-secure-store', () => ({
-  getItemAsync: async (key: string) => store.get(key) ?? null,
-  setItemAsync: async (key: string, value: string) => { store.set(key, value); },
+  getItemAsync: async (key: string) => secureStoreGet(key),
+  setItemAsync: async (key: string, value: string) => {
+    secureStoreWrites.push({ key, value });
+    store.set(key, value);
+  },
   deleteItemAsync: async (key: string) => { store.delete(key); },
 }));
 
@@ -37,10 +42,14 @@ async function loadFresh() {
 
 beforeEach(() => {
   store.clear();
+  secureStoreWrites.length = 0;
+  secureStoreGet = async (key: string) => store.get(key) ?? null;
 });
 
 afterEach(() => {
+  jest.useRealTimers();
   store.clear();
+  secureStoreWrites.length = 0;
 });
 
 describe('getDeviceId — canonical device identity (0863)', () => {
@@ -89,5 +98,36 @@ describe('getDeviceId — canonical device identity (0863)', () => {
     expect(b).toBe(c);
     // Exactly one value persisted.
     expect(store.get(SYNC_KEY)).toBe(a);
+  });
+
+  test('a stuck secure-storage read rejects without minting and clears the in-flight call for retry', async () => {
+    jest.useFakeTimers();
+    secureStoreGet = async () => new Promise<string | null>(() => {});
+    const {
+      DEVICE_ID_STORAGE_TIMEOUT_MS,
+      DeviceIdUnavailableError,
+      resolveDeviceId,
+    } = await loadFresh();
+
+    const first = resolveDeviceId();
+    const joined = resolveDeviceId();
+    const failures = Promise.all([
+      first.catch((error) => error),
+      joined.catch((error) => error),
+    ]);
+    jest.advanceTimersByTime(DEVICE_ID_STORAGE_TIMEOUT_MS);
+
+    const [firstError, joinedError] = await failures;
+    expect(firstError).toBeInstanceOf(DeviceIdUnavailableError);
+    expect(joinedError).toBeInstanceOf(DeviceIdUnavailableError);
+    expect(secureStoreWrites).toHaveLength(0);
+
+    secureStoreGet = async (key: string) => store.get(key) ?? null;
+    store.set(SYNC_KEY, 'retry-device-id');
+    await expect(resolveDeviceId()).resolves.toEqual({
+      id: 'retry-device-id',
+      source: 'stored',
+      persisted: true,
+    });
   });
 });

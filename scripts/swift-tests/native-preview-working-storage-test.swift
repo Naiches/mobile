@@ -1,9 +1,17 @@
 import Foundation
 
 private var assertionCount = 0
+private var temporaryPaths: [URL] = []
+
+private func cleanupTemporaryPaths() {
+  for path in temporaryPaths.reversed() {
+    try? FileManager.default.removeItem(at: path)
+  }
+}
 
 private func fail(_ message: String) -> Never {
   fputs("native-preview-working-storage-test: FAIL: \(message)\n", stderr)
+  cleanupTemporaryPaths()
   exit(1)
 }
 
@@ -24,6 +32,7 @@ private func exists(_ url: URL) -> Bool {
 
 private let cache = FileManager.default.temporaryDirectory
   .appendingPathComponent("native-preview-working-storage-test-\(UUID().uuidString)", isDirectory: true)
+temporaryPaths.append(cache)
 defer { try? FileManager.default.removeItem(at: cache) }
 
 let oldPreviewTemp = cache.appendingPathComponent(".photo.jpg.550E8400-E29B-41D4-A716-446655440000.tmp")
@@ -67,6 +76,7 @@ expect(exists(plainHiddenFile), "fresh-process prepare removed plain hidden file
 
 let raceCache = FileManager.default.temporaryDirectory
   .appendingPathComponent("native-preview-working-storage-race-test-\(UUID().uuidString)", isDirectory: true)
+temporaryPaths.append(raceCache)
 defer { try? FileManager.default.removeItem(at: raceCache) }
 let raceOldTemp = raceCache.appendingPathComponent(".old.jpg.550E8400-E29B-41D4-A716-446655440004.tmp")
 let raceLiveTemp = raceCache.appendingPathComponent(".live.jpg.550E8400-E29B-41D4-A716-446655440005.tmp")
@@ -111,6 +121,8 @@ let aliasTarget = FileManager.default.temporaryDirectory
   .appendingPathComponent("native-preview-working-storage-alias-target-\(UUID().uuidString)", isDirectory: true)
 let aliasLink = FileManager.default.temporaryDirectory
   .appendingPathComponent("native-preview-working-storage-alias-link-\(UUID().uuidString)", isDirectory: true)
+temporaryPaths.append(aliasTarget)
+temporaryPaths.append(aliasLink)
 defer {
   try? FileManager.default.removeItem(at: aliasLink)
   try? FileManager.default.removeItem(at: aliasTarget)

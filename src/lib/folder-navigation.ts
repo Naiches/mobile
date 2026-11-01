@@ -3,9 +3,22 @@ export interface BreadcrumbEntry {
   name: string;
 }
 
+export type FilesAction = 'upload' | 'search' | 'scan' | 'recent' | 'root' | 'folder';
+
 export interface FolderBreadcrumbTarget {
   id: string;
   name: string;
+}
+
+export interface FolderPathIndexEntry {
+  name: string;
+  parent: string | null;
+}
+
+export interface FolderRouteParams {
+  folderId: string;
+  name: string;
+  path: BreadcrumbEntry[];
 }
 
 export interface FolderListEntry {
@@ -51,6 +64,44 @@ export function appendFolderToBreadcrumbStack<T extends BreadcrumbEntry>(
   const existingIndex = stack.findIndex((entry) => entry.id === folder.id);
   if (existingIndex >= 0) return stack.slice(0, existingIndex + 1);
   return [...stack, { id: folder.id, name: folder.name }];
+}
+
+/**
+ * Rebuild a folder's complete Drive path from the vault index.
+ *
+ * Search results, pins and external jumps can name a folder without having
+ * visited its parents first. Native navigation still receives the whole path
+ * so breadcrumbs are truthful, while the jump itself remains one pushed
+ * screen (Back therefore returns to the search results or originating view).
+ */
+export function buildFolderRouteParams(
+  folder: FolderBreadcrumbTarget & { parentId?: string | null },
+  entries: Readonly<Record<string, FolderPathIndexEntry | undefined>>,
+): FolderRouteParams {
+  const reversed: BreadcrumbEntry[] = [];
+  const visited = new Set<string>();
+  let id: string | null = folder.id;
+
+  while (id && !visited.has(id)) {
+    visited.add(id);
+    const entry: FolderPathIndexEntry | undefined = entries[id];
+    reversed.push({
+      id,
+      name: id === folder.id ? folder.name : (entry?.name || 'Folder'),
+    });
+    id = entry?.parent ?? (id === folder.id ? folder.parentId ?? null : null);
+  }
+
+  return {
+    folderId: folder.id,
+    name: folder.name,
+    path: [{ id: null, name: 'Drive' }, ...reversed.reverse()],
+  };
+}
+
+/** Same-tab presses reset Drive; presses used to switch tabs do not. */
+export function filesTabReselectAction(alreadyFocused: boolean): 'root' | null {
+  return alreadyFocused ? 'root' : null;
 }
 
 /** Hide impossible folder rows where a folder is listed as its own child. */

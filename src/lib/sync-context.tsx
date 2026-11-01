@@ -29,6 +29,8 @@ interface SyncContextValue {
   loading: boolean;
   /** Last error from the engine (snapshot fetch, stream open, op submit). */
   error: Error | null;
+  /** Epoch ms of the last moment the tree was known current (snapshot, op, catch-up, stream open). */
+  lastSyncAt: number | null;
   /** True when sync is actively backing the UI (snapshot loaded). */
   ready: boolean;
   /**
@@ -68,6 +70,10 @@ export function SyncProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  // Updated silently on every sync event; copied into state only when the status changes,
+  // so the once-a-minute catch-up does not re-render every consumer.
+  const lastSyncAtRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!user) {
@@ -88,23 +94,43 @@ export function SyncProvider({ children }: { children: ReactNode }) {
 
     const unsubscribe = client.subscribe((event) => {
       if (event.type === 'status' && event.status) {
+        if (event.status === 'connected') lastSyncAtRef.current = Date.now();
         setStatus(event.status);
-      } else if (event.type === 'snapshot' || event.type === 'ready') {
+        setLastSyncAt(lastSyncAtRef.current);
+      } else if (event.type === 'caught-up') {
+        lastSyncAtRef.current = Date.now();
+        if (event.treeChanged) {
+          setLastSyncAt(lastSyncAtRef.current);
+          setTreeVersion((n) => n + 1);
+        }
+      } else if (event.type === 'snapshot') {
         setError(null);
         setReady(true);
         setLoading(false);
+        lastSyncAtRef.current = Date.now();
+        setLastSyncAt(lastSyncAtRef.current);
         setTreeVersion((n) => n + 1);
+      } else if (event.type === 'ready') {
+        // Snapshot or replay already published the tree once. `ready` only
+        // changes lifecycle state; bumping the tree again repeats vault-wide
+        // derivations in every mounted folder screen.
+        setError(null);
+        setReady(true);
+        setLoading(false);
+        lastSyncAtRef.current = Date.now();
+        setLastSyncAt(lastSyncAtRef.current);
       } else if (event.type === 'op') {
+        lastSyncAtRef.current = Date.now();
+        setLastSyncAt(lastSyncAtRef.current);
         setTreeVersion((n) => n + 1);
-        // 0818 — a sync-arrived trash/delete (incl. 0816's cascade-tagged folder
-        // op, whose subtree was captured before apply) fans out to every derived
-        // store so a web delete doesn't leave orphaned backup rows / thumbnails /
-        // offline copies / search hits. Fire-and-forget; the cascade is idempotent.
-        if (event.deletedIds && event.deletedIds.length > 0) {
-          void onFilesDeleted(event.deletedIds, { subtree: true });
-        }
       } else if (event.type === 'error' && event.error) {
         setError(event.error);
+      }
+
+      // A replay coalesces all delete ids into its single caught-up event; a
+      // live op carries its own. The cascade is idempotent and stays async.
+      if (event.deletedIds && event.deletedIds.length > 0) {
+        void onFilesDeleted(event.deletedIds, { subtree: true });
       }
     });
 
@@ -172,6 +198,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
   const value = useMemo<SyncContextValue>(
     () => ({
       status,
+      lastSyncAt,
       loading,
       error,
       ready,
@@ -183,7 +210,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
       submitOp,
       applyLocalOp,
     }),
-    [status, loading, error, ready, treeVersion, children_, getNode, allNodes, collectSubtreeIds, submitOp, applyLocalOp],
+    [status, lastSyncAt, loading, error, ready, treeVersion, children_, getNode, allNodes, collectSubtreeIds, submitOp, applyLocalOp],
   );
 
   return <SyncContext.Provider value={value}>{children}</SyncContext.Provider>;

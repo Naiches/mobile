@@ -8,7 +8,7 @@ let params: any = { folderId: 'folder' };
 let groups: any[];
 let rows: any[];
 let calls: any[];
-mock.module('react-native', () => ({ View: 'View', Text: 'Text', TouchableOpacity: 'Button', ActivityIndicator: 'Spinner', ScrollView: 'ScrollView', FlatList: 'List', RefreshControl: 'Refresh', StyleSheet: { create: x => x } }));
+mock.module('react-native', () => ({ View: 'View', Text: 'Text', TouchableOpacity: 'Button', ActivityIndicator: 'Spinner', ScrollView: 'ScrollView', FlatList: 'List', RefreshControl: 'Refresh', StyleSheet: { create: x => x }, useWindowDimensions: () => ({ width: 390, height: 844, fontScale: 1, scale: 3 }) }));
 mock.module('@expo/vector-icons', () => ({ Ionicons: 'Icon' }));
 mock.module('expo-haptics', () => ({})); mock.module('expo-clipboard', () => ({}));
 mock.module('@react-navigation/native', () => ({ useRoute: () => ({ params }), useNavigation: () => ({ navigate() {}, goBack() {} }), useFocusEffect() {} }));

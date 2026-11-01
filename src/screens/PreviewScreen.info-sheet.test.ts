@@ -72,7 +72,9 @@ describe('Info sheet stacking', () => {
   });
 
   test('even the large detent stops below the top chrome (sim: the handle hid under the title capsule)', () => {
-    expect(infoSheetSource).toMatch(/topClearance=\{insets\.top \+ PREVIEW_CHROME_CLEARANCE\}/);
+    expect(infoSheetSource).toMatch(
+      /topClearance=\{insets\.top \+ PREVIEW_CHROME_CLEARANCE \* Math\.max\(1, fontScale\)\}/,
+    );
     expect(Number(infoSheetSource.match(/PREVIEW_CHROME_CLEARANCE = (\d+)/)?.[1] ?? 0)).toBeGreaterThanOrEqual(64);
     expect(bottomSheetSource).toMatch(/computeDetents\(detentNames, containerHeight - keyboardHeight, topClearance \?\? insets\.top\)/);
   });

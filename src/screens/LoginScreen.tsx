@@ -11,6 +11,7 @@ import {
   TextInput,
   TouchableOpacity,
   View,
+  useWindowDimensions,
 } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import type { NativeStackNavigationProp, NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -41,6 +42,7 @@ export default function LoginScreen() {
   const route = useRoute<RouteProps>();
   const { refreshAuth } = useAuth();
   const { colors: c, resolved } = useTheme();
+  const { fontScale } = useWindowDimensions();
   const passwordRef = useRef<TextInput>(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -90,6 +92,7 @@ export default function LoginScreen() {
   const styles = useMemo(() => StyleSheet.create({
     root: { flex: 1, backgroundColor: c.paper },
     scrollContent: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: spacing.xl, paddingVertical: 40 },
+    scrollContentLarge: { justifyContent: 'flex-start' },
     brandRow: { alignItems: 'center', marginBottom: spacing.xl },
     heading: { fontSize: 24, fontWeight: '700', color: c.ink, textAlign: 'center', marginBottom: 4 },
     subheading: { fontSize: 13, color: c.ink3, textAlign: 'center' },
@@ -98,11 +101,11 @@ export default function LoginScreen() {
     errorBanner: { backgroundColor: resolved === 'dark' ? '#2d1515' : '#fef2f2', borderWidth: 1, borderColor: resolved === 'dark' ? '#5c2828' : '#fecaca', borderRadius: radii.md, paddingVertical: spacing.sm, paddingHorizontal: spacing.md, marginBottom: spacing.lg },
     errorText: { fontSize: 12, color: c.red, lineHeight: 17 },
     label: { fontSize: 12, fontWeight: '600', color: c.ink2, marginBottom: 4, marginTop: spacing.md },
-    input: { height: 44, borderWidth: 1, borderColor: c.line, borderRadius: radii.md, paddingHorizontal: spacing.md, fontSize: 14, color: c.ink, backgroundColor: c.paper },
-    button: { height: 44, backgroundColor: c.ink, borderRadius: radii.md, alignItems: 'center', justifyContent: 'center', marginTop: spacing.xl },
+    input: { minHeight: 44, borderWidth: 1, borderColor: c.line, borderRadius: radii.md, paddingHorizontal: spacing.md, paddingVertical: 10, fontSize: 14, color: c.ink, backgroundColor: c.paper },
+    button: { minHeight: 44, paddingVertical: 10, paddingHorizontal: spacing.md, backgroundColor: c.ink, borderRadius: radii.md, alignItems: 'center', justifyContent: 'center', marginTop: spacing.xl },
     buttonDisabled: { opacity: 0.6 },
     buttonText: { color: c.paper, fontSize: 14, fontWeight: '600' },
-    footerRow: { flexDirection: 'row', justifyContent: 'center', marginTop: spacing.lg },
+    footerRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'center', marginTop: spacing.lg },
     footerText: { fontSize: 13, color: c.ink3 },
     footerNote: { flex: 1, textAlign: 'center', lineHeight: 18 },
     footerLink: { fontSize: 13, color: c.amberDeep, fontWeight: '600' },
@@ -162,7 +165,7 @@ export default function LoginScreen() {
   return (
     <ScrollView
       style={styles.root}
-      contentContainerStyle={styles.scrollContent}
+      contentContainerStyle={[styles.scrollContent, fontScale > 1.3 && styles.scrollContentLarge]}
       automaticallyAdjustKeyboardInsets
       keyboardShouldPersistTaps="handled"
       keyboardDismissMode="interactive"

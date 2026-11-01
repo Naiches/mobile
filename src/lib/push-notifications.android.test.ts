@@ -16,7 +16,7 @@ mock.module('expo-constants', () => ({ default: constants }));
 mock.module('expo-secure-store', () => ({
   getItemAsync: async (key: string) => key === 'beebeeb_notifications_opt_out'
     ? (optedOut ? 'true' : null) : 'true',
-  setItemAsync: async () => {},
+  setItemAsync: async (key: string, value: string) => { calls.push(`secure:${key}:${value}`); },
 }));
 mock.module('./device-identity', () => ({ getDeviceId: async () => 'test-device' }));
 mock.module('./api', () => ({
@@ -34,12 +34,13 @@ mock.module('expo-notifications', () => ({
   getPermissionsAsync: async () => { calls.push('permissions'); return { status: permission }; },
   requestPermissionsAsync: async () => {
     calls.push('request');
+    permission = requestedPermission;
     return { status: requestedPermission };
   },
   getExpoPushTokenAsync: async () => { calls.push('token'); return { data: 'test-token' }; },
 }));
 
-const { registerForPushNotifications } = await import('./push-notifications');
+const { enablePushNotifications, registerForPushNotifications } = await import('./push-notifications');
 
 beforeEach(() => {
   calls.length = 0;
@@ -96,6 +97,24 @@ describe('Android push notification registration', () => {
     requestedPermission = 'denied';
     await registerForPushNotifications();
     expect(calls).toEqual(['channel', 'permissions', 'request']);
+  });
+
+  test('a passive login registration never presents the permission prompt', async () => {
+    await registerForPushNotifications(undefined, { requestPermission: false });
+    expect(calls).toEqual(['channel', 'permissions']);
+  });
+
+  test('the explicit setup action asks first, records opt-in, then registers', async () => {
+    expect(await enablePushNotifications()).toBe(true);
+    expect(calls).toEqual([
+      'permissions',
+      'request',
+      'secure:beebeeb_notifications_opt_out:false',
+      'channel',
+      'permissions',
+      'token',
+      'register',
+    ]);
   });
 
   test('a channel failure is non-fatal and does not attempt registration', async () => {

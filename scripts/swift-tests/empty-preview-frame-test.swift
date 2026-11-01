@@ -14,7 +14,10 @@ func runEmptyPreviewFrameTest() throws {
   var assertions = 0
   func check(_ condition: Bool) {
     assertions += 1
-    precondition(condition, "empty preview assertion \(assertions) failed")
+    guard condition else {
+      try? FileManager.default.removeItem(at: directory)
+      preconditionFailure("empty preview assertion \(assertions) failed")
+    }
   }
   check(frame.count == 28 && plan.expectedEncryptedSize == 28)
   for variant in 0..<4 {

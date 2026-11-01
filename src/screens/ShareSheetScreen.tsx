@@ -7,6 +7,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
@@ -175,6 +176,8 @@ export default function ShareSheetScreen() {
   const navigation = useNavigation();
   const route = useRoute<ShareRoute>();
   const { colors: c, resolved } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const { fileId, fileName, mimeType, sizeBytes, isFolder } = route.params;
   const { getFileKeyBytes, decryptNames, deriveX25519PrivateFromHandle, getMasterKeyHandleId, isUnlocked } = useCrypto();
   useKeyboardLayoutAnimation();
@@ -220,7 +223,9 @@ export default function ShareSheetScreen() {
     // glass is the control layer only.
     body: { paddingHorizontal: spacing.lg },
     fileRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 16 },
+    fileRowAccessibility: { alignItems: 'flex-start' },
     fileIcon: { width: 36, height: 36, borderRadius: radii.md, alignItems: 'center', justifyContent: 'center' },
+    fileIconAccessibility: { width: 52, height: undefined, minHeight: 52, paddingHorizontal: 4, paddingVertical: 4 },
     fileIconText: { color: '#FFFFFF', fontSize: 9, fontWeight: '700', letterSpacing: 0.4 },
     fileInfo: { flex: 1, minWidth: 0 },
     fileName: { fontSize: 14, fontWeight: '600', color: c.ink },
@@ -234,11 +239,13 @@ export default function ShareSheetScreen() {
     chipText: { fontSize: 12, color: c.ink3 },
     chipTextActive: { color: c.paper, fontWeight: '600' },
     modeRow: { flexDirection: 'row', backgroundColor: c.paper2, borderRadius: radii.md, padding: 3, marginBottom: 12 },
-    modeButton: { flex: 1, height: 36, borderRadius: radii.sm, alignItems: 'center', justifyContent: 'center' },
+    modeRowAccessibility: { flexDirection: 'column' },
+    modeButton: { flex: 1, minHeight: 36, paddingVertical: 8, borderRadius: radii.sm, alignItems: 'center', justifyContent: 'center' },
+    modeButtonAccessibility: { flex: undefined, width: '100%' },
     modeButtonActive: { backgroundColor: c.paper, borderWidth: 1, borderColor: c.line },
     modeText: { fontSize: 13, fontWeight: '600', color: c.ink3 },
     modeTextActive: { color: c.ink },
-    input: { height: 42, borderWidth: 1, borderColor: c.line, borderRadius: radii.md, paddingHorizontal: spacing.md, fontSize: 14, color: c.ink, backgroundColor: c.paper },
+    input: { minHeight: 42, borderWidth: 1, borderColor: c.line, borderRadius: radii.md, paddingHorizontal: spacing.md, paddingVertical: 10, fontSize: 14, color: c.ink, backgroundColor: c.paper },
     hint: { fontSize: 11, color: c.ink3, marginTop: 6, lineHeight: 15 },
     // Double-encrypted toggle
     toggleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, paddingVertical: 10, borderTopWidth: 1, borderTopColor: c.line, marginTop: 8 },
@@ -253,24 +260,29 @@ export default function ShareSheetScreen() {
     retryButtonText: { fontSize: 12, fontWeight: '600', color: c.ink },
     errorBanner: { backgroundColor: resolved === 'dark' ? '#2d1515' : '#fef2f2', borderWidth: 1, borderColor: resolved === 'dark' ? '#5c2828' : '#fecaca', borderRadius: radii.md, paddingVertical: spacing.sm, paddingHorizontal: spacing.md, marginTop: spacing.lg },
     errorText: { fontSize: 12, color: c.red, lineHeight: 17 },
-    createButton: { height: 46, backgroundColor: c.amber, borderRadius: radii.md, alignItems: 'center', justifyContent: 'center', marginTop: spacing.xl },
+    createButton: { minHeight: 46, paddingVertical: spacing.md, paddingHorizontal: spacing.md, backgroundColor: c.amber, borderRadius: radii.md, alignItems: 'center', justifyContent: 'center', marginTop: spacing.xl },
     buttonDisabled: { opacity: 0.6 },
     createButtonText: { fontSize: 14, fontWeight: '700', color: c.ink },
     fineprint: { fontSize: 11, color: c.ink4, textAlign: 'center', marginTop: 12, lineHeight: 16 },
     successCard: { paddingTop: 8 },
     successHeaderRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+    successHeaderRowAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
     successTitle: { fontSize: 11, fontWeight: '600', color: c.ink3, textTransform: 'uppercase', letterSpacing: 0.6, flex: 1 },
     urlBox: { flexDirection: 'row', alignItems: 'center', backgroundColor: c.paper2, borderWidth: 1, borderColor: c.line, borderRadius: radii.md, paddingLeft: 12, paddingRight: 6, paddingVertical: 6, gap: 8 },
+    urlBoxAccessibility: { alignItems: 'stretch', flexDirection: 'column', padding: 10 },
     urlText: { flex: 1, fontSize: 12, color: c.ink, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
     fieldLabel: { fontSize: 11, fontWeight: '600', color: c.ink2, marginBottom: 6, marginTop: 10 },
     copyButton: { paddingHorizontal: 12, paddingVertical: 7, backgroundColor: c.ink, borderRadius: radii.sm },
+    copyButtonAccessibility: { alignItems: 'center', minHeight: 44, justifyContent: 'center' },
     copyButtonText: { fontSize: 12, fontWeight: '600', color: c.amber },
     successDetails: { marginTop: 10, gap: 4 },
     successHint: { fontSize: 12, color: c.ink3 },
     buttonRow: { flexDirection: 'row', gap: 10, marginTop: spacing.xl },
-    shareButton: { flex: 1, height: 44, backgroundColor: c.amber, borderRadius: radii.md, alignItems: 'center', justifyContent: 'center' },
+    buttonRowAccessibility: { flexDirection: 'column' },
+    shareButton: { flex: 1, minHeight: 44, paddingVertical: spacing.md, paddingHorizontal: spacing.md, backgroundColor: c.amber, borderRadius: radii.md, alignItems: 'center', justifyContent: 'center' },
     shareButtonText: { fontSize: 14, fontWeight: '700', color: c.ink },
-    doneButton: { flex: 1, height: 44, backgroundColor: 'transparent', borderRadius: radii.md, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: c.line },
+    doneButton: { flex: 1, minHeight: 44, paddingVertical: spacing.md, paddingHorizontal: spacing.md, backgroundColor: 'transparent', borderRadius: radii.md, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: c.line },
+    actionButtonAccessibility: { flex: undefined, width: '100%' },
     doneButtonText: { fontSize: 14, fontWeight: '600', color: c.ink3 },
   }), [c, resolved]);
 
@@ -589,12 +601,12 @@ export default function ShareSheetScreen() {
   }, [displayUrl]);
 
   const fileRow = (
-    <View style={styles.fileRow}>
-      <View style={[styles.fileIcon, { backgroundColor: badge.color }]}>
+    <View style={[styles.fileRow, accessibilityLayout && styles.fileRowAccessibility]}>
+      <View style={[styles.fileIcon, accessibilityLayout && styles.fileIconAccessibility, { backgroundColor: badge.color }]}>
         <Text style={styles.fileIconText}>{badge.label}</Text>
       </View>
       <View style={styles.fileInfo}>
-        <Text style={styles.fileName} numberOfLines={1}>{fileName}</Text>
+        <Text style={styles.fileName} numberOfLines={accessibilityLayout ? undefined : 1}>{fileName}</Text>
         <Text style={styles.fileMeta}>
           {sizeBytes != null ? `${formatSize(sizeBytes)} · ` : ''}encrypted
         </Text>
@@ -634,7 +646,7 @@ export default function ShareSheetScreen() {
           /* ---- Share created — ONE full link (task 1690): the URL with the
              decryption key embedded as a #key= fragment ---- */
           <View style={styles.successCard}>
-            <View style={styles.successHeaderRow}>
+            <View style={[styles.successHeaderRow, accessibilityLayout && styles.successHeaderRowAccessibility]}>
               <Text style={styles.successTitle}>End-to-end encrypted share</Text>
               {share.double_encrypted && (
                 <View style={styles.zkBadge}>
@@ -648,12 +660,12 @@ export default function ShareSheetScreen() {
                 send-separately badge) was removed so every produced/copyable
                 share string is the whole link. */}
             <Text style={styles.fieldLabel}>Share link</Text>
-            <View style={styles.urlBox}>
-              <Text style={styles.urlText} numberOfLines={1} selectable>
+            <View style={[styles.urlBox, accessibilityLayout && styles.urlBoxAccessibility]}>
+              <Text style={styles.urlText} numberOfLines={accessibilityLayout ? undefined : 1} selectable>
                 {displayUrl}
               </Text>
               <TouchableOpacity
-                style={styles.copyButton}
+                style={[styles.copyButton, accessibilityLayout && styles.copyButtonAccessibility]}
                 onPress={() => handleCopy(displayUrl)}
                 activeOpacity={0.8}
               >
@@ -677,16 +689,16 @@ export default function ShareSheetScreen() {
               )}
             </View>
 
-            <View style={styles.buttonRow}>
+            <View style={[styles.buttonRow, accessibilityLayout && styles.buttonRowAccessibility]}>
               <TouchableOpacity
-                style={styles.shareButton}
+                style={[styles.shareButton, accessibilityLayout && styles.actionButtonAccessibility]}
                 onPress={handleShare}
                 activeOpacity={0.8}
               >
                 <Text style={styles.shareButtonText}>Share full link</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={styles.doneButton}
+                style={[styles.doneButton, accessibilityLayout && styles.actionButtonAccessibility]}
                 onPress={handleClose}
                 activeOpacity={0.8}
               >
@@ -696,7 +708,7 @@ export default function ShareSheetScreen() {
           </View>
         ) : inviteSentTo ? (
           <View style={styles.successCard}>
-            <View style={styles.successHeaderRow}>
+            <View style={[styles.successHeaderRow, accessibilityLayout && styles.successHeaderRowAccessibility]}>
               <Text style={styles.successTitle}>Invite sent</Text>
             </View>
             <View style={styles.successDetails}>
@@ -705,9 +717,9 @@ export default function ShareSheetScreen() {
               </Text>
             </View>
 
-            <View style={styles.buttonRow}>
+            <View style={[styles.buttonRow, accessibilityLayout && styles.buttonRowAccessibility]}>
               <TouchableOpacity
-                style={styles.doneButton}
+                style={[styles.doneButton, accessibilityLayout && styles.actionButtonAccessibility]}
                 onPress={handleClose}
                 activeOpacity={0.8}
               >
@@ -758,9 +770,9 @@ export default function ShareSheetScreen() {
               </View>
             )}
             {isFolder ? null : (
-            <View style={styles.modeRow} accessibilityRole="tablist">
+            <View style={[styles.modeRow, accessibilityLayout && styles.modeRowAccessibility]} accessibilityRole="tablist">
               <TouchableOpacity
-                style={[styles.modeButton, mode === 'link' && styles.modeButtonActive]}
+                style={[styles.modeButton, accessibilityLayout && styles.modeButtonAccessibility, mode === 'link' && styles.modeButtonActive]}
                 onPress={() => {
                   setMode('link');
                   setError(null);
@@ -774,7 +786,7 @@ export default function ShareSheetScreen() {
                 </Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.modeButton, mode === 'person' && styles.modeButtonActive]}
+                style={[styles.modeButton, accessibilityLayout && styles.modeButtonAccessibility, mode === 'person' && styles.modeButtonActive]}
                 onPress={() => {
                   setMode('person');
                   setError(null);

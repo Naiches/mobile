@@ -8,6 +8,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -139,7 +140,7 @@ function DocumentScannerUnavailable() {
 
   return (
     <View style={[styles.root, { backgroundColor: c.paper }]}>
-      <View style={styles.unavailableContent}>
+      <ScrollView contentContainerStyle={styles.unavailableContent}>
         <TouchableOpacity
           onPress={() => navigation.goBack()}
           style={[styles.iconButton, { backgroundColor: c.paper2, borderColor: c.line }]}
@@ -155,7 +156,7 @@ function DocumentScannerUnavailable() {
             This build is missing the native camera module required to scan documents.
           </Text>
         </View>
-      </View>
+      </ScrollView>
     </View>
   );
 }
@@ -165,6 +166,8 @@ function DocumentScannerCameraScreen({ camera }: { camera: CameraModule }) {
   const navigation = useNavigation<Nav>();
   const route = useRoute<Route>();
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const { showToast } = useToast();
   const { isUnlocked, encryptChunk, encryptMetadata, getMasterKeyHandleId } = useCrypto();
   const [permission, requestPermission] = useCameraPermissions();
@@ -384,7 +387,7 @@ function DocumentScannerCameraScreen({ camera }: { camera: CameraModule }) {
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={styles.content}
       >
-        <View style={styles.headerRow}>
+        <View style={[styles.headerRow, accessibilityLayout && styles.headerRowAccessibility]}>
           <TouchableOpacity
             onPress={() => navigation.goBack()}
             style={[styles.iconButton, { backgroundColor: c.paper2, borderColor: c.line }]}
@@ -449,12 +452,12 @@ function DocumentScannerCameraScreen({ camera }: { camera: CameraModule }) {
         */}
         {previewing && (showAiNote || ocrBusy) && (
           <View style={[styles.aiCard, { backgroundColor: c.paper2, borderColor: c.line }]}>
-            <View style={styles.aiCardHeader}>
+            <View style={[styles.aiCardHeader, accessibilityLayout && styles.aiCardHeaderAccessibility]}>
               <View style={styles.aiBadge}>
                 <Ionicons name="sparkles" size={14} color={c.amber} />
                 <Text style={[styles.aiBadgeText, { color: c.ink }]}>AI summary</Text>
               </View>
-              <View style={styles.aiCardHeaderRight}>
+              <View style={[styles.aiCardHeaderRight, accessibilityLayout && styles.aiCardHeaderRightAccessibility]}>
                 <View style={[styles.aiPill, { borderColor: c.line }]}>
                   <Ionicons name="lock-closed" size={10} color={c.ink3} />
                   <Text style={[styles.aiPillText, { color: c.ink3 }]}>On your device</Text>
@@ -479,11 +482,17 @@ function DocumentScannerCameraScreen({ camera }: { camera: CameraModule }) {
             ) : showAiNote ? (
               <>
                 {docSummary && (
-                  <Text style={[styles.aiSummary, { color: c.ink }]} numberOfLines={2}>
+                  <Text
+                    style={[styles.aiSummary, { color: c.ink }]}
+                    numberOfLines={accessibilityLayout ? undefined : 2}
+                  >
                     {docSummary.summary}
                   </Text>
                 )}
-                <Text style={[styles.aiNotePreview, { color: c.ink3 }]} numberOfLines={3}>
+                <Text
+                  style={[styles.aiNotePreview, { color: c.ink3 }]}
+                  numberOfLines={accessibilityLayout ? undefined : 3}
+                >
                   {combinedOcr}
                 </Text>
                 <Text style={[styles.aiFootnote, { color: c.ink4 }]}>
@@ -553,7 +562,7 @@ const styles = StyleSheet.create({
     gap: spacing.lg,
   },
   unavailableContent: {
-    flex: 1,
+    flexGrow: 1,
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.lg,
     gap: spacing.lg,
@@ -563,6 +572,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: spacing.md,
   },
+  headerRowAccessibility: { alignItems: 'flex-start' },
   headerText: { flex: 1 },
   iconButton: {
     width: 40,
@@ -593,6 +603,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 8,
+    flexWrap: 'wrap',
     borderRadius: 999,
     paddingVertical: 10,
     backgroundColor: 'rgba(0, 0, 0, 0.58)',
@@ -624,8 +635,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 8,
     paddingHorizontal: spacing.lg,
+    paddingVertical: 12,
   },
-  primaryButtonText: { fontSize: 15, fontWeight: '700' },
+  primaryButtonText: { fontSize: 15, fontWeight: '700', textAlign: 'center' },
   secondaryButton: {
     minHeight: 46,
     borderWidth: 1,
@@ -635,8 +647,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 8,
     paddingHorizontal: spacing.lg,
+    paddingVertical: 11,
   },
-  secondaryButtonText: { fontSize: 14, fontWeight: '700' },
+  secondaryButtonText: { fontSize: 14, fontWeight: '700', textAlign: 'center' },
   disabled: { opacity: 0.45 },
   // Task 0802 — AI note card (placeholder treatment, pending designer spec).
   aiCard: {
@@ -650,6 +663,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
+  aiCardHeaderAccessibility: { alignItems: 'flex-start', flexDirection: 'column', gap: spacing.sm },
   aiBadge: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -661,6 +675,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: spacing.sm,
   },
+  aiCardHeaderRightAccessibility: { flexWrap: 'wrap' },
   aiPill: {
     flexDirection: 'row',
     alignItems: 'center',

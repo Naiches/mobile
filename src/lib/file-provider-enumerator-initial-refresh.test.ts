@@ -1,7 +1,7 @@
 // @ts-nocheck — bun runs this; guards native File Provider behavior.
 import { describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -54,10 +54,25 @@ struct CachedItem {
   let id: String
   let parentId: String?
   let nameDecrypted: String?
+  // The real rule lives in FileProviderItem.swift (covered by the extension behaviour harness).
+  var isHiddenBackupManifest: Bool { false }
+}
+
+// The enumerator also uses these (Trash folder, authentication record); the full behaviour is
+// covered by file-provider-extension-behaviour.test.ts.
+enum FilesTrash {
+  static func isTrashNamespace(_ id: String) -> Bool { id == "io.beebeeb.trash" || id.hasPrefix("trash:") }
+}
+enum FileProviderAuthRequirement {
+  static func record() {}
+}
+extension CachedItem {
+  static func trashContainer() -> CachedItem { CachedItem(id: "io.beebeeb.trash", parentId: nil, nameDecrypted: "Beebeeb Trash") }
 }
 
 final class CacheManager {
   static let shared = CacheManager()
+  func item(id: String) -> CachedItem? { nil }
   func children(parent: String?) -> [CachedItem] { [] }
   func syncState(key: String) -> String? { nil }
   func materializedContainerIds() -> [String] { [] }
@@ -282,7 +297,7 @@ struct Main {
     let listing = RecordingObserver()
     enumerator.enumerateItems(for: listing, startingAt: NSFileProviderPage(Data()))
     assert(listing.wait(seconds: 0.1), "rebuilt populated listing blocked")
-    assert(listing.snapshot.counts == [1], "rebuild missed cached row")
+    assert(listing.snapshot.counts == [2], "rebuild missed cached row")
     enumerator.invalidate()
   }
 
@@ -343,7 +358,8 @@ struct Main {
     makeEnumerator(cache: cache, refresher: refresher).enumerateItems(for: observer, startingAt: NSFileProviderPage(Data()))
     assert(observer.wait(seconds: 2), "populated first mount did not finish")
     let snapshot = observer.snapshot
-    assert(snapshot.counts == [1], "populated first mount counts \(snapshot.counts)")
+    // The root listing also carries the read-only Trash folder.
+    assert(snapshot.counts == [2], "populated first mount counts \(snapshot.counts)")
     assert(snapshot.error == nil, "populated first mount unexpected error")
     assert(refresher.callCount == 1, "populated first mount refresh count \(refresher.callCount)")
   }
@@ -355,7 +371,7 @@ struct Main {
     makeEnumerator(cache: cache, refresher: refresher).enumerateItems(for: observer, startingAt: NSFileProviderPage(Data()))
     assert(observer.wait(seconds: 2), "true empty folder did not finish")
     let snapshot = observer.snapshot
-    assert(snapshot.counts == [0], "true empty folder counts \(snapshot.counts)")
+    assert(snapshot.counts == [1], "true empty folder counts \(snapshot.counts)")
     assert(snapshot.error == nil, "true empty folder unexpected error")
   }
 
@@ -371,7 +387,7 @@ struct Main {
     makeEnumerator(cache: cache, refresher: refresher).enumerateItems(for: observer, startingAt: NSFileProviderPage(Data()))
     assert(observer.wait(seconds: 0.05), "known empty folder waited for refresh")
     let snapshot = observer.snapshot
-    assert(snapshot.counts == [0], "known empty folder counts \(snapshot.counts)")
+    assert(snapshot.counts == [1], "known empty folder counts \(snapshot.counts)")
     assert(snapshot.error == nil, "known empty folder unexpected error")
     try? await Task.sleep(nanoseconds: 350_000_000)
     assert(refresher.callCount == 1, "known empty folder refresh count \(refresher.callCount)")
@@ -424,6 +440,7 @@ struct Main {
 describe('iOS File Provider initial enumeration refresh', () => {
   nativeSwiftHarnessTest('actual Swift enumerator handles first-mount populated, true-empty, failed refresh, and cancel paths', () => {
     const dir = mkdtempSync(join(tmpdir(), 'beebeeb-file-provider-enumerator-'));
+    try {
     const harness = join(dir, 'Harness.swift');
     const binary = join(dir, 'Harness');
     const outputPath = join(dir, 'output.log');
@@ -439,6 +456,9 @@ describe('iOS File Provider initial enumeration refresh', () => {
     execFileSync('/bin/sh', ['-c', '"$1" > "$2" 2>&1', 'enumerator-harness', binary, outputPath], { timeout: 30_000 });
     const output = readFileSync(outputPath, 'utf8');
     expect(output).toContain('swift-enumerator-harness: 11 pass');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 15_000);
 
   // Task 1722 round 4 (review round 2, minor 6): iOS never lists a materialized folder again and
@@ -502,7 +522,7 @@ struct WorkingSetMain {
     _ = cache.noteContainerMaterialized("F")
     let ws = workingSet(cache)
     let listed = list(ws)
-    check(listed.ids == ["F", "c1", "c2", "readme"], "working set: root rows + the materialized folder's children, got \(listed.ids)")
+    check(listed.ids == ["F", "c1", "c2", "io.beebeeb.trash", "readme"], "working set: root rows + the materialized folder's children, got \(listed.ids)")
 
     // W2. The working set anchor follows the materialized folders, and only them.
     let base = anchor(ws)
@@ -561,6 +581,7 @@ struct WorkingSetMain {
 }
 `;
     const dir = mkdtempSync(join(tmpdir(), 'beebeeb-file-provider-working-set-'));
+    try {
     const harness = join(dir, 'Harness.swift');
     const binary = join(dir, 'Harness');
     const outputPath = join(dir, 'output.log');
@@ -580,6 +601,9 @@ struct WorkingSetMain {
     console.log(output);
     expect(output).not.toContain('FAIL:');
     expect(output).toContain('working-set-harness: 17 checks passed, 0 failed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 60_000);
 
   test('an empty cached listing branches on typed refresh outcome before finishing', () => {
@@ -596,14 +620,15 @@ struct WorkingSetMain {
     expect(switchOutcome).toBeGreaterThan(refresh);
 
     const success = body.indexOf('case .success:', switchOutcome);
-    const reread = body.indexOf('cache.children(parent: parent)', success);
+    const reread = body.indexOf('visibleChildren(parent: parent)', success);
     const finish = body.indexOf('observer.finishEnumerating(upTo: nil)', reread);
     expect(success).toBeGreaterThan(switchOutcome);
     expect(reread).toBeGreaterThan(success);
     expect(finish).toBeGreaterThan(reread);
 
-    const failure = body.indexOf('case .notAuthenticated, .serverUnreachable:', switchOutcome);
+    const failure = body.indexOf('case .notAuthenticated:', switchOutcome);
     const finishError = body.indexOf('observer.finishEnumeratingWithError(outcome.fileProviderError)', failure);
+    expect(body.indexOf('case .serverUnreachable:', finishError)).toBeGreaterThan(finishError);
     expect(failure).toBeGreaterThan(switchOutcome);
     expect(finishError).toBeGreaterThan(failure);
   });
@@ -620,13 +645,16 @@ struct WorkingSetMain {
 
     // Task 1722 round 4: a folder's known-empty listing still vends nothing; the working set adds
     // the children of materialized folders (deliveredRows), so the call is no longer a literal [].
-    const enumerateEmpty = body.indexOf('observer.didEnumerate(delivered.map', knownEmpty);
+    const enumerateEmpty = body.indexOf('observer.didEnumerate(deliveredItems(delivered))', knownEmpty);
     const finishEmpty = body.indexOf('observer.finishEnumerating(upTo: nil)', enumerateEmpty);
     expect(enumerateEmpty).toBeGreaterThan(knownEmpty);
     expect(finishEmpty).toBeGreaterThan(enumerateEmpty);
 
-    const backgroundRefresh = body.indexOf('Task.detached', finishEmpty);
+    // The refresh outlives the enumerator (invalidate() must not cancel it), so it runs in the
+    // coalescing startBackgroundRefresh, not in the cancellable refreshTask.
+    const backgroundRefresh = body.indexOf('startBackgroundRefresh()', finishEmpty);
     expect(backgroundRefresh).toBeGreaterThan(finishEmpty);
+    expect(src).toContain('Task.detached { [refresher] in');
   });
 
   test('extension refresh maps auth and transport failures to File Provider outcomes', () => {

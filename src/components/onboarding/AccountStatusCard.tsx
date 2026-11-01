@@ -11,7 +11,7 @@
  * the allowance, trial and trial-ended screens for tappable purchase elements.
  */
 import React, { useMemo } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { fonts, radii, spacing } from '../../theme';
 import { useTheme } from '../../lib/theme-context';
@@ -20,6 +20,8 @@ import type { OnboardingDocument } from '../../lib/onboarding/types';
 
 export function AccountStatusCard({ doc }: { doc: OnboardingDocument }) {
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const summary: AccountSummary | null = useMemo(() => {
     try {
       return summarizeAccount(doc);
@@ -37,16 +39,16 @@ export function AccountStatusCard({ doc }: { doc: OnboardingDocument }) {
         line: { fontSize: 13, color: c.ink2, lineHeight: 19 },
         barTrack: { height: 6, borderRadius: 3, backgroundColor: c.line, overflow: 'hidden' },
         barFill: { height: 6, borderRadius: 3, backgroundColor: c.amber },
-        usageRow: { flexDirection: 'row', justifyContent: 'space-between' },
+        usageRow: { flexDirection: accessibilityLayout ? 'column' : 'row', justifyContent: 'space-between', gap: accessibilityLayout ? 4 : 0 },
         mono: { fontSize: 11, color: c.ink3, fontFamily: fonts.mono },
         note: { fontSize: 12, color: c.ink3, lineHeight: 17 },
         rows: { borderTopWidth: 1, borderTopColor: c.line, marginTop: spacing.xs, paddingTop: spacing.sm, gap: 6 },
-        row: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md },
-        rowLabel: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+        row: { flexDirection: accessibilityLayout ? 'column' : 'row', alignItems: accessibilityLayout ? 'flex-start' : 'center', justifyContent: 'space-between', gap: accessibilityLayout ? 4 : spacing.md },
+        rowLabel: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 8 },
         rowLabelText: { fontSize: 13, color: c.ink },
         rowDetail: { fontSize: 12, color: c.ink3 },
       }),
-    [c],
+    [accessibilityLayout, c],
   );
   if (!summary) return null;
 

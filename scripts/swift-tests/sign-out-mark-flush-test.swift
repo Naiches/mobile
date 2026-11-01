@@ -242,7 +242,6 @@ do {
 let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-r3-\(UUID().uuidString)", isDirectory: true)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 
 func open(_ path: String) -> OpaquePointer {
   var db: OpaquePointer?
@@ -360,11 +359,14 @@ do {
 
 // MARK: - Report
 
+let exitCode: Int32
 if failures.isEmpty {
   print("SignOutMarkFlushTests: \(total) assertions, 0 failed")
-  exit(0)
+  exitCode = 0
 } else {
   for f in failures { print("FAIL: \(f)") }
   print("SignOutMarkFlushTests: \(failures.count) of \(total) assertions FAILED")
-  exit(1)
+  exitCode = 1
 }
+try? fm.removeItem(at: root)
+exit(exitCode)

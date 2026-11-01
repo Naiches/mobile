@@ -13,6 +13,7 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import * as XLSX from '@e965/xlsx';
@@ -51,6 +52,7 @@ interface XlsxRendererProps {
    */
   topInset?: number;
   bottomInset?: number;
+  onScrollOffsetChange?: (offset: number) => void;
 }
 
 const COL_WIDTH = 140;
@@ -83,7 +85,12 @@ function parseSpreadsheet(arrayBuffer: ArrayBuffer): SpreadsheetData {
   return { sheetName, sheetNames, rows: padded, columnCount };
 }
 
-export function XlsxRenderer({ data, colors: c, topInset = 0, bottomInset = 0 }: XlsxRendererProps) {
+export function XlsxRenderer({ data, colors: c, topInset = 0, bottomInset = 0, onScrollOffsetChange }: XlsxRendererProps) {
+  const { fontScale } = useWindowDimensions();
+  const layoutScale = Math.max(1, fontScale);
+  const largeText = fontScale >= 1.35;
+  const columnWidth = COL_WIDTH * layoutScale;
+  const rowMinHeight = ROW_HEIGHT * layoutScale;
   const parsed = useMemo(() => {
     try {
       return parseSpreadsheet(data);
@@ -126,7 +133,7 @@ export function XlsxRenderer({ data, colors: c, topInset = 0, bottomInset = 0 }:
     );
   }
 
-  const totalWidth = Math.max(COL_WIDTH * columnCount, 1);
+  const totalWidth = Math.max(columnWidth * columnCount, 1);
 
   const renderRow = ({ item, index }: { item: string[]; index: number }) => {
     const stripe = index % 2 === 0;
@@ -137,6 +144,7 @@ export function XlsxRenderer({ data, colors: c, topInset = 0, bottomInset = 0 }:
           {
             backgroundColor: stripe ? c.paper : c.paper2,
             width: totalWidth,
+            minHeight: rowMinHeight,
             borderBottomColor: c.line,
           },
         ]}
@@ -144,11 +152,11 @@ export function XlsxRenderer({ data, colors: c, topInset = 0, bottomInset = 0 }:
         {Array.from({ length: columnCount }).map((_, ci) => (
           <View
             key={ci}
-            style={[styles.sheetCell, { width: COL_WIDTH, borderRightColor: c.line }]}
+            style={[styles.sheetCell, { width: columnWidth, borderRightColor: c.line }]}
           >
             <Text
               style={[styles.sheetCellText, { color: c.ink }]}
-              numberOfLines={1}
+              numberOfLines={largeText ? undefined : 1}
               ellipsizeMode="tail"
             >
               {item[ci] ?? ''}
@@ -163,7 +171,10 @@ export function XlsxRenderer({ data, colors: c, topInset = 0, bottomInset = 0 }:
     <View style={[styles.sheetContainer, { backgroundColor: c.paper, paddingTop: topInset }]}>
       {sheetNames.length > 1 ? (
         <View style={[styles.sheetTabs, { borderBottomColor: c.line }]}>
-          <Text style={[styles.sheetTabsText, { color: c.ink3 }]} numberOfLines={1}>
+          <Text
+            style={[styles.sheetTabsText, { color: c.ink3 }]}
+            numberOfLines={largeText ? undefined : 1}
+          >
             Showing: {sheetName}  ·  {sheetNames.length} sheets in file
           </Text>
         </View>
@@ -183,17 +194,18 @@ export function XlsxRenderer({ data, colors: c, topInset = 0, bottomInset = 0 }:
                 backgroundColor: c.paper2,
                 borderBottomColor: c.line,
                 width: totalWidth,
+                minHeight: rowMinHeight,
               },
             ]}
           >
             {Array.from({ length: columnCount }).map((_, ci) => (
               <View
                 key={ci}
-                style={[styles.sheetCell, { width: COL_WIDTH, borderRightColor: c.line }]}
+                style={[styles.sheetCell, { width: columnWidth, borderRightColor: c.line }]}
               >
                 <Text
                   style={[styles.sheetHeaderText, { color: c.ink }]}
-                  numberOfLines={1}
+                  numberOfLines={largeText ? undefined : 1}
                   ellipsizeMode="tail"
                 >
                   {headerRow[ci] ?? ''}
@@ -206,14 +218,16 @@ export function XlsxRenderer({ data, colors: c, topInset = 0, bottomInset = 0 }:
             data={bodyRows}
             keyExtractor={(_, i) => `row-${i}`}
             renderItem={renderRow}
-            getItemLayout={(_, index) => ({
-              length: ROW_HEIGHT,
-              offset: ROW_HEIGHT * index,
+            getItemLayout={largeText ? undefined : (_, index) => ({
+              length: rowMinHeight,
+              offset: rowMinHeight * index,
               index,
             })}
             initialNumToRender={30}
             windowSize={11}
             removeClippedSubviews
+            scrollEventThrottle={16}
+            onScroll={(event) => onScrollOffsetChange?.(event.nativeEvent.contentOffset.y)}
             contentContainerStyle={bottomInset ? { paddingBottom: bottomInset } : undefined}
           />
         </View>
@@ -248,7 +262,7 @@ const styles = StyleSheet.create({
   },
   sheetRow: {
     flexDirection: 'row',
-    height: ROW_HEIGHT,
+    minHeight: ROW_HEIGHT,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   sheetHeaderRow: {
@@ -256,6 +270,7 @@ const styles = StyleSheet.create({
   },
   sheetCell: {
     paddingHorizontal: 8,
+    paddingVertical: 8,
     justifyContent: 'center',
     borderRightWidth: StyleSheet.hairlineWidth,
   },

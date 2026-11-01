@@ -83,6 +83,7 @@ defineMock('react-native', () => ({
   Easing: new Proxy({}, { get: () => () => () => 0 }),
   Alert: { alert() {} },
   Dimensions: { get: () => ({ width: SCREEN_WIDTH, height: 844, scale: 3, fontScale: 1 }), addEventListener: () => ({ remove() {} }) },
+  useWindowDimensions: () => ({ width: SCREEN_WIDTH, height: 844, scale: 3, fontScale: 1 }),
   Platform: { OS: 'ios', select: (o: any) => o.ios ?? o.default },
   AccessibilityInfo: {
     isReduceMotionEnabled: () => Promise.resolve(false),
@@ -107,6 +108,7 @@ const themeValue = { colors, resolved: 'dark' };
 defineMock('../lib/theme-context', () => ({ useTheme: () => themeValue }));
 const toastValue = { showToast() {} };
 defineMock('../lib/toast-context', () => ({ useToast: () => toastValue }));
+defineMock('../lib/use-duplicate-file', () => ({ useDuplicateFile: () => ({ duplicate: () => {}, progressSheet: null }) }));
 const cryptoValue = { isUnlocked: true, getFileKeyBytes: async () => new Uint8Array(32), getMasterKeyHandleId: () => 1 };
 defineMock('../lib/crypto-context', () => ({ useCrypto: () => cryptoValue }));
 defineMock('../lib/api', () => ({

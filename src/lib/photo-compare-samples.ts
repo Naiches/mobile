@@ -23,18 +23,26 @@
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
-import { encodePhotoPreviewSample, originalPhotoForCompare } from '../../modules/beebeeb-crypto';
+import {
+  encodePhotoPreviewSample,
+  encodePhotoPreviewSampleFromSource,
+  originalPhotoForCompare,
+  originalPhotoForCompareFromSource,
+} from '../../modules/beebeeb-crypto';
 import {
   PlaintextGateClosedError,
   withPlaintextLease,
   type PlaintextLease,
 } from './plaintext-gate';
+import { sourcePathFromUri, type ComparePhotoSource } from './photo-preview-source';
+import { PreviewTimeoutError, withPreviewTimeout } from './photo-preview-timeout';
 
 export type CompareSample = { path: string; bytes: number; width: number; height: number };
 export type CompareOriginal = { path: string; width: number; height: number; originalBytes?: number };
 export type CompareSampleFormat = 'heic' | 'jpeg';
 
 const SAMPLES_DIR_MARK = '/beebeeb-previews-v1/samples/';
+export const COMPARE_SAMPLE_TIMEOUT_MS = 8_000;
 
 /** Only ever deletes inside the Caches samples folder — never an arbitrary path. */
 async function discardSample(path: string): Promise<void> {
@@ -61,20 +69,66 @@ async function encodeUnderLease<T extends { path: string }>(
   return result;
 }
 
+function normalizeSource(source: string | ComparePhotoSource): ComparePhotoSource {
+  return typeof source === 'string' ? { localIdentifier: source } : source;
+}
+
+function boundSample<T extends { path: string }>(work: Promise<T>, operation: string, timeoutMs: number): Promise<T> {
+  return withPreviewTimeout(work, timeoutMs, operation).catch((error) => {
+    if (error instanceof PreviewTimeoutError) {
+      // The lease remains held until native settles. If it writes after the UI
+      // timed out, remove that now-unreferenced plaintext copy immediately.
+      void work.then((result) => discardSample(result.path), () => {});
+    }
+    throw error;
+  });
+}
+
 /** A preview sample (plaintext, Caches only) for the compare view. */
 export function encodePreviewSample(
-  localIdentifier: string,
+  sourceInput: string | ComparePhotoSource,
   format: CompareSampleFormat,
   px: number,
+  timeoutMs = COMPARE_SAMPLE_TIMEOUT_MS,
 ): Promise<CompareSample> {
-  return withPlaintextLease('photo compare sample', (lease) =>
-    encodeUnderLease(lease, () => encodePhotoPreviewSample(localIdentifier, format, px)),
+  const source = normalizeSource(sourceInput);
+  const sourcePath = sourcePathFromUri(source.sourceUri);
+  const work = withPlaintextLease('photo compare sample', (lease) =>
+    encodeUnderLease(lease, async () => {
+      if (sourcePath) {
+        try {
+          return await encodePhotoPreviewSampleFromSource(sourcePath, format, px);
+        } catch (error) {
+          if (!source.localIdentifier) throw error;
+        }
+      }
+      if (!source.localIdentifier) throw new Error('No readable photo source');
+      return encodePhotoPreviewSample(source.localIdentifier, format, px);
+    }),
   );
+  return boundSample(work, 'Photo preview sample', timeoutMs);
 }
 
 /** The downsampled original (plaintext, Caches only) the previews are judged against. */
-export function originalForCompare(localIdentifier: string, maxPx: number): Promise<CompareOriginal> {
-  return withPlaintextLease('photo compare original', (lease) =>
-    encodeUnderLease(lease, () => originalPhotoForCompare(localIdentifier, maxPx)),
+export function originalForCompare(
+  sourceInput: string | ComparePhotoSource,
+  maxPx: number,
+  timeoutMs = COMPARE_SAMPLE_TIMEOUT_MS,
+): Promise<CompareOriginal> {
+  const source = normalizeSource(sourceInput);
+  const sourcePath = sourcePathFromUri(source.sourceUri);
+  const work = withPlaintextLease('photo compare original', (lease) =>
+    encodeUnderLease(lease, async () => {
+      if (sourcePath) {
+        try {
+          return await originalPhotoForCompareFromSource(sourcePath, maxPx);
+        } catch (error) {
+          if (!source.localIdentifier) throw error;
+        }
+      }
+      if (!source.localIdentifier) throw new Error('No readable photo source');
+      return originalPhotoForCompare(source.localIdentifier, maxPx);
+    }),
   );
+  return boundSample(work, 'Original photo sample', timeoutMs);
 }

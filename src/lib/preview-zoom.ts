@@ -49,6 +49,55 @@ export function clampZoomScale(scale: number): number {
   return Math.min(MAX_ZOOM_SCALE, Math.max(MIN_ZOOM_SCALE, scale));
 }
 
+/**
+ * UIScrollView may emit a content-offset event without `zoomScale` while
+ * `zoomToRect:` animates. That event must preserve the programmatic target,
+ * not incorrectly announce that the image snapped back to fit.
+ */
+export function resolveZoomScale(
+  reportedScale: number | null | undefined,
+  currentScale: number,
+): number {
+  return clampZoomScale(typeof reportedScale === 'number' ? reportedScale : currentScale);
+}
+
+export interface ProgrammaticZoomResolution {
+  scale: number;
+  pendingScale: number | null;
+}
+
+/**
+ * `zoomToRect:` is asynchronous. On iOS its first scroll callback can still
+ * carry the scale from before the double-tap (1x while zooming in, or a
+ * zoomed value while returning to fit). Keep publishing the requested scale
+ * until native UIScrollView reports a value on the same side of the 1x
+ * boundary; after that, native pinch/animation values are authoritative.
+ */
+export function resolveProgrammaticZoomScale(
+  reportedScale: number | null | undefined,
+  currentScale: number,
+  pendingScale: number | null,
+): ProgrammaticZoomResolution {
+  if (pendingScale === null) {
+    return {
+      scale: resolveZoomScale(reportedScale, currentScale),
+      pendingScale: null,
+    };
+  }
+
+  const target = clampZoomScale(pendingScale);
+  if (typeof reportedScale !== 'number') {
+    return { scale: target, pendingScale: target };
+  }
+
+  const reported = clampZoomScale(reportedScale);
+  if (isZoomed(reported) !== isZoomed(target)) {
+    return { scale: target, pendingScale: target };
+  }
+
+  return { scale: reported, pendingScale: null };
+}
+
 export function isZoomed(scale: number): boolean {
   return clampZoomScale(scale) > MIN_ZOOM_SCALE + ZOOMED_EPSILON;
 }

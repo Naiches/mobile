@@ -58,6 +58,7 @@ import {
   getCalendarBackupStatus,
   resetContactsBackup,
   resetCalendarBackup,
+  wakePhotoBackupDrain,
 } from '../../modules/beebeeb-crypto';
 import { encryptedMetadataToJson, encryptedMetadataPayloadToBytes, fileMetadataPlaintext } from '../lib/encrypted-metadata';
 import { encryptedUpload, generateFileId } from '../lib/encrypted-upload';
@@ -74,6 +75,13 @@ import {
 import { loadNameCache, pruneNameCache } from '../lib/name-cache';
 import { getDeviceId } from '../lib/device-identity';
 import { BACKUP_FOLDER_CACHE_KEY } from '../lib/backup-folder-cache';
+import {
+  removeFromFileProviderCache,
+  setFileProviderProtectedBackupsRoot,
+  syncDecryptedEntriesToFileProvider,
+} from '../lib/file-provider-mount';
+import { getProtectedBackupsRootId, setProtectedBackupsRootId } from '../lib/protected-folders';
+import { DEVICE_MANIFEST_NAME } from '../lib/hidden-system-files';
 // Task 1594: stop (never fork the tree) when this key can't read the names.
 import { VaultKeyMismatchError } from './vault-key-mismatch';
 
@@ -188,7 +196,7 @@ export const LEGACY_MIGRATION_DONE_KEY = 'beebeeb_backup_legacy_migration';
 const LEGACY_PHOTOS_FOLDER_ID_KEY = 'beebeeb_photos_folder_id';
 /** The plaintext names the pre-category backup code wrote at the vault root. */
 const LEGACY_ROOT_NAMES = { photosFolder: 'Photos', contacts: 'contacts.vcf', calendar: 'calendar.ics' } as const;
-const MANIFEST_FILENAME = '.device.json';
+const MANIFEST_FILENAME = DEVICE_MANIFEST_NAME;
 const MANIFEST_VERSION = 1;
 const FALLBACK_CHUNK_SIZE = 4 * 1024 * 1024;
 const NONCE_LENGTH = 12;
@@ -539,7 +547,14 @@ async function ensureFolder(parentId: string | undefined, name: string): Promise
     const nameEncrypted = await encryptFolderName(folderId, name);
     // Task SF-0001 (2275 L13/A8): `createFolder` aborts when the answer names
     // another folder — nothing is ever written into an id we did not mint.
-    await createFolder(nameEncrypted, parentId, folderId);
+    const created = await createFolder(nameEncrypted, parentId, folderId);
+    // The app knows this name; hand it to the Files app cache with the row, so it never lists
+    // the new folder as "Encrypted item" while it waits for the extension to decrypt it.
+    void syncDecryptedEntriesToFileProvider(
+      [{ ...created, id: folderId, parent_id: created.parent_id ?? parentId ?? null, is_folder: true, name_encrypted: created.name_encrypted ?? nameEncrypted }],
+      { [folderId]: name },
+      parentId ?? null,
+    ).catch(() => {});
     return folderId;
   })();
 
@@ -868,6 +883,7 @@ async function mergeSameNamedChildFolders(
         try {
           const result = await trashFiles([dup.id]);
           if (result.trashed.includes(dup.id) || result.already_trashed.includes(dup.id)) {
+            void removeFromFileProviderCache([dup.id]);
             trashed += 1;
           } else {
             deferred += 1;
@@ -998,6 +1014,45 @@ export function resetReconcileThrottleForTests(): void {
  *  tree from scratch (used when the whole Backups root is gone). */
 async function clearFolderCache(epoch: AccountEpoch): Promise<void> {
   await writeFolderCache({}, epoch);
+  // The cached root is gone; ensureBackupFolders publishes the recreated one.
+  if (isCurrentAccountEpoch(epoch)) publishBackupsRoot(null);
+}
+
+/**
+ * The root "Backups" folder is a protected system folder (see lib/protected-folders): remember
+ * its id for the app's screens and publish it to the Files app extension.
+ */
+function publishBackupsRoot(rootId: string | null): void {
+  setProtectedBackupsRootId(rootId);
+  void setFileProviderProtectedBackupsRoot(rootId);
+}
+
+const PROTECTED_ROOT_VERIFY_INTERVAL_MS = 10 * 60 * 1000;
+let protectedRootVerifiedAt = 0;
+
+/**
+ * Make the protected root known without creating anything: from the persisted folder cache at
+ * once, then confirmed by the same find logic ensureFolder uses (so a new device, or a root
+ * recreated elsewhere, is covered). With the vault locked, offline, or on a key mismatch the
+ * last known id stays. Returns the id, or null when the account has no Backups folder.
+ */
+export async function resolveProtectedBackupsRoot(): Promise<string | null> {
+  const epoch = accountEpoch();
+  const cachedRootId = (await readFolderCache()).rootId ?? null;
+  if (!isCurrentAccountEpoch(epoch)) return null;
+  if (cachedRootId) publishBackupsRoot(cachedRootId);
+  if (!_encryption) return getProtectedBackupsRootId();
+  // The find walks and decrypts the root's folders; a cached id confirmed a moment ago is enough.
+  if (cachedRootId && Date.now() - protectedRootVerifiedAt < PROTECTED_ROOT_VERIFY_INTERVAL_MS) return cachedRootId;
+  try {
+    const found = await findChildFolder(undefined, ROOT_FOLDER_NAME);
+    if (!isCurrentAccountEpoch(epoch)) return null;
+    publishBackupsRoot(found?.id ?? null);
+    protectedRootVerifiedAt = Date.now();
+    return found?.id ?? null;
+  } catch {
+    return getProtectedBackupsRootId();
+  }
 }
 
 /** 0818 — if any deleted id is a cached backup folder (root/device/category),
@@ -1116,19 +1171,22 @@ export async function reconcileDerivedStateAgainstServer(): Promise<void> {
       live();
       _lastReconcile = { epoch, at: Date.now() };
 
-      // Hash short-circuit: nothing changed since the last reconcile → no-op.
-      if (!resp.files || !resp.hash || resp.hash === lastHash) {
+      if (!resp.files || !resp.hash) {
         return;
       }
 
       const indexIds = new Set(resp.files.map((f) => f.id));
+      if (resp.hash === lastHash) return;
 
       // --- Backup manifest (camera roll) -------------------------------------
       const cache = await readFolderCache();
       live();
-      const rootGone = cache.rootId != null && !indexIds.has(cache.rootId);
       const uploadedRemote = await getAllUploadedRemoteIds();
       live();
+      // Production's index excludes Trash, which is exactly the backup
+      // contract: a trashed copy does not count and the local photo must be
+      // requeued while the old Trash copy is left alone.
+      const rootGone = cache.rootId != null && !indexIds.has(cache.rootId);
       const backupOrphans = rootGone
         ? [...uploadedRemote]
         : [...uploadedRemote].filter((id) => !indexIds.has(id));
@@ -1139,10 +1197,19 @@ export async function reconcileDerivedStateAgainstServer(): Promise<void> {
         // re-uploads them) and drop the stale folder cache so the tree rebuilds.
         const requeued = await resetUploadedState(undefined, writeTicket);
         live();
+        if (requeued > 0) {
+          await wakePhotoBackupDrain().catch(() => {});
+          live();
+        }
         await clearFolderCache(epoch);
         console.info(`[BackupService] reconcile: Backups root gone — re-queued ${requeued} asset(s), cleared folder cache`);
       } else if (backupOrphans.length > 0) {
         const requeued = await resetUploadedState(backupOrphans, writeTicket);
+        live();
+        if (requeued > 0) {
+          await wakePhotoBackupDrain().catch(() => {});
+          live();
+        }
         console.info(`[BackupService] reconcile: re-queued ${requeued} orphaned backup asset(s)`);
       }
 
@@ -1261,6 +1328,7 @@ export async function ensureBackupFolders(
   // not stop the folder resolve.
   const info = { device_name: deviceName() };
   const rootId = await ensureFolder(undefined, ROOT_FOLDER_NAME);
+  if (isCurrentAccountEpoch(epoch)) publishBackupsRoot(rootId);
   const deviceFolderId = await ensureFolder(rootId, info.device_name);
 
   const categoryFolderName = CATEGORY_FOLDERS[category];
@@ -1289,6 +1357,23 @@ export async function ensureBackupFolders(
   }, epoch);
 
   return { deviceFolderId, categoryFolderId };
+}
+
+/**
+ * The `Backups › <appName>` folder for files an app exports to Beebeeb (a shared WhatsApp chat).
+ * One per account, not per device: found or created inside the protected Backups root with a
+ * normal folder name. It uses the same find-or-create as the device folders (concurrent callers
+ * share one creation), and a copy another device created at the same moment is merged into the
+ * oldest one before the id is returned, so every device ends with the same single folder.
+ */
+export async function ensureAppBackupFolder(appName: string): Promise<string> {
+  const epoch = accountEpoch();
+  await flattenDuplicateBackupFolders();
+  const rootId = await ensureFolder(undefined, ROOT_FOLDER_NAME);
+  if (isCurrentAccountEpoch(epoch)) publishBackupsRoot(rootId);
+  const folderId = await ensureFolder(rootId, appName);
+  const merged = await mergeSameNamedChildFolders(rootId, appName);
+  return merged.survivors[0]?.id ?? folderId;
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1426,9 @@ async function findManifestFile(deviceFolderId: string): Promise<FileEntry | nul
   return match ?? null;
 }
 
+// Old and broken manifest copies go to Trash with `deleteFile`: a permanent delete needs a
+// device-owner confirmation token (the user's Face ID / passcode), which a background cleanup cannot
+// ask for. They are hidden everywhere (lib/hidden-system-files) and "Empty Trash" purges them.
 async function cleanupBrokenManifestCopies(deviceFolderId: string): Promise<void> {
   let children: FileEntry[];
   try {
@@ -1358,6 +1446,7 @@ async function cleanupBrokenManifestCopies(deviceFolderId: string): Promise<void
 
     try {
       await deleteFile(f.id);
+      void removeFromFileProviderCache([f.id]);
     } catch (err) {
       console.warn('[BackupService] could not remove broken manifest copy:', err);
     }
@@ -1440,6 +1529,7 @@ async function writeManifest(manifest: DeviceManifest, deviceFolderId: string): 
   const existing = await findManifestFile(deviceFolderId);
   if (existing) {
     await deleteFile(existing.id);
+    void removeFromFileProviderCache([existing.id]);
   }
 
   const fileId = await generateFileId();

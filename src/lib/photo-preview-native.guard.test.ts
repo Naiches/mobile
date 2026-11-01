@@ -237,11 +237,24 @@ describe('compare samples are written under a plaintext lease', () => {
   });
 
   test('both native sample writers still write only inside the Caches samples folder', () => {
-    for (const name of ['encodePhotoPreviewSample', 'originalPhotoForCompare']) {
+    for (const name of [
+      'encodePhotoPreviewSample',
+      'encodePhotoPreviewSampleFromSource',
+      'originalPhotoForCompare',
+      'originalPhotoForCompareFromSource',
+    ]) {
       const b = body(name);
       expect(b).toContain('photoPreviewSamplesDirectory()');
       expect(b).toContain('options: .atomic');
       expect(b).not.toContain('NSTemporaryDirectory');
+    }
+  });
+
+  test('picker-file writers read the picker copy instead of requiring PhotoKit lookup', () => {
+    for (const name of ['encodePhotoPreviewSampleFromSource', 'originalPhotoForCompareFromSource']) {
+      const b = body(name);
+      expect(b).toContain('photoPreviewFileImageSource(sourcePath: sourcePath)');
+      expect(b).not.toContain('photoPreviewImageSource(localIdentifier:');
     }
   });
 });

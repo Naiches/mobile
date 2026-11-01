@@ -20,7 +20,6 @@ export function BBWordmark({ size = 22, color, style }: BBWordmarkProps) {
   const inkColor = color ?? colors.ink
   return (
     <Text
-      allowFontScaling={false}
       style={[
         {
           fontSize: size,

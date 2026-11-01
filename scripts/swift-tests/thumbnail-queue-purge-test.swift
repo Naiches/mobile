@@ -4,18 +4,30 @@ import Foundation
 // shipped `ThumbnailQueueDB` plus `PlaintextStorageProtection.removeItem`
 // (the purge's preserving semantics). No simulator, no app process.
 
+let fm = FileManager.default
+var tempDirs: [URL] = []
+
+func cleanupTempDirs() {
+    for dir in tempDirs { try? fm.removeItem(at: dir) }
+}
+
+defer { cleanupTempDirs() }
+
 var assertions = 0
 func check(_ condition: @autoclosure () -> Bool, _ name: String) {
-    guard condition() else { print("FAIL: \(name)"); exit(1) }
+    guard condition() else {
+        print("FAIL: \(name)")
+        cleanupTempDirs()
+        exit(1)
+    }
     assertions += 1
     print("PASS: \(name)")
 }
 
-let fm = FileManager.default
-
 func makeTempDir() -> URL {
     let dir = fm.temporaryDirectory.appendingPathComponent("bb-thumbnail-queue-\(UUID().uuidString)")
     try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    tempDirs.append(dir)
     return dir
 }
 

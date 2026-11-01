@@ -32,6 +32,7 @@ mock.module('react-native', () => ({
   View: (props: unknown) => props,
   Text: (props: unknown) => props,
   ScrollView: (props: unknown) => props,
+  useWindowDimensions: () => ({ fontScale: 1 }),
   StyleSheet: {
     create: (s: unknown) => s,
     absoluteFillObject: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
@@ -40,7 +41,17 @@ mock.module('react-native', () => ({
 }));
 mock.module('../../theme', () => ({ fonts: { mono: 'JetBrainsMono-Regular' } }));
 
-const { computeCodeView, highlightToLines, MAX_PREVIEW_CHARS } = await import('./CodeRenderer');
+const { codeGutterMinWidth, computeCodeView, highlightToLines, MAX_PREVIEW_CHARS } = await import('./CodeRenderer');
+
+describe('codeGutterMinWidth', () => {
+  test('keeps the default-size gutter unchanged', () => {
+    expect(codeGutterMinWidth(4, 1)).toBe(36);
+  });
+
+  test('grows the fixed gutter with Dynamic Type', () => {
+    expect(codeGutterMinWidth(4, 1.6)).toBeCloseTo(57.6);
+  });
+});
 
 describe('CodeRenderer does not depend on react-native-webview', () => {
   test('the component source never imports react-native-webview', () => {

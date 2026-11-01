@@ -140,6 +140,9 @@ interface LoaderDeps {
   classifyLocally?: (fileIds: string[]) => Promise<Map<string, boolean>>;
   now: () => number;
   revalidateMs: number;
+  /** Cache persistence is an optimization. A stuck filesystem bridge must
+   *  not hold a screen open forever before or after the network request. */
+  cacheOperationDeadlineMs?: number;
 }
 
 /** The account epoch plus the cache generation: both must hold. */
@@ -191,6 +194,36 @@ export function mergeWithServerRows(cacheFiles: FileEntry[], byId: Map<string, F
 }
 
 const NO_ACCOUNT: AccountEpoch = { generation: 0, accountId: null };
+const DEFAULT_CACHE_OPERATION_DEADLINE_MS = 1_000;
+const CACHE_OPERATION_TIMED_OUT = Symbol('cache-operation-timed-out');
+
+function settleCacheOperation<T>(
+  operation: Promise<T>,
+  deadlineMs: number,
+): Promise<T | typeof CACHE_OPERATION_TIMED_OUT> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      resolve(CACHE_OPERATION_TIMED_OUT);
+    }, Math.max(0, deadlineMs));
+
+    operation.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 /** A file row with no `is_media` at all: written by the sync write-through,
  *  not by the server (whose /files/index rows always carry the boolean). */
@@ -201,6 +234,21 @@ function isUnclassifiedFile(row: FileEntry): boolean {
 export function createFileIndexLoader(deps: LoaderDeps) {
   let inFlight: InFlight | null = null;
   let last: LastCheck | null = null;
+  const cacheOperationDeadlineMs = deps.cacheOperationDeadlineMs ?? DEFAULT_CACHE_OPERATION_DEADLINE_MS;
+
+  async function loadCacheBestEffort(): Promise<CachedFileIndex | null> {
+    const result = await settleCacheOperation(deps.loadCache(), cacheOperationDeadlineMs);
+    return result === CACHE_OPERATION_TIMED_OUT ? null : result;
+  }
+
+  async function saveCacheBestEffort(
+    hash: string,
+    files: FileEntry[],
+    storedAt: number,
+    scope: FileIndexCacheWriteScope,
+  ): Promise<void> {
+    await settleCacheOperation(deps.saveCache(hash, files, storedAt, scope), cacheOperationDeadlineMs);
+  }
 
   function epochNow(): Epoch {
     return { account: deps.accountEpoch ? deps.accountEpoch() : NO_ACCOUNT, cache: deps.cacheGeneration() };
@@ -279,7 +327,7 @@ export function createFileIndexLoader(deps: LoaderDeps) {
   }
 
   async function revalidate(epoch: Epoch, preloaded: CachedFileIndex | null | undefined): Promise<FileIndexLoadResult> {
-    const cached = preloaded !== undefined ? preloaded : await deps.loadCache();
+    const cached = preloaded !== undefined ? preloaded : await loadCacheBestEffort();
     assertCurrent(epoch);
     const index = await deps.fetchIndex(cached?.hash);
     // Signed out / switched account while the request ran: the answer is the
@@ -314,7 +362,7 @@ export function createFileIndexLoader(deps: LoaderDeps) {
       const storedAt = deps.now();
       // The cache write re-checks the epoch at its turn in the write queue
       // (file-index-cache.ts), so a sign-out during it leaves nothing behind.
-      await deps.saveCache(index.hash, index.files, storedAt, { epoch: epoch.account, generation: epoch.cache });
+      await saveCacheBestEffort(index.hash, index.files, storedAt, { epoch: epoch.account, generation: epoch.cache });
       assertCurrent(epoch);
       last = {
         at: storedAt,
@@ -336,7 +384,7 @@ export function createFileIndexLoader(deps: LoaderDeps) {
     if (joined) return joined;
     const preloaded = usablePreloaded(epoch, options.cached, options.cachedEpoch);
     if (!options.force) {
-      const cached = preloaded !== undefined ? preloaded : await deps.loadCache();
+      const cached = preloaded !== undefined ? preloaded : await loadCacheBestEffort();
       // The account may have changed while the cache was read: this caller's
       // account is gone, so it gets nothing (and nothing is asked of the
       // server on its behalf under the next account's session).

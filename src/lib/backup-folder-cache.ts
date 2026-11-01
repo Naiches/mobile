@@ -14,6 +14,7 @@
  */
 import { Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
+import { setProtectedBackupsRootId } from './protected-folders';
 
 export const BACKUP_FOLDER_CACHE_KEY = 'beebeeb_backup_folders';
 
@@ -29,6 +30,8 @@ export async function clearBackupFolderCacheForSignOut(): Promise<void> {
  * throws.
  */
 export async function clearBackupFolderCacheChecked(): Promise<boolean> {
+  // The protected Backups root id belongs to the account that is leaving.
+  setProtectedBackupsRootId(null);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       if (Platform.OS === 'web') {

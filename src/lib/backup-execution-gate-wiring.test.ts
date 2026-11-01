@@ -275,12 +275,12 @@ describe('5. B6: foreground keeps a user Pause', () => {
     (s) => {
       const b = body(s, '@objc private func handleAppWillEnterForeground() {');
       return (
-        inOrder(b, ['executionGate.setForeground(true)', 'endBackgroundGrace()', 'if isRunning, !isPaused, pendingUploadCount() > 0 {']) &&
+        inOrder(b, ['executionGate.setForeground(true)', 'endBackgroundGrace()', 'if !isPaused, pendingUploadCount() > 0 {']) &&
         !/isPaused\s*=\s*false/.test(b)
       );
     },
     // round 1 (#257): `if isRunning { isPaused = false; wake }`
-    (s) => s.replace('if isRunning, !isPaused, pendingUploadCount() > 0 {', 'if isRunning {\n      isPaused = false'),
+    (s) => s.replace('if !isPaused, pendingUploadCount() > 0 {', 'isPaused = false\n      if pendingUploadCount() > 0 {'),
   );
   guarded(
     'didBecomeActive reopens the gate too',
@@ -349,10 +349,10 @@ describe('7. the drain and the batch stop when the gate closes', () => {
     'the drain loop asks the gate first in every iteration',
     engine,
     (s) => {
-      const b = body(s, 'private func startDrainLoop(reason: String) {');
-      return inOrder(b, ['while let self, self.isRunning, !Task.isCancelled {', 'guard self.executionGate.canStartSQLiteWork else {', 'break', 'if self.isPaused {']);
+      const b = body(s, 'private func runDrainLoop(generation: Int) async {');
+      return inOrder(b, ['while isRunning, !Task.isCancelled {', 'guard executionGate.canStartSQLiteWork else {', 'break', 'if isPaused {']);
     },
-    (s) => s.replace('        guard self.executionGate.canStartSQLiteWork else {\n          self.perfLog("drain.stop", ["reason": "background-time-ended"])\n          break\n        }\n', ''),
+    (s) => s.replace('      guard executionGate.canStartSQLiteWork else {\n        perfLog("drain.stop", ["reason": "background-time-ended"])\n        break\n      }\n', ''),
   );
   guarded(
     'processBatch asks the gate at its start and before the selection',
@@ -450,8 +450,8 @@ describe('9. round 2 (#262 review): a batch across a closure, the relaunch windo
   guarded(
     '#1: the quiesce cancels the drain',
     engine,
-    (s) => body(s, 'private func quiesceSQLiteBeforeBackgroundTimeEnds(reason: String) -> BackupSQLiteQuiesce.Outcome {').includes('if outcome != .foreground { drainTask?.cancel() }'),
-    (s) => s.replace('    if outcome != .foreground { drainTask?.cancel() }\n', ''),
+    (s) => inOrder(body(s, 'private func quiesceSQLiteBeforeBackgroundTimeEnds(reason: String) -> BackupSQLiteQuiesce.Outcome {'), ['if outcome != .foreground {', 'let drainToCancel = _drainTask', 'drainToCancel?.cancel()']),
+    (s) => s.replace('      drainToCancel?.cancel()\n      sleepToCancel?.cancel()\n    }\n    perfLog("quiesce"', '    }\n    perfLog("quiesce"'),
   );
   guarded(
     '#2: the background-session handler quiesces before it hands the events back (last step)',

@@ -1,7 +1,7 @@
 // @ts-nocheck -- native SQLite harness; isolated bun test on macOS.
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const ios = join(import.meta.dir, '../../modules/beebeeb-crypto/ios');
@@ -14,6 +14,7 @@ nativeTest('object-budget failures exhaust automatic retries immediately without
   const method = source.slice(start, end).replaceAll('exsqlite3_', 'sqlite3_');
   const terminalArgument = method.includes('retryLimitReached: Bool') ? ', retryLimitReached: true' : '';
   const dir = mkdtempSync(join(tmpdir(), 'bb-object-budget-'));
+  try {
   writeFileSync(join(dir, 'main.swift'), String.raw`
 import Foundation
 import SQLite3
@@ -50,10 +51,14 @@ Fixture().run()
 `);
   execFileSync('swiftc', ['-module-cache-path', join(dir,'modules'), join(dir,'main.swift'), '-o', join(dir,'budget')], {timeout:60000});
   expect(execFileSync(join(dir,'budget'), [], {encoding:'utf8'})).toContain('5 assertions passed, 0 failed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90000);
 
 nativeTest('only typed 403 object-budget refusals use the file-limit message', () => {
   const dir = mkdtempSync(join(tmpdir(), 'bb-budget-classifier-'));
+  try {
   writeFileSync(join(dir, 'main.swift'), `import Foundation
 let body = Data(#"{"error":"object_budget_exceeded"}"#.utf8)
 precondition(AccountRefusalDetection.isObjectBudgetExceeded(statusCode: 403, body: body))
@@ -63,6 +68,9 @@ precondition(!AccountRefusalDetection.isObjectBudgetExceeded(statusCode: 403, bo
 print("budget classifier: 4 assertions passed, 0 failed")`);
   execFileSync('swiftc', ['-module-cache-path',join(dir,'modules'),join(ios,'AccountRefusalDetection.swift'),join(dir,'main.swift'),'-o',join(dir,'classifier')], {timeout:60000});
   expect(execFileSync(join(dir,'classifier'), [], {encoding:'utf8'})).toContain('4 assertions passed, 0 failed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90000);
 
 test('file-limit pause stops both batch scheduling loops and queued asset admission', () => {
@@ -81,6 +89,7 @@ nativeTest('file-limit reason survives repeated progress/status decisions', () =
   const method = source.slice(start, source.indexOf('  private func makeBackupStatusPayload', start));
   const surface = readFileSync(join(ios, 'BackupSurfaceState.swift'), 'utf8').split('\nextension ServerCheckPause')[0];
   const dir = mkdtempSync(join(tmpdir(), 'bb-budget-surface-'));
+  try {
   writeFileSync(join(dir, 'Surface.swift'), surface);
   writeFileSync(join(dir, 'main.swift'), `import Foundation
 final class Fixture {
@@ -108,4 +117,7 @@ Fixture().run()
 print("file-limit surface: 4 assertions passed, 0 failed")`);
   execFileSync('swiftc', ['-module-cache-path',join(dir,'modules'),join(dir,'Surface.swift'),join(dir,'main.swift'),'-o',join(dir,'surface')], {timeout:60000});
   expect(execFileSync(join(dir,'surface'), [], {encoding:'utf8'})).toContain('4 assertions passed, 0 failed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90000);

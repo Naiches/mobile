@@ -65,6 +65,8 @@ const PREVIEW_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 export interface PreviewDecryptOptions {
   /** Request uploads supply their sealed random content key, not a master-derived key. */
   useProvidedFileKey?: boolean;
+  /** False when the caller needs a completed local file rather than a loopback video stream. */
+  streamVideo?: boolean;
   onProgress?: (event: PreviewLoadProgressEvent) => void;
   onOfflineFallback?: (event: { fileId: string; reason: string }) => void;
   signal?: AbortSignal;
@@ -277,6 +279,7 @@ export async function decryptToTempFile(
           masterKeyHandleId,
           {
             signal,
+            streamVideo: options.streamVideo,
             useProvidedFileKey: options.useProvidedFileKey,
             onProgress: (event) => {
               sharedListeners.get(outputPath)?.forEach((l) => l.onProgress?.(event));
@@ -477,8 +480,21 @@ async function abortActivePreviewStreams(): Promise<void> {
   await Promise.allSettled(entries.map((entry) => cancelActivePreviewStream(entry, true)));
 }
 
+/** True while a caller holds a lease on this preview-cache path (an open preview, a running duplicate). */
+export function isPreviewPathLeased(path: string): boolean {
+  return (previewLeases.get(path) ?? 0) > 0;
+}
+
 function retainPreviewLease(path: string): void {
   previewLeases.set(path, (previewLeases.get(path) ?? 0) + 1);
+}
+
+/** How many preview copies are leased and how many video streams are still decrypting (counts only). */
+export function previewActivity(): { previewOpen: boolean; activeStreams: number } {
+  return {
+    previewOpen: previewLeases.size > 0 || activePreviewStreams.size > 0,
+    activeStreams: activePreviewStreams.size,
+  };
 }
 
 /** Take one more lease on the preview-cache copy of (fileId, extension); give it back with `releasePreviewCopy`. */
@@ -723,7 +739,7 @@ async function decryptToTempFileUnshared(
       // from the master key — streaming would decrypt garbage and the
       // fallback whole-file path would too). Request uploads pass a null
       // handle deliberately — keep them off the stream path.
-      if (isStreamableVideoExtension(ext) && masterKeyHandleId != null) {
+      if (options.streamVideo !== false && isStreamableVideoExtension(ext) && masterKeyHandleId != null) {
         let streamLease: PlaintextLease | null = null;
         let streamAbortController: AbortController | null = null;
         let forwardAbort: (() => void) | null = null;
@@ -764,6 +780,16 @@ async function decryptToTempFileUnshared(
             await FileSystem.deleteAsync(outputPath, { idempotent: true }).catch(() => {});
             recordRuntimeTrace('preview.decrypt.stream.aborted_after_result', { fileId });
             throw abortError();
+          }
+          // The file list can carry a stale chunk count; the chunk endpoint's
+          // count is what the stream uses. Record the difference so a wrong
+          // list value is visible instead of silently trusted.
+          if (typeof chunkCount === 'number' && chunkCount !== started.chunkCount) {
+            recordRuntimeTrace('preview.decrypt.stream.declared_chunk_count_stale', {
+              fileId,
+              declaredChunkCount: chunkCount,
+              actualChunkCount: started.chunkCount,
+            });
           }
           await prunePreviewCache(outputPath);
           if (streamAbortController.signal.aborted) {

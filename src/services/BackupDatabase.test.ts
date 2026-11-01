@@ -106,4 +106,5 @@ describe('BackupDatabase legacy status enum migration', () => {
 
     expect(getBackupDb().rows.get('active-uploading-after-migration')?.status).toBe('uploading');
   });
+
 });

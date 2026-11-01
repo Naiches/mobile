@@ -34,7 +34,7 @@ import {
   unwrapRequestPrivateWithHandle,
 } from '../../modules/beebeeb-crypto'
 import type { BatchNameItem, BatchNameResult, EncryptedData, RequestKeypairResult } from '../../modules/beebeeb-crypto'
-import { setBackupEncryption, getKeepVaultUnlocked } from '../services/BackupService'
+import { setBackupEncryption, getKeepVaultUnlocked, resolveProtectedBackupsRoot } from '../services/BackupService'
 import { recordRuntimeTrace } from './runtime-trace'
 import {
   createRequestKeyResolver,
@@ -119,6 +119,29 @@ export { SIMULATOR_MASTER_KEY_FILE }
  */
 export function usesSoftwareVaultFallback(): boolean {
   return !Device.isDevice || Device.modelName?.toLowerCase().includes('simulator') === true
+}
+
+/**
+ * Whether this physical device has a verified-key fallback candidate whose
+ * read would otherwise be silent. Failure to inspect SecureStore is treated
+ * as present (fail closed): the explicit device-owner gate can still run and
+ * the later key read will remain locked if storage is unavailable.
+ */
+export async function physicalVaultUsesSoftwareFallback(): Promise<boolean> {
+  if (usesSoftwareVaultFallback()) return false
+  try {
+    if (Platform.OS === 'ios') {
+      // Existence only: do not return the fallback master-key value to JS until
+      // BiometricLockScreen has completed explicit device-owner authentication.
+      const exists = await SharedNative.secureStoreItemExistsWithoutReadingData(MASTER_KEY_FALLBACK_LABEL)
+      return exists
+    }
+    // Android does not expose the iOS metadata-only Keychain bridge. Preserve
+    // its existing SecureStore/Keystore fallback classification here.
+    return (await SecureStore.getItemAsync(MASTER_KEY_FALLBACK_LABEL)) != null
+  } catch {
+    return true
+  }
 }
 
 function uint8ToBase64(bytes: Uint8Array): string {
@@ -286,6 +309,10 @@ async function storeMasterKeyExclusive(masterKey: Uint8Array, ownerUserId: strin
     recordRuntimeTrace('keychain.store.software_fallback_written', {
       label: MASTER_KEY_FALLBACK_LABEL,
     })
+  } else {
+    // A later successful SE write supersedes any fallback left by an earlier
+    // transient failure. Removing it also makes the cold-lock preflight exact.
+    await SecureStore.deleteItemAsync(MASTER_KEY_FALLBACK_LABEL).catch(() => {})
   }
   if (softwareFallbackRuntime && FileSystem.documentDirectory) {
     await FileSystem.writeAsStringAsync(SIMULATOR_MASTER_KEY_FILE, encoded)
@@ -358,14 +385,17 @@ type VaultLoadResult =
   | { reason: 'auth_canceled' }
   | { reason: 'auth_failed' }
   | { reason: 'biometry_lockout' }
+  | { reason: 'auth_not_available' }
+  | { reason: 'se_not_warm' }
 
 /**
  * Map a native vault-auth error `code` (thrown by `loadKeyFromKeychainAsHandle`
  * as an Expo Exception, task 0882) to a surfaced VaultLoadResult reason.
- * Returns `null` for retryable / unknown codes so the caller falls through to
- * the normal `transient` path (silent cold-start warm-up retry).
+ * Secure-Enclave warm-up retries happen inside the native load with the same
+ * satisfied LAContext. Every native code is surfaced here; JS must never call
+ * the native load again after a completed Face ID/passcode sheet.
  */
-function surfacedReasonForAuthCode(code: unknown): 'auth_canceled' | 'auth_failed' | 'biometry_lockout' | null {
+function surfacedReasonForAuthCode(code: unknown): 'auth_canceled' | 'auth_failed' | 'biometry_lockout' | 'auth_not_available' | 'se_not_warm' {
   switch (code) {
     case 'ERR_VAULT_AUTH_CANCELED':
       return 'auth_canceled'
@@ -373,10 +403,14 @@ function surfacedReasonForAuthCode(code: unknown): 'auth_canceled' | 'auth_faile
       return 'auth_failed'
     case 'ERR_VAULT_BIOMETRY_LOCKOUT':
       return 'biometry_lockout'
-    // ERR_VAULT_SE_NOT_WARM / ERR_VAULT_AUTH_NOT_AVAILABLE (and anything else)
-    // are retryable → fall through to transient.
+    case 'ERR_VAULT_AUTH_NOT_AVAILABLE':
+      return 'auth_not_available'
+    case 'ERR_VAULT_SE_NOT_WARM':
+      return 'se_not_warm'
+    // An unknown native auth failure is surfaced rather than retried. Waiting
+    // cannot repair a denied permission or an invalid policy/context.
     default:
-      return null
+      return 'auth_failed'
   }
 }
 
@@ -394,7 +428,7 @@ function surfacedReasonForAuthCode(code: unknown): 'auth_canceled' | 'auth_faile
  *                            (SE not warm, fallback miss despite a present
  *                            check label) — safe to retry, never recovery
  */
-async function loadVerifiedMasterKeyHandle(): Promise<VaultLoadResult> {
+async function loadVerifiedMasterKeyHandle(preferSoftwareFallback = false): Promise<VaultLoadResult> {
   const checkB64 = await SecureStore.getItemAsync(MASTER_KEY_CHECK_LABEL).catch(() => null)
   if (!checkB64) {
     recordRuntimeTrace('keychain.load.no_recovery_check', { label: MASTER_KEY_CHECK_LABEL })
@@ -415,13 +449,19 @@ async function loadVerifiedMasterKeyHandle(): Promise<VaultLoadResult> {
     try {
       const actual = await computeRecoveryCheck(candidate)
       if (!constantTimeEqual(actual, expected)) return null
+      let nativeKeychainStored = false
       try {
         await storeKeyInKeychain(candidate, MASTER_KEY_LABEL)
+        nativeKeychainStored = true
       } catch {
         // SE may be unavailable — the native handle can still be created
         // directly from this verified fallback key.
       }
-      return await createMasterKeyHandle(candidate)
+      const handleId = await createMasterKeyHandle(candidate)
+      if (nativeKeychainStored && !usesSoftwareVaultFallback()) {
+        await SecureStore.deleteItemAsync(MASTER_KEY_FALLBACK_LABEL).catch(() => {})
+      }
+      return handleId
     } finally {
       candidate.fill(0)
     }
@@ -433,7 +473,7 @@ async function loadVerifiedMasterKeyHandle(): Promise<VaultLoadResult> {
   // only `no_key` exit is the absent-check-label guard above.
 
   // Primary: Secure Enclave-wrapped key (real devices)
-  if (!usesSoftwareVaultFallback()) {
+  if (!preferSoftwareFallback && !usesSoftwareVaultFallback()) {
     try {
       recordRuntimeTrace('keychain.load.native_handle_request', {
         label: MASTER_KEY_LABEL,
@@ -469,24 +509,15 @@ async function loadVerifiedMasterKeyHandle(): Promise<VaultLoadResult> {
     } catch (error) {
       const code = (error as { code?: unknown } | null)?.code
       const surfaced = surfacedReasonForAuthCode(code)
-      if (surfaced != null) {
-        // A real user cancel / auth failure / biometric lockout. Surface it —
-        // do NOT retry and do NOT fall through to the SecureStore fallback (a
-        // provisioned real-device install has none anyway). The lock screen
-        // stays locked with a genuine tap-to-retry (0428 fail-closed).
-        recordRuntimeTrace('keychain.load.native_handle_auth_surfaced', {
-          label: MASTER_KEY_LABEL,
-          code: typeof code === 'string' ? code : 'unknown',
-          reason: surfaced,
-        })
-        return { reason: surfaced }
-      }
-      // SE read threw a retryable/unknown code (warm-up) — same transient story.
-      // Fall through to the SecureStore fallback, then report transient.
-      recordRuntimeTrace('keychain.load.native_handle_failed', {
+      // Surface every native auth outcome. In particular, a not-warm result
+      // has already exhausted same-context native retries, so calling native
+      // again here could display another OS sheet.
+      recordRuntimeTrace('keychain.load.native_handle_auth_surfaced', {
         label: MASTER_KEY_LABEL,
         code: typeof code === 'string' ? code : 'unknown',
+        reason: surfaced,
       })
+      return { reason: surfaced }
     }
   }
 
@@ -605,7 +636,12 @@ interface CryptoContextValue {
    *   in the secure enclave for future unlocks.
    * - Without phrase: loads the master key from the secure enclave directly.
    */
-  unlock: (phrase?: string, source?: VaultUnlockSource, freshMasterKey?: Uint8Array) => Promise<void>
+  unlock: (
+    phrase?: string,
+    source?: VaultUnlockSource,
+    freshMasterKey?: Uint8Array,
+    options?: { preferSoftwareFallback?: boolean },
+  ) => Promise<void>
   /** Latest vault unlock diagnostics for debug/export surfaces. */
   getUnlockDiagnostics: () => VaultUnlockDiagnostics
   /** Zero out the in-memory master key and mark vault as locked. */
@@ -790,7 +826,12 @@ export function CryptoProvider({ children, userId }: { children: React.ReactNode
   // so the signup path inherits every ownership/generation guarantee of the phrase
   // path and adds no second way to adopt a key. The CALLER owns the buffer and the
   // branch below zeroes it (`masterKey.fill(0)`) in its `finally`.
-  const unlock = useCallback(async (phrase?: string, sourceArg?: VaultUnlockSource, freshMasterKey?: Uint8Array) => {
+  const unlock = useCallback(async (
+    phrase?: string,
+    sourceArg?: VaultUnlockSource,
+    freshMasterKey?: Uint8Array,
+    options?: { preferSoftwareFallback?: boolean },
+  ) => {
     const source: VaultUnlockSource =
       sourceArg ?? (freshMasterKey != null ? 'new_account' : phrase != null ? 'recovery_phrase' : 'keychain')
     const hasRecoveryPhrase = phrase != null || freshMasterKey != null
@@ -958,7 +999,7 @@ export function CryptoProvider({ children, userId }: { children: React.ReactNode
             setNeedsRecoveryPhrase(true)
             throw new Error(VAULT_NEEDS_PHRASE_MESSAGE)
           }
-          let result = await loadVerifiedMasterKeyHandle()
+          let result = await loadVerifiedMasterKeyHandle(options?.preferSoftwareFallback === true)
 
           // Backoff ONLY for `transient` — the Secure-Enclave / auth subsystem
           // not being warm yet this early in a cold restart (SE returned no key,
@@ -984,7 +1025,7 @@ export function CryptoProvider({ children, userId }: { children: React.ReactNode
               delayMs: transientBackoffMs[attempt],
             })
             await new Promise((resolve) => setTimeout(resolve, transientBackoffMs[attempt]))
-            result = await loadVerifiedMasterKeyHandle()
+            result = await loadVerifiedMasterKeyHandle(options?.preferSoftwareFallback === true)
           }
 
           if ('handleId' in result) {
@@ -1091,17 +1132,21 @@ export function CryptoProvider({ children, userId }: { children: React.ReactNode
           } else if (
             result.reason === 'auth_canceled' ||
             result.reason === 'auth_failed' ||
-            result.reason === 'biometry_lockout'
+            result.reason === 'biometry_lockout' ||
+            result.reason === 'auth_not_available' ||
+            result.reason === 'se_not_warm'
           ) {
-            // Real biometric outcome (task 0882): the user canceled, the
-            // biometric failed to match, or biometrics are locked out. Fail
-            // CLOSED — do NOT arm recovery and do NOT silently retry. Surface a
-            // non-recovery error so the BiometricLockScreen stays locked with a
-            // genuine tap-to-retry (and the password fallback for lockout). The
-            // vault never opens without a successful evaluation (0428).
+            // Real device-auth outcome (task 0882): the user canceled, auth
+            // failed, biometrics are locked out, or Face ID is unavailable.
+            // Fail CLOSED — do NOT arm recovery and do NOT silently retry.
+            // Surface a non-recovery error so BiometricLockScreen stays locked.
             recordRuntimeTrace('vault.unlock.auth_surfaced', { source, reason: result.reason })
             const authMessage =
-              result.reason === 'biometry_lockout'
+              result.reason === 'se_not_warm'
+                ? 'Secure Enclave is not ready. Tap Try Face ID to try again.'
+                : result.reason === 'auth_not_available'
+                ? 'Face ID is off for Beebeeb or unavailable. Turn it on in iOS Settings.'
+                : result.reason === 'biometry_lockout'
                 ? 'Biometrics are locked — use your Beebeeb password to unlock'
                 : result.reason === 'auth_canceled'
                   ? 'Biometric unlock was canceled'
@@ -1553,6 +1598,8 @@ export function CryptoProvider({ children, userId }: { children: React.ReactNode
         encryptMetadataFn: encryptMetadataFn,
         decryptMetadataFn: decryptMetadataFn,
       })
+      // Know which folder is the protected Backups root before any screen offers actions.
+      void resolveProtectedBackupsRoot().catch(() => {})
     } else {
       setBackupEncryption(null)
     }

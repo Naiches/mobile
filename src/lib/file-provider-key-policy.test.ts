@@ -1,6 +1,6 @@
 // @ts-nocheck — extracted production Swift runs with a deterministic Security test double.
 import { test, expect } from 'bun:test';
-import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -98,7 +98,7 @@ let errSecSuccess: Int32 = 0
 let errSecItemNotFound: Int32 = -25300
 struct SecAccessControlCreateFlags: OptionSet {
   let rawValue: Int
-  static let privateKeyUsage = Self(rawValue: 1), devicePasscode = Self(rawValue: 2), biometryAny = Self(rawValue: 4)
+  static let privateKeyUsage = Self(rawValue: 1), devicePasscode = Self(rawValue: 2), biometryAny = Self(rawValue: 4), userPresence = Self(rawValue: 8)
 }
 struct ACL { let protection: String; let flags: SecAccessControlCreateFlags }
 final class SecKey { let tag: Data; let acl: ACL; init(_ tag: Data, _ acl: ACL) { self.tag = tag; self.acl = acl } }
@@ -238,11 +238,15 @@ check(State.blobs["files"] == priorBlob, "failed rewrap preserves existing ciphe
 print("Files key policy: \\(count) cases passed")
 `;
   const dir = mkdtempSync(join(tmpdir(), 'beebeeb-files-key-'));
+  try {
   const swift = join(dir, 'main.swift'), binary = join(dir, 'runner'), output = join(dir, 'output.log');
   writeFileSync(swift, harness);
   execFileSync('swiftc', [swift, '-o', binary], { timeout: 60_000 });
   execFileSync('/bin/sh', ['-c', '"$1" > "$2" 2>&1', 'files-key-test', binary, output], { timeout: 30_000 });
   expect(readFileSync(output, 'utf8')).toContain('Files key policy: 23 cases passed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90_000);
 
 /** Like functionBody, but '' when the signature is not in the source (so one harness compiles before and after a change). */
@@ -270,6 +274,7 @@ function optionalLine(source: string, prefix: string) {
 nativeTest('Files key exists only while Files is mounted, has one writer at a time, and never fails a vault store or unlock', () => {
   const extracted = [
     'static func store(masterKeyBytes:',
+    'private static func storePrimaryWrappedKey(',
     'static func load(label:',
     'static func setAccessControl(',
     'static func delete()',
@@ -330,14 +335,16 @@ let errSecItemNotFound: Int32 = -25300
 let errSecInteractionNotAllowed: Int32 = -25308
 struct SecAccessControlCreateFlags: OptionSet {
   let rawValue: Int
-  static let privateKeyUsage = Self(rawValue: 1), devicePasscode = Self(rawValue: 2), biometryAny = Self(rawValue: 4)
+  static let privateKeyUsage = Self(rawValue: 1), devicePasscode = Self(rawValue: 2), biometryAny = Self(rawValue: 4), userPresence = Self(rawValue: 8)
 }
 struct ACL { let protection: String; let flags: SecAccessControlCreateFlags }
 final class SecKey {
   let tag: Data, acl: ACL, id: UInt8
   init(_ tag: Data, _ acl: ACL, id: UInt8) { self.tag = tag; self.acl = acl; self.id = id }
 }
-final class LAContext {}
+final class LAContext {
+  var localizedFallbackTitle: String?
+}
 
 /// The keychain double. Every access takes \`lock\`, because two writers run at once below.
 /// Hooks run outside it, on the calling thread.
@@ -384,7 +391,7 @@ func SecKeyCreateEncryptedData(_ key: SecKey, _ algorithm: String, _ bytes: CFDa
 func SecKeyCreateDecryptedData(_ key: SecKey, _ algorithm: String, _ bytes: CFData, _ error: inout Unmanaged<CFError>?) -> CFData? {
   let refusal = State.with { () -> Int? in
     // A passcode- or Face ID-gated key decrypts only after the app's one explicit evaluation.
-    if !key.acl.flags.isDisjoint(with: [.devicePasscode, .biometryAny]), !State.authenticated { return -25293 }
+    if !key.acl.flags.isDisjoint(with: [.devicePasscode, .biometryAny, .userPresence]), !State.authenticated { return -25293 }
     if State.locked, key.tag == BeebeebKeychainCore.seKeyTagFiles { return Int(errSecInteractionNotAllowed) }
     return nil
   }
@@ -501,7 +508,17 @@ enum BeebeebKeychainCore {
 }
 enum Manager {
   static var requiresBiometric = false
+  static var legacyPrimaryAccessControl = false
+  static let primaryAccessControlVersionKey = "primary-acl-version"
+  static func markPrimaryAccessControlCurrent() { legacyPrimaryAccessControl = false }
+  static func replaceAccessControl(requireBiometric: Bool, masterKeyBytes: Data, label: String) throws {
+    requiresBiometric = requireBiometric
+    legacyPrimaryAccessControl = false
+  }
   static func authenticateForPrimaryLoad(label: String) throws -> LAContext { State.with { State.authenticated = true }; return LAContext() }
+  // Migration recovery is orthogonal to this Files-key lifecycle harness.
+  static func repairInterruptedAccessControlMigration(label: String) throws -> Data? { nil }
+  static func finishAccessControlMigration() {}
   ${lock}
   ${extracted.join('\n')}
   ${lifecycle.join('\n')}
@@ -756,6 +773,7 @@ check(Manager.checkFileProviderKey(masterKeyBytes: vault, label: label) == .mism
 print("Files key lifecycle: \\(count) cases passed")
 `;
   const dir = mkdtempSync(join(tmpdir(), 'beebeeb-files-key-lifecycle-'));
+  try {
   const swift = join(dir, 'main.swift'), binary = join(dir, 'runner'), output = join(dir, 'output.log');
   writeFileSync(swift, harness);
   try {
@@ -773,6 +791,9 @@ print("Files key lifecycle: \\(count) cases passed")
   console.log(text);
   expect(text).not.toContain('FAIL:');
   expect(text).toContain('Files key lifecycle: 59 cases passed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 150_000);
 
 // Review round 2, item 2 (mutation B): Settings toggle-off (`clearFileProviderSharedState`) and
@@ -839,6 +860,7 @@ defaults.removePersistentDomain(forName: suite)
 print("Files revoke order: \\(count) cases passed")
 `;
   const dir = mkdtempSync(join(tmpdir(), 'beebeeb-files-revoke-order-'));
+  try {
   const swift = join(dir, 'main.swift'), binary = join(dir, 'runner'), output = join(dir, 'output.log');
   writeFileSync(swift, harness);
   try {
@@ -856,6 +878,9 @@ print("Files revoke order: \\(count) cases passed")
   console.log(text);
   expect(text).not.toContain('FAIL:');
   expect(text).toContain('Files revoke order: 3 cases passed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 150_000);
 
 nativeTest('fileProviderMountConsented is the Settings rule: trusted mount on, enabled on or absent', () => {
@@ -886,6 +911,7 @@ check(!BeebeebKeychainCore.fileProviderMountConsented(defaults: defaults), "trus
 print("Files consent: \\(count) cases passed")
 `;
   const dir = mkdtempSync(join(tmpdir(), 'beebeeb-files-consent-'));
+  try {
   const swift = join(dir, 'main.swift'), binary = join(dir, 'runner'), output = join(dir, 'output.log');
   writeFileSync(swift, harness);
   execFileSync('swiftc', [swift, '-o', binary], { timeout: 120_000, stdio: 'pipe' });
@@ -897,4 +923,7 @@ print("Files consent: \\(count) cases passed")
   const text = readFileSync(output, 'utf8');
   expect(text).not.toContain('FAIL:');
   expect(text).toContain('Files consent: 6 cases passed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 150_000);

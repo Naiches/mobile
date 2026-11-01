@@ -56,7 +56,7 @@ function jsonResponse(body: unknown, status = 200, headers: Record<string, strin
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
 }
 
-const { saveIndex, createEmptyIndex } = await import('./search-index');
+const { saveIndex, createEmptyIndex, updateIndexEntries } = await import('./search-index');
 
 beforeEach(() => {
   fetchQueue = [];
@@ -65,6 +65,28 @@ beforeEach(() => {
   calls.endSessionSnapshots = [];
   currentToken = 'token-A';
   currentGeneration = 0;
+});
+
+describe('bulk index updates', () => {
+  test('5,000 entries are installed with one files-object clone', () => {
+    const initial = createEmptyIndex();
+    const entries = Array.from({ length: 5_000 }, (_, i) => [String(i), {
+      name: `file-${i}`,
+      path: `file-${i}`,
+      type: 'text/plain',
+      size: i,
+      parent: null,
+      starred: false,
+      created: '',
+      modified: '',
+      tags: [],
+    }]);
+
+    const next = updateIndexEntries(initial, entries);
+    expect(Object.keys(next.files)).toHaveLength(5_000);
+    expect(next.files['4999']?.name).toBe('file-4999');
+    expect(next.files).not.toBe(initial.files);
+  });
 });
 
 describe('1594 round 3 (Codex T6) — saveIndex() routes account_mismatch through guarded session-teardown', () => {

@@ -72,7 +72,7 @@ describe('compare encode queue', () => {
     expect(h.maxActive()).toBe(1);
   });
 
-  test('finished keys are not run again; failures are reported and not retried', async () => {
+  test('finished keys are not run again until an explicit retry', async () => {
     const h = harness();
     h.q.enqueue('a');
     h.pending.get('a')!.reject();
@@ -82,6 +82,10 @@ describe('compare encode queue', () => {
     h.q.prioritize('a');
     h.q.enqueue('a');
     expect(h.order).toEqual(['a']);
+    h.q.retry('a');
+    expect(h.order).toEqual(['a', 'a']);
+    await h.finish('a');
+    expect(h.results.get('a')).toBe('r:a');
   });
 
   test('clear drops waiting keys but the running one still reports', async () => {

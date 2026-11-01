@@ -22,7 +22,7 @@ export interface SharedKeysApi {
 }
 export interface SharedKeyPorts extends SharedKeysApi { native: SharedKeysNative; custody: CustodyMemory; masterHandleId(): number; epoch(): AccountEpoch; now(): number; }
 export interface SharedKeyResolver {
-  ensureLoaded(ids: string[]): Promise<Map<string, SharedKeyOutcome>>;
+  ensureLoaded(ids: string[], observedVersions?: ReadonlyMap<string, number>): Promise<Map<string, SharedKeyOutcome>>;
   folderHandleFor(root: string): Promise<number | null>;
   adoptFolderHandle(root: string, handle: number): void;
   originLabel(file: string): Promise<string | null>;
@@ -50,13 +50,27 @@ function notifyVaultKeysReady(): void { for (const l of [...vaultReadyListeners]
 export function sharedMasterHandleId(): number { if (!nativeMaster) throw new Error('Vault is locked'); return nativeMaster(); }
 const ownerWrapLoaded = new Set<string>();
 const outcomes = new Map<string, SharedKeyOutcome>();
+const completedOwnerUploads = new Set<string>();
 export function isOwnerWrapLoaded(id: string): boolean { return ownerWrapLoaded.has(id); }
 export function sharedFileKeyIsLoaded(id: string): boolean { return nativeSurface.sharedFileKeyIsLoaded?.(id) ?? false; }
 export function assertFileKeyExportable(id: string, loaded = sharedFileKeyIsLoaded): void { if (loaded(id)) throw new SharedFileKeyNotExportableError(); }
 export function setSharedKeyResolver(value: SharedKeyResolver | null): void { resolver = value; }
 export function getSharedKeyResolver(): SharedKeyResolver | null { return resolver; }
 export function sharedKeyOutcome(id: string): SharedKeyOutcome | undefined { return outcomes.get(id); }
-export function clearSharedKeys(): void { nativeMaster = null; resolver?.clear(); clearTree(); outcomes.clear(); ownerWrapLoaded.clear(); }
+/** Bumped per file whenever its recorded outcome is known to be stale, so a lookup already in flight does not
+ *  record a verdict the file has since disproved. */
+const outcomeVersions = new Map<string, number>();
+function snapshotOutcomeVersions(ids: Iterable<string>): Map<string, number> {
+  return new Map([...new Set(ids)].map(id => [id, outcomeVersions.get(id) ?? 0]));
+}
+/** Drops a verdict disproved by a successful decrypt. Bumping the version also stops older work from restoring it. */
+export function forgetSharedKeyOutcome(id: string): void {
+  outcomes.delete(id); outcomeVersions.set(id, (outcomeVersions.get(id) ?? 0) + 1);
+}
+/** A completed upload is permanently owner-readable for this account epoch. Pending-row fallback work must never
+ *  turn its expected temporary name mismatch into a shared-key failure, even when that work starts later. */
+export function markOwnerUploadComplete(id: string): void { completedOwnerUploads.add(id); forgetSharedKeyOutcome(id); }
+export function clearSharedKeys(): void { nativeMaster = null; resolver?.clear(); clearTree(); outcomes.clear(); outcomeVersions.clear(); completedOwnerUploads.clear(); ownerWrapLoaded.clear(); }
 onAccountEpochAdvance(clearSharedKeys);
 export function configureSharedKeys(native: Partial<SharedKeysNative>, api: SharedKeysApi, masterHandleId: () => number): SharedKeyResolver {
   nativeSurface = native;
@@ -120,8 +134,9 @@ export function createSharedKeyResolver(p: SharedKeyPorts): SharedKeyResolver {
     }
     const value={at:p.now(),rows,incomplete}; listings.set(root,value); return value;
   }
-  async function ensureLoaded(ids: string[]): Promise<Map<string,SharedKeyOutcome>> {
+  async function ensureLoaded(ids: string[], observedVersions?: ReadonlyMap<string, number>): Promise<Map<string,SharedKeyOutcome>> {
     const epoch=p.epoch(), g=generation, out=new Map<string,SharedKeyOutcome>(), groups=new Map<string,string[]>();
+    const versions=observedVersions ?? snapshotOutcomeVersions(ids);
     async function ownerFallback(id: string, fallback: SharedKeyOutcome) {
       const row=await p.getFileOwnerWrap(id); guard(epoch,g);
       if(row.actedViaShareId) shareByFile.set(id,row.actedViaShareId);
@@ -156,7 +171,9 @@ export function createSharedKeyResolver(p: SharedKeyPorts): SharedKeyResolver {
       const stale = e instanceof StaleAccountError || g!==generation || !sameAccountEpoch(epoch,p.epoch());
       for(const id of ids) if(stale || !out.has(id)) out.set(id,stale?'stale':'key_does_not_open');
     }
-    if(g===generation && sameAccountEpoch(epoch,p.epoch())) for(const [id,result] of out) outcomes.set(id,result);
+    if(g===generation && sameAccountEpoch(epoch,p.epoch())) for(const [id,result] of out) {
+      if(!completedOwnerUploads.has(id) && (outcomeVersions.get(id)??0)===(versions.get(id)??0)) outcomes.set(id,result);
+    }
     return out;
   }
   return {
@@ -172,38 +189,45 @@ export function createSharedKeyResolver(p: SharedKeyPorts): SharedKeyResolver {
         if(!label) return null; const value=await p.native.sharedFolderDecryptName(roots.get(root)!,label); guard(epoch,g); return value;
       } catch { return null; }
     },
-    clear() { generation++; roots.clear(); negative.clear(); listings.clear(); rootByFile.clear(); shareByFile.clear(); opening.clear(); outcomes.clear(); ownerWrapLoaded.clear(); void p.native.sharedKeysClear?.().catch(()=>{}); },
+    clear() { generation++; roots.clear(); negative.clear(); listings.clear(); rootByFile.clear(); shareByFile.clear(); opening.clear(); outcomes.clear(); outcomeVersions.clear(); completedOwnerUploads.clear(); ownerWrapLoaded.clear(); void p.native.sharedKeysClear?.().catch(()=>{}); },
   };
 }
 
 export async function retrySharedDecrypt<T>(id: string, operation: () => Promise<T>, r = resolver): Promise<T> {
   const epoch=accountEpoch();
+  const versions=snapshotOutcomeVersions([id]);
   try {
     const value = await operation();
     if (!sameAccountEpoch(epoch, accountEpoch())) throw new StaleAccountError('shared decrypt');
+    forgetSharedKeyOutcome(id);
     return value;
   } catch(error) {
     if(!r || !isKeyMismatchError(error)) throw error;
-    const result=await r.ensureLoaded([id]);
+    const result=await r.ensureLoaded([id],versions);
     if(result.get(id)==='stale' || !sameAccountEpoch(epoch,accountEpoch())) throw new StaleAccountError('shared decrypt');
     if(result.get(id)!=='loaded') throw error;
     const value = await operation();
     if (!sameAccountEpoch(epoch, accountEpoch())) throw new StaleAccountError('shared decrypt');
+    forgetSharedKeyOutcome(id);
     return value;
   }
 }
 export async function resolveSharedNames<T extends {fileId:string}, R extends {error:string|null}>(items: T[], decrypt: (items:T[])=>Promise<R[]>, r=resolver): Promise<R[]> {
   const epoch=accountEpoch();
+  const versions=snapshotOutcomeVersions(items.map(i=>i.fileId));
   // L3: known foreign rows resolve before touching native readers.
   const foreign=items.filter(i=>isForeignSharedFile(i.fileId,epoch.accountId));
-  if(foreign.length && r) { const loaded=await r.ensureLoaded(foreign.map(i=>i.fileId)); if([...loaded.values()].includes('stale') || !sameAccountEpoch(epoch,accountEpoch())) throw new StaleAccountError('shared names'); }
+  if(foreign.length && r) { const loaded=await r.ensureLoaded(foreign.map(i=>i.fileId),versions); if([...loaded.values()].includes('stale') || !sameAccountEpoch(epoch,accountEpoch())) throw new StaleAccountError('shared names'); }
   const result=await decrypt(items);
   if (!sameAccountEpoch(epoch, accountEpoch())) throw new StaleAccountError('shared names');
+  // A name that decrypted proves the file opens: a failure recorded for it earlier (while it was still pending) is stale.
+  items.forEach((item,i)=>{ if(result[i] && !result[i].error) forgetSharedKeyOutcome(item.fileId); });
   const failed=items.filter((_,i)=>isKeyMismatchError(result[i]?.error));
   if(!failed.length || !r) return result;
-  const loaded=await r.ensureLoaded(failed.map(i=>i.fileId));
+  const loaded=await r.ensureLoaded(failed.map(i=>i.fileId),versions);
   if([...loaded.values()].includes('stale') || !sameAccountEpoch(epoch,accountEpoch())) throw new StaleAccountError('shared names');
   const retry=failed.filter(i=>loaded.get(i.fileId)==='loaded'); if(!retry.length) return result;
   const values=await decrypt(retry); if(!sameAccountEpoch(epoch,accountEpoch())) throw new StaleAccountError('shared names');
+  retry.forEach((item,i)=>{ if(values[i] && !values[i].error) forgetSharedKeyOutcome(item.fileId); });
   const byId=new Map(retry.map((item,i)=>[item.fileId,values[i]])); return items.map((item,i)=>byId.get(item.fileId)??result[i]);
 }

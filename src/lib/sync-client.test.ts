@@ -163,6 +163,54 @@ beforeEach(() => {
 });
 
 describe('SyncClient catch-up (task 1302)', () => {
+  test('startup replay yields to input and publishes one coalesced tree change', async () => {
+    secureStore.set('bb_sync_last_seq', '5');
+    cachedIndex = {
+      hash: 'large-replay',
+      storedAt: Date.now(),
+      seq: 5,
+      files: [fileEntry({ id: 'existing' })],
+    };
+    const replay = Array.from({ length: 120 }, (_, index) => ({
+      seq_id: 6 + index,
+      op_type: 'file_create',
+      payload: {
+        id: `new-${index}`,
+        name_encrypted: `enc-new-${index}`,
+        parent_id: null,
+      },
+    }));
+
+    let client!: InstanceType<typeof SyncClient>;
+    let nodesAtInputTurn = -1;
+    let resolveInputTurn!: () => void;
+    const inputTurn = new Promise<void>((resolve) => { resolveInputTurn = resolve; });
+    getSyncOpsImpl = async () => {
+      setTimeout(() => {
+        nodesAtInputTurn = client.getAllNodes().length;
+        resolveInputTurn();
+      }, 0);
+      return replay;
+    };
+
+    client = new SyncClient();
+    const events: Array<{ type: string; treeChanged?: boolean }> = [];
+    client.subscribe((event) => events.push(event));
+    try {
+      await client.start();
+      await inputTurn;
+
+      expect(nodesAtInputTurn).toBeGreaterThan(1);
+      expect(nodesAtInputTurn).toBeLessThan(121);
+      expect(events.filter((event) => event.type === 'op')).toHaveLength(0);
+      expect(events.filter((event) => event.type === 'caught-up')).toEqual([
+        expect.objectContaining({ type: 'caught-up', treeChanged: true }),
+      ]);
+    } finally {
+      client.stop();
+    }
+  });
+
   test('seeds the tree from the on-disk index cache before replaying ops — pre-existing files survive a relaunch that only replays a create op', async () => {
     secureStore.set('bb_sync_last_seq', '5');
 
@@ -624,6 +672,45 @@ test('SyncProvider becomes ready after its rejected startup recovers without a s
   } finally {
     await act(async () => { renderer?.unmount(); });
     start.mockRestore();
+  }
+});
+
+test('SyncProvider publishes a startup replay to consumers once', async () => {
+  const React = await import('react');
+  const { default: TestRenderer, act } = await import('react-test-renderer');
+  const { SyncProvider, useSync } = await import('./sync-context');
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  secureStore.set('bb_sync_last_seq', '5');
+  cachedIndex = {
+    hash: 'provider-replay',
+    storedAt: Date.now(),
+    seq: 5,
+    files: [fileEntry({ id: 'existing' })],
+  };
+  getSyncOpsImpl = async () => Array.from({ length: 120 }, (_, index) => ({
+    seq_id: 6 + index,
+    op_type: 'file_create',
+    payload: { id: `provider-new-${index}`, name_encrypted: `enc-${index}`, parent_id: null },
+  }));
+
+  let latest;
+  let renderer;
+  function Consumer() { latest = useSync(); return null; }
+  try {
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(SyncProvider, null, React.createElement(Consumer)));
+    });
+    await act(async () => {
+      for (let turn = 0; turn < 20 && !latest?.ready; turn += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    });
+
+    expect(latest.ready).toBe(true);
+    expect(latest.allNodes()).toHaveLength(121);
+    expect(latest.treeVersion).toBe(1);
+  } finally {
+    await act(async () => { renderer?.unmount(); });
   }
 });
 

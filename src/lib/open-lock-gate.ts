@@ -22,6 +22,7 @@
 
 import * as LocalAuthentication from 'expo-local-authentication';
 import { isFileLocked } from './file-locks';
+import { keyedSingleFlight } from './single-flight';
 
 /** Whether FilesScreen may proceed to open `entry` (navigate into a folder or push Preview). */
 export async function passesOpenLockGate(entry: { id: string; is_folder: boolean }): Promise<boolean> {
@@ -60,4 +61,20 @@ export async function openFilesEntry<E extends { id: string; is_folder: boolean;
   if (!(await deps.ensureFileReady(entry))) return 'not-ready';
   deps.openPreview(entry);
   return 'preview';
+}
+
+/**
+ * Coalesce overlapping taps for one row while leaving different rows independent.
+ * Keep one instance for the lifetime of FilesScreen (for example, in a ref) so a
+ * render cannot replace the in-flight map between taps.
+ */
+export function createOpenFilesEntryGuard<
+  E extends { id: string; is_folder: boolean; is_uploading?: boolean | null },
+>(): (entry: E, deps: OpenFilesEntryDeps<E>) => Promise<OpenFilesEntryOutcome> {
+  type Request = { entry: E; deps: OpenFilesEntryDeps<E> };
+  const run = keyedSingleFlight<Request, OpenFilesEntryOutcome, string>(
+    ({ entry, deps }) => openFilesEntry(entry, deps),
+    ({ entry }) => entry.id,
+  );
+  return (entry, deps) => run({ entry, deps });
 }

@@ -7,6 +7,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
   type LayoutChangeEvent,
 } from 'react-native';
@@ -34,6 +35,7 @@ import {
 import { createEncodeQueue, type EncodeQueue } from '../lib/compare-encode-queue';
 import { formatBytes } from '../lib/format';
 import { encodePreviewSample, originalForCompare } from '../lib/photo-compare-samples';
+import { pickerPhotoSource, type ComparePhotoSource } from '../lib/photo-preview-source';
 import {
   DEFAULT_PHOTO_PREVIEW_SETTING,
   PREVIEW_SIZE_OPTIONS,
@@ -77,20 +79,28 @@ export default function PhotoPreviewCompareScreen() {
   const navigation = useNavigation();
   const route = useRoute<RouteProp<RootStackParamList, 'PhotoPreviewCompare'>>();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
-  const [localId, setLocalId] = useState<string | undefined>(route.params?.localIdentifier);
+  const initialIdentifier = route.params?.localIdentifier;
+  const [photoSource, setPhotoSource] = useState<ComparePhotoSource | undefined>(
+    initialIdentifier ? { localIdentifier: initialIdentifier } : undefined,
+  );
+  const [sourceKey, setSourceKey] = useState<string | undefined>(initialIdentifier ? 'route-photo' : undefined);
   const [mode, setMode] = useState<Mode>('stacked');
   const [format, setFormat] = useState<PreviewFormat>(DEFAULT_PHOTO_PREVIEW_SETTING.format);
   const [px, setPx] = useState<PreviewPx>(DEFAULT_PHOTO_PREVIEW_SETTING.px);
   const [original, setOriginal] = useState<Original | null>(null);
   const [samples, setSamples] = useState<Record<string, Sample | 'failed'>>({});
   const [error, setError] = useState<string | null>(null);
+  const [originalAttempt, setOriginalAttempt] = useState(0);
   const [area, setArea] = useState<Box>({ w: 0, h: 0 });
   const [view, setView] = useState<Viewport>({ scale: 1, x: 0, y: 0 });
   const [wipe, setWipe] = useState(0.5);
   const [holding, setHolding] = useState(false);
 
   const touchedSetting = useRef(false);
+  const pickedSequence = useRef(0);
   const viewRef = useRef(view);
   viewRef.current = view;
 
@@ -138,8 +148,10 @@ export default function PhotoPreviewCompareScreen() {
   // Files made for the photo on screen; removed when the photo changes or the screen closes.
   const filesRef = useRef<string[]>([]);
   const mountedRef = useRef(true);
-  const localIdRef = useRef<string | undefined>(localId);
-  localIdRef.current = localId;
+  const sourceKeyRef = useRef<string | undefined>(sourceKey);
+  sourceKeyRef.current = sourceKey;
+  const sourceByKeyRef = useRef(new Map<string, ComparePhotoSource>());
+  if (sourceKey && photoSource) sourceByKeyRef.current.set(sourceKey, photoSource);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -158,12 +170,14 @@ export default function PhotoPreviewCompareScreen() {
       async (key) => {
         const [id, rest] = [key.slice(0, key.lastIndexOf('|')), key.slice(key.lastIndexOf('|') + 1)];
         const [f, p] = rest.split(':');
-        const r = await encodePreviewSample(id, f as PreviewFormat, Number(p));
+        const source = sourceByKeyRef.current.get(id);
+        if (!source) throw new Error('Photo source is no longer available');
+        const r = await encodePreviewSample(source, f as PreviewFormat, Number(p));
         return { uri: fileUri(r.path), bytes: r.bytes, width: r.width, height: r.height };
       },
       (key, outcome) => {
         const id = key.slice(0, key.lastIndexOf('|'));
-        if (outcome.ok && (!mountedRef.current || id !== localIdRef.current)) {
+        if (outcome.ok && (!mountedRef.current || id !== sourceKeyRef.current)) {
           deleteCompareFiles([outcome.value.uri]); // landed after the photo changed or the screen closed
           return;
         }
@@ -176,12 +190,12 @@ export default function PhotoPreviewCompareScreen() {
 
   // Original side: downsampled decode of the PhotoKit original.
   useEffect(() => {
-    if (!localId) return;
+    if (!photoSource || !sourceKey) return;
     let alive = true;
     setOriginal(null);
     setError(null);
     lastFit.current = '';
-    originalForCompare(localId, ORIGINAL_MAX_PX)
+    originalForCompare(photoSource, ORIGINAL_MAX_PX)
       .then((o) => {
         const uri = fileUri(o.path);
         if (!alive || !mountedRef.current) {
@@ -196,25 +210,29 @@ export default function PhotoPreviewCompareScreen() {
       });
     return () => {
       alive = false;
-      // New photo (or unmount): drop this photo's compare copies and any waiting encodes.
-      queueRef.current?.clear();
-      queueRef.current?.forgetDone();
-      deleteCompareFiles(filesRef.current);
-      filesRef.current = [];
-      setSamples({});
     };
-  }, [localId]);
+  }, [sourceKey, originalAttempt]);
+
+  // A different photo owns a different set of temporary copies and queue keys.
+  useEffect(() => () => {
+    queueRef.current?.clear();
+    queueRef.current?.forgetDone();
+    deleteCompareFiles(filesRef.current);
+    filesRef.current = [];
+    setSamples({});
+    if (sourceKey) sourceByKeyRef.current.delete(sourceKey);
+  }, [sourceKey]);
 
   // The selected option jumps the line; the rest of the chip row follows.
   useEffect(() => {
     const q = queueRef.current;
-    if (!localId || !q) return;
-    q.prioritize(sampleKey(localId, format, px));
-    for (const o of PREVIEW_SIZE_OPTIONS) q.enqueue(sampleKey(localId, format, o.px));
-    for (const o of FORMATS) q.enqueue(sampleKey(localId, o.value, px));
-  }, [localId, format, px]);
+    if (!sourceKey || !q) return;
+    q.prioritize(sampleKey(sourceKey, format, px));
+    for (const o of PREVIEW_SIZE_OPTIONS) q.enqueue(sampleKey(sourceKey, format, o.px));
+    for (const o of FORMATS) q.enqueue(sampleKey(sourceKey, o.value, px));
+  }, [sourceKey, format, px]);
 
-  const current = localId ? samples[sampleKey(localId, format, px)] : undefined;
+  const current = sourceKey ? samples[sampleKey(sourceKey, format, px)] : undefined;
   const currentSample = current && current !== 'failed' ? current : null;
 
   // ── Mode switch: keep the viewed spot ───────────────────────────────────────
@@ -352,16 +370,31 @@ export default function PhotoPreviewCompareScreen() {
         quality: 1,
       });
       if (res.canceled || res.assets.length === 0) return;
-      const id = res.assets[0].assetId;
-      if (!id) {
+      const source = pickerPhotoSource(res.assets[0]);
+      if (!source) {
         Alert.alert('Cannot compare this photo', 'Pick a photo from your library.');
         return;
       }
-      setLocalId(id);
+      const key = `picked-photo-${++pickedSequence.current}`;
+      sourceByKeyRef.current.set(key, source);
+      setPhotoSource(source);
+      setSourceKey(key);
+      setOriginalAttempt(0);
     } catch {
       Alert.alert('Could not open the photo picker', 'Try again.');
     }
   }, []);
+
+  const retryCurrentSample = useCallback(() => {
+    if (!sourceKey) return;
+    const key = sampleKey(sourceKey, format, px);
+    setSamples((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+    queueRef.current?.retry(key);
+  }, [sourceKey, format, px]);
 
   // ── Rendering ───────────────────────────────────────────────────────────────
   const originalUri = original?.uri ?? null;
@@ -376,11 +409,11 @@ export default function PhotoPreviewCompareScreen() {
   const zoomText = zoomLabel(view.scale, base.w, original?.width ?? 0, PixelRatio.get());
 
   const chipSize = (p: PreviewPx) => {
-    const s = localId ? samples[sampleKey(localId, format, p)] : undefined;
+    const s = sourceKey ? samples[sampleKey(sourceKey, format, p)] : undefined;
     return s && s !== 'failed' ? formatBytes(s.bytes) : s === 'failed' ? '—' : '…';
   };
   const chipFormat = (f: PreviewFormat) => {
-    const s = localId ? samples[sampleKey(localId, f, px)] : undefined;
+    const s = sourceKey ? samples[sampleKey(sourceKey, f, px)] : undefined;
     return s && s !== 'failed' ? formatBytes(s.bytes) : s === 'failed' ? '—' : '…';
   };
 
@@ -392,15 +425,35 @@ export default function PhotoPreviewCompareScreen() {
       <View style={{ width: paneBox.w, height: paneBox.h, overflow: 'hidden', backgroundColor: '#000' }}>
         <SyncedZoomImage uri={uri} pixels={pixels} box={paneBox} base={base} viewport={view} />
         {extra}
-        <View style={styles.labelWrap} pointerEvents="none">
+        <View style={[styles.labelWrap, accessibilityLayout && styles.labelWrapAccessibility]} pointerEvents="none">
           <Text style={styles.label}>{label}</Text>
         </View>
       </View>
     </GestureDetector>
   );
 
+  const sampleStatusOverlay = current === 'failed' ? (
+    <View style={styles.sampleStatus}>
+      <Ionicons name="alert-circle-outline" size={24} color="#fff" />
+      <Text style={styles.sampleStatusText}>Could not make this preview.</Text>
+      <TouchableOpacity
+        onPress={retryCurrentSample}
+        style={styles.retryButton}
+        accessibilityRole="button"
+        accessibilityLabel="Try making this preview again"
+      >
+        <Text style={styles.retryButtonText}>Try again</Text>
+      </TouchableOpacity>
+    </View>
+  ) : !currentSample ? (
+    <View style={styles.sampleStatus} pointerEvents="none">
+      <ActivityIndicator color="#fff" />
+      <Text style={styles.sampleStatusText}>Making preview…</Text>
+    </View>
+  ) : null;
+
   let content: React.ReactNode = null;
-  if (!localId) {
+  if (!sourceKey) {
     content = (
       <View style={styles.center}>
         <Text style={styles.emptyText}>Pick a photo to compare its original with a preview.</Text>
@@ -410,19 +463,28 @@ export default function PhotoPreviewCompareScreen() {
     content = (
       <View style={styles.center}>
         <Text style={styles.emptyText}>{error}</Text>
+        <TouchableOpacity
+          onPress={() => setOriginalAttempt((n) => n + 1)}
+          style={styles.retryButton}
+          accessibilityRole="button"
+          accessibilityLabel="Try opening this photo again"
+        >
+          <Text style={styles.retryButtonText}>Try again</Text>
+        </TouchableOpacity>
       </View>
     );
   } else if (!original || area.w <= 0) {
     content = (
       <View style={styles.center}>
         <ActivityIndicator color="#fff" />
+        <Text style={styles.emptyText}>Opening photo…</Text>
       </View>
     );
   } else if (mode === 'stacked') {
     content = (
       <View style={{ gap: STACK_GAP }}>
         {pane(originalUri, originalPixels, gestureA, originalLabel)}
-        {pane(settingUri, settingPixels, gestureB, settingLabel)}
+        {pane(settingUri, settingPixels, gestureB, settingLabel, sampleStatusOverlay)}
       </View>
     );
   } else if (mode === 'wipe') {
@@ -433,10 +495,19 @@ export default function PhotoPreviewCompareScreen() {
           <View style={{ width: paneBox.w, height: paneBox.h, overflow: 'hidden', backgroundColor: '#000' }}>
             <SyncedZoomImage uri={originalUri} pixels={originalPixels} box={paneBox} base={base} viewport={view} />
             <SyncedZoomImage uri={settingUri} pixels={settingPixels} box={paneBox} base={base} viewport={view} clipLeft={divX} />
-            <View style={[styles.labelWrap, { left: 10 }]} pointerEvents="none">
+            {sampleStatusOverlay}
+            <View style={[styles.labelWrap, accessibilityLayout && styles.labelWrapAccessibility, { left: 10 }]} pointerEvents="none">
               <Text style={styles.label}>{originalLabel}</Text>
             </View>
-            <View style={[styles.labelWrap, { right: 10, left: undefined }]} pointerEvents="none">
+            <View
+              style={[
+                styles.labelWrap,
+                accessibilityLayout && styles.labelWrapAccessibility,
+                { right: 10, left: undefined },
+                accessibilityLayout && styles.wipeSecondLabelAccessibility,
+              ]}
+              pointerEvents="none"
+            >
               <Text style={styles.label}>{settingLabel}</Text>
             </View>
           </View>
@@ -457,12 +528,13 @@ export default function PhotoPreviewCompareScreen() {
       holding ? originalPixels : settingPixels,
       gestureA,
       holding ? originalLabel : `${settingLabel} · hold for original`,
+      holding ? undefined : sampleStatusOverlay,
     );
   }
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
-      <View style={styles.header}>
+      <View style={[styles.header, accessibilityLayout && styles.headerAccessibility]}>
         <TouchableOpacity
           onPress={() => navigation.goBack()}
           style={styles.iconBtn}
@@ -471,7 +543,7 @@ export default function PhotoPreviewCompareScreen() {
         >
           <Ionicons name="close" size={24} color="#fff" />
         </TouchableOpacity>
-        <View style={styles.seg}>
+        <View style={[styles.seg, accessibilityLayout && styles.segAccessibility]}>
           {MODES.map((m) => (
             <TouchableOpacity
               key={m.id}
@@ -487,8 +559,8 @@ export default function PhotoPreviewCompareScreen() {
         </View>
       </View>
 
-      <View style={styles.zoomRow}>
-        <Text style={styles.zoomText}>{zoomText}</Text>
+      <View style={[styles.zoomRow, accessibilityLayout && styles.zoomRowAccessibility]}>
+        <Text style={[styles.zoomText, accessibilityLayout && styles.zoomTextAccessibility]}>{zoomText}</Text>
         <TouchableOpacity onPress={fit} style={styles.zoomBtn} accessibilityRole="button" accessibilityLabel="Fit">
           <Text style={styles.zoomBtnText}>Fit</Text>
         </TouchableOpacity>
@@ -556,19 +628,38 @@ function Chip({ label, sub, on, onPress }: { label: string; sub: string; on: boo
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0b0b0c' },
   header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 8, paddingVertical: 6, gap: 8 },
+  headerAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   iconBtn: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
   seg: { flex: 1, flexDirection: 'row', backgroundColor: '#1c1c1e', borderRadius: 10, padding: 3 },
-  segItem: { flex: 1, paddingVertical: 7, alignItems: 'center', borderRadius: 8 },
+  segAccessibility: { flexBasis: '100%' },
+  segItem: { flex: 1, paddingHorizontal: 4, paddingVertical: 7, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
   segItemOn: { backgroundColor: '#3a3a3c' },
-  segText: { color: '#a1a1a6', fontSize: 13, fontWeight: '500' },
+  segText: { color: '#a1a1a6', fontSize: 13, fontWeight: '500', textAlign: 'center' },
   segTextOn: { color: '#fff' },
   zoomRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingBottom: 6, gap: 10 },
+  zoomRowAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   zoomText: { color: '#a1a1a6', fontSize: 12, flex: 1 },
-  zoomBtn: { paddingHorizontal: 12, paddingVertical: 4, borderRadius: 8, backgroundColor: '#1c1c1e' },
-  zoomBtnText: { color: '#fff', fontSize: 12, fontWeight: '600' },
+  zoomTextAccessibility: { flexBasis: '100%' },
+  zoomBtn: { paddingHorizontal: 12, paddingVertical: 4, borderRadius: 8, backgroundColor: '#1c1c1e', justifyContent: 'center' },
+  zoomBtnText: { color: '#fff', fontSize: 12, fontWeight: '600', textAlign: 'center' },
   area: { flex: 1 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
   emptyText: { color: '#a1a1a6', fontSize: 14, textAlign: 'center' },
+  sampleStatus: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    padding: 20,
+    backgroundColor: 'rgba(0,0,0,0.72)',
+  },
+  sampleStatusText: { color: '#fff', fontSize: 13, fontWeight: '600', textAlign: 'center' },
+  retryButton: { backgroundColor: '#fff', borderRadius: 9, paddingHorizontal: 14, paddingVertical: 8, marginTop: 4 },
+  retryButtonText: { color: '#111', fontSize: 13, fontWeight: '700' },
   labelWrap: {
     position: 'absolute',
     left: 10,
@@ -577,8 +668,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 6,
+    maxWidth: '85%',
   },
-  label: { color: '#fff', fontSize: 11, fontWeight: '600' },
+  labelWrapAccessibility: { maxWidth: '90%' },
+  wipeSecondLabelAccessibility: { top: 10, bottom: undefined },
+  label: { color: '#fff', fontSize: 11, fontWeight: '600', flexShrink: 1 },
   divider: { position: 'absolute', top: 0, bottom: 0, width: 2, backgroundColor: '#fff' },
   handleHit: { position: 'absolute', top: 0, bottom: 0, width: HANDLE_W, alignItems: 'center', justifyContent: 'center' },
   knob: { width: 30, height: 30, borderRadius: 15, backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
@@ -600,5 +694,5 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: '#555',
   },
-  chooseText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  chooseText: { color: '#fff', fontSize: 14, fontWeight: '600', textAlign: 'center' },
 });

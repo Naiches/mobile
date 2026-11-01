@@ -3,11 +3,14 @@ import { beforeEach, describe, expect, mock, test } from 'bun:test';
 
 let prefs: Record<string, unknown> = {};
 let strictError: Error | null = null;
-const setCalls: Array<[string, unknown]> = [];
+const setCalls: Array<[string, unknown, AbortSignal | undefined]> = [];
 mock.module('./api', () => ({
   getPreferenceValue: async (key: string) => prefs[key] ?? null,
   getPreferenceValueStrict: async (key: string) => { if (strictError) throw strictError; return prefs[key] ?? null; },
-  setPreferenceValue: async (key: string, value: unknown) => { setCalls.push([key, value]); prefs[key] = value; },
+  setPreferenceValue: async (key: string, value: unknown, signal?: AbortSignal) => {
+    setCalls.push([key, value, signal]);
+    prefs[key] = value;
+  },
 }));
 
 const s = await import('./photo-preview-settings');
@@ -55,6 +58,11 @@ describe('load/save', () => {
   test('save sends an object value', async () => {
     await s.savePhotoPreviewSetting({ enabled: true, format: 'jpeg', px: 1280 });
     expect(setCalls[0][1]).toEqual({ enabled: true, format: 'jpeg', px: 1280 });
+  });
+  test('save forwards cancellation to the preference request', async () => {
+    const abort = new AbortController();
+    await s.savePhotoPreviewSetting({ enabled: true, format: 'heic', px: 2560 }, abort.signal);
+    expect(setCalls[0][2]).toBe(abort.signal);
   });
   test('save then load round-trips under the photo_previews key', async () => {
     await s.savePhotoPreviewSetting({ enabled: true, format: 'jpeg', px: 1280 });

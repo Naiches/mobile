@@ -13,6 +13,8 @@ export interface EncodeQueue {
   enqueue(key: string): void;
   /** Add or move to the front of the line (no-op when running or done). */
   prioritize(key: string): void;
+  /** Forget a completed outcome and put the key at the front again. */
+  retry(key: string): void;
   /** Drop every waiting key (a running one still finishes and reports). */
   clear(): void;
   /** Forget which keys are done, e.g. after the cache they refer to is gone. */
@@ -60,6 +62,12 @@ export function createEncodeQueue<T>(
     },
     prioritize(key) {
       if (known(key)) return;
+      waiting = [key, ...waiting.filter((k) => k !== key)];
+      pump();
+    },
+    retry(key) {
+      if (running === key) return;
+      done.delete(key);
       waiting = [key, ...waiting.filter((k) => k !== key)];
       pump();
     },

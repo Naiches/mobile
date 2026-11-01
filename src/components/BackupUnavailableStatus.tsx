@@ -19,8 +19,11 @@ export function BackupUnavailableStatus({
   style?: StyleProp<ViewStyle>;
 }) {
   return (
-    <View testID={BACKUP_UNAVAILABLE_STATUS_TEST_ID} style={style}>
-      <Text style={{ fontSize: 13, lineHeight: 18, color }}>
+    <View
+      testID={BACKUP_UNAVAILABLE_STATUS_TEST_ID}
+      style={[{ minWidth: 0, flexShrink: 1 }, style]}
+    >
+      <Text style={{ minWidth: 0, flexShrink: 1, fontSize: 13, lineHeight: 18, color }}>
         {ANDROID_BACKUP_UNAVAILABLE_COPY}
       </Text>
     </View>

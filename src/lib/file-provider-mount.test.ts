@@ -47,6 +47,10 @@ mock.module('../../modules/beebeeb-crypto', () => ({
   },
   removeFileProviderAccess: async () => ({ registered: false }),
   removeFileProviderEntries: async () => 0,
+  setFileProviderProtectedFolder: async (id: string | null) => {
+    nativeCalls.push({ fn: 'setFileProviderProtectedFolder', args: [id] });
+    return true;
+  },
   syncFileProviderCache: async (entries: unknown[], prune: boolean, pruneParents: unknown) => {
     nativeCalls.push({ fn: 'syncFileProviderCache', args: [entries, prune, pruneParents] });
     onSyncFileProviderCache?.(entries, prune, pruneParents);
@@ -80,7 +84,7 @@ mock.module('./lock-state', () => ({
   wasRecentlyUnlocked: () => true,
 }));
 
-const { mountTrustedFileProvider, registerTrustedFileProviderDomain, resetTrustedFileProviderDomain, populateFileProviderCache, syncDecryptedEntriesToFileProvider } = await import('./file-provider-mount');
+const { mountTrustedFileProvider, registerTrustedFileProviderDomain, resetTrustedFileProviderDomain, populateFileProviderCache, syncDecryptedEntriesToFileProvider, setFileProviderProtectedBackupsRoot } = await import('./file-provider-mount');
 const { plaintextGate } = await import('./plaintext-gate');
 const decryptMetadata = async () => 'unused';
 
@@ -174,7 +178,9 @@ describe('populateFileProviderCache (task 1593 round 4 — walk holds ONE lease 
       },
     });
     expect(count).toBe(25);
-    expect(sizes).toEqual([12, 12, 1]);
+    // The shared background-name worker uses bounded 100-row batches so a
+    // large vault yields 50 times, rather than forcing 417 fixed-delay turns.
+    expect(sizes).toEqual([25]);
     expect(individual).toBe(0);
     expect(nativeCalls[0].args[0][0].name_decrypted).toBe('f0.jpg');
   });
@@ -264,5 +270,16 @@ describe('populateFileProviderCache (task 1593 round 4 — walk holds ONE lease 
     await purged;
     expect(sweepRan).toBe(true);
     expect(plaintextGate.isOpen()).toBe(false); // stays closed until open()
+  });
+});
+
+describe('setFileProviderProtectedBackupsRoot', () => {
+  test('publishes the id to the shared cache, and null clears it', async () => {
+    await setFileProviderProtectedBackupsRoot('root-1');
+    await setFileProviderProtectedBackupsRoot(null);
+    expect(nativeCalls).toEqual([
+      { fn: 'setFileProviderProtectedFolder', args: ['root-1'] },
+      { fn: 'setFileProviderProtectedFolder', args: [null] },
+    ]);
   });
 });
