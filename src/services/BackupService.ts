@@ -81,6 +81,7 @@ import {
   syncDecryptedEntriesToFileProvider,
 } from '../lib/file-provider-mount';
 import { getProtectedBackupsRootId, setProtectedBackupsRootId } from '../lib/protected-folders';
+import { isMailBackupFolderName, MAIL_BACKUP_FOLDER_NAME } from '../lib/protected-backup-folders';
 import { DEVICE_MANIFEST_NAME } from '../lib/hidden-system-files';
 // Task 1594: stop (never fork the tree) when this key can't read the names.
 import { VaultKeyMismatchError } from './vault-key-mismatch';
@@ -272,6 +273,13 @@ interface DeviceInfo {
 
 function deviceName(): string {
   return Device.deviceName ?? 'Unknown Device';
+}
+
+function deviceFolderName(): string {
+  const name = deviceName();
+  // The exact reserved name belongs to the separate mail-backup product.
+  // Keep the phone's familiar name as the base while avoiding that direct child.
+  return isMailBackupFolderName(name) ? `${MAIL_BACKUP_FOLDER_NAME} (Device)` : name;
 }
 
 /**
@@ -829,6 +837,7 @@ function pickOldest(group: FileEntry[]): FileEntry {
 async function mergeSameNamedChildFolders(
   parentId: string | undefined,
   onlyName?: string,
+  skipMailBackupFolder = false,
 ): Promise<MergeLevelResult> {
   const children = await listAllFiles(parentId);
 
@@ -839,6 +848,9 @@ async function mergeSameNamedChildFolders(
     const name = await decryptName(f);
     if (name == null) continue; // undecryptable — leave it alone
     if (onlyName != null && name !== onlyName) continue;
+    // This flag is used only for direct children of Backups. Excluding the
+    // folder from survivors also prevents recursion into its entire subtree.
+    if (skipMailBackupFolder && isMailBackupFolderName(name)) continue;
     const list = groups.get(name) ?? [];
     list.push(f);
     groups.set(name, list);
@@ -915,7 +927,7 @@ async function mergeSameNamedChildFolders(
 /** Recurse into a Backups subtree folder, merging same-named child folders at
  *  each level down to MAX_MERGE_DEPTH (device, then category). */
 async function mergeBackupSubtree(folderId: string, depth: number): Promise<boolean> {
-  const level = await mergeSameNamedChildFolders(folderId);
+  const level = await mergeSameNamedChildFolders(folderId, undefined, depth === 1);
   let clean = level.fullyClean;
   if (depth < MAX_MERGE_DEPTH) {
     for (const survivor of level.survivors) {
@@ -1326,7 +1338,7 @@ export async function ensureBackupFolders(
   // only. `getDeviceInfo()` also reads the device id, which now rejects
   // while the keychain cannot be read (it never mints one), and that must
   // not stop the folder resolve.
-  const info = { device_name: deviceName() };
+  const info = { device_name: deviceFolderName() };
   const rootId = await ensureFolder(undefined, ROOT_FOLDER_NAME);
   if (isCurrentAccountEpoch(epoch)) publishBackupsRoot(rootId);
   const deviceFolderId = await ensureFolder(rootId, info.device_name);
@@ -1372,7 +1384,7 @@ export async function ensureAppBackupFolder(appName: string): Promise<string> {
   const rootId = await ensureFolder(undefined, ROOT_FOLDER_NAME);
   if (isCurrentAccountEpoch(epoch)) publishBackupsRoot(rootId);
   const folderId = await ensureFolder(rootId, appName);
-  const merged = await mergeSameNamedChildFolders(rootId, appName);
+  const merged = await mergeSameNamedChildFolders(rootId, appName, true);
   return merged.survivors[0]?.id ?? folderId;
 }
 

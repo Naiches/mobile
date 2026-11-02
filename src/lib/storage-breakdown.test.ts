@@ -75,6 +75,24 @@ describe('computeStorageBreakdown', () => {
     expect(b.yourFiles.count).toBe(0);
   });
 
+  test('the beebeeb Mail Backup subtree is other backup data, not a device', () => {
+    const rows = [
+      folder('root', null, 'Backups'),
+      folder('mail', 'root', 'beebeeb Mail Backup'),
+      // Account ids are opaque to mobile and can happen to match category names.
+      folder('account', 'mail', 'Contacts'),
+      folder('nested', 'account', 'Camera Roll'),
+      file('bundle-a', 'account', 40, 'mail-1.zip'),
+      file('bundle-b', 'nested', 60, 'mail-2.zip'),
+    ];
+    const b = computeStorageBreakdown({ rows, backupsRootId: 'root', totalBytes: 100 });
+    expect(b.backups.other).toEqual({ bytes: 100, count: 2 });
+    expect(b.backups.contactsCalendar).toEqual({ bytes: 0, count: 0 });
+    expect(b.backups.cameraRoll).toEqual({ bytes: 0, count: 0 });
+    expect(b.backups.total).toEqual({ bytes: 100, count: 2 });
+    expect(b.yourFiles.count).toBe(0);
+  });
+
   test('a file named like a category outside Backups is a normal file', () => {
     const rows = [...backupTree, folder('c2', null, 'Camera Roll'), file('x', 'c2', 9, 'a.jpg')];
     const b = computeStorageBreakdown({ rows, backupsRootId: 'root', totalBytes: 9 });

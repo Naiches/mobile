@@ -10,6 +10,8 @@
  * contradict the server's total.
  */
 
+import { isMailBackupFolderName } from './protected-backup-folders';
+
 export interface BreakdownRow {
   id: string;
   parentId: string | null;
@@ -159,7 +161,10 @@ export function computeStorageBreakdown(input: {
       const id = path[i]!;
       let z: Zone;
       if (zone === NONE) z = NONE;
-      else if (zone === ROOT) z = norm(byId.get(id)?.name) === 'whatsapp' ? 'whatsapp' : DEVICE;
+      else if (zone === ROOT) {
+        const name = byId.get(id)?.name;
+        z = isMailBackupFolderName(name) ? 'other' : norm(name) === 'whatsapp' ? 'whatsapp' : DEVICE;
+      }
       else if (zone === DEVICE) z = BUCKET_BY_FOLDER_NAME[norm(byId.get(id)?.name)] ?? 'other';
       else z = zone;
       zones.set(id, z);

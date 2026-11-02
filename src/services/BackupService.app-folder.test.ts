@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, mock, test } from 'bun:test';
 mock.module('expo-constants', () => ({ default: { expoConfig: { version: '0.9.0' } } }));
 mock.module('expo-application', () => ({ nativeApplicationVersion: '1.0.1', nativeBuildVersion: '8' }));
 
-type Entry = { id: string; parent_id: string | null; is_folder: boolean; name_encrypted: string; created_at: string };
+type Entry = { id: string; parent_id: string | null; is_folder: boolean; name_encrypted: string; created_at: string; size_bytes?: number };
 
 let idCounter = 0;
 const listings = new Map<string, Entry[]>();
@@ -18,6 +18,9 @@ const created: Array<{ parentId: string | undefined; id: string }> = [];
 const readable = new Map<string, string>();
 const moves: Array<{ id: string; parentId: string }> = [];
 const renames: string[] = [];
+const deleted: string[] = [];
+const trashed: string[] = [];
+const listedParents: string[] = [];
 
 function sealed(id: string, parent: string | null, isFolder = true): Entry {
   return {
@@ -42,7 +45,12 @@ mock.module('@react-native-async-storage/async-storage', () => ({
     getAllKeys: async () => [],
   },
 }));
-mock.module('expo-file-system/legacy', () => ({ documentDirectory: 'file:///tmp/docs/', cacheDirectory: 'file:///tmp/cache/' }));
+mock.module('expo-file-system/legacy', () => ({
+  documentDirectory: 'file:///tmp/docs/',
+  cacheDirectory: 'file:///tmp/cache/',
+  writeAsStringAsync: async () => {},
+  deleteAsync: async () => {},
+}));
 const secure = new Map<string, string>();
 mock.module('expo-secure-store', () => ({
   getItemAsync: async (k: string) => secure.get(k) ?? null,
@@ -50,7 +58,7 @@ mock.module('expo-secure-store', () => ({
   deleteItemAsync: async (k: string) => { secure.delete(k); },
 }));
 mock.module('react-native', () => ({ Platform: { OS: 'ios' } }));
-mock.module('expo-device', () => ({ deviceName: 'bb-ios27', modelName: 'iPhone 17 Pro', osName: 'iOS', osVersion: '27.0' }));
+mock.module('expo-device', () => ({ deviceName: 'beebeeb Mail Backup', modelName: 'iPhone 17 Pro', osName: 'iOS', osVersion: '27.0' }));
 
 mock.module('../lib/api', () => ({
   createFolder: async (_nameEncrypted: string, parentId: string | undefined, folderId: string) => {
@@ -59,9 +67,12 @@ mock.module('../lib/api', () => ({
     listings.set(parentId ?? 'root', [...(listings.get(parentId ?? 'root') ?? []), sealed(folderId, parentId ?? null)]);
     return { id: folderId, parent_id: parentId ?? null };
   },
-  deleteFile: async () => {},
+  deleteFile: async (id: string) => { deleted.push(id); },
   downloadFile: async () => { throw new Error('not used'); },
-  listAllFiles: async (parentId?: string) => [...(listings.get(parentId ?? 'root') ?? [])],
+  listAllFiles: async (parentId?: string) => {
+    listedParents.push(parentId ?? 'root');
+    return [...(listings.get(parentId ?? 'root') ?? [])];
+  },
   findFile: async (parentId: string | undefined, match: (f: Entry) => boolean | Promise<boolean>) => {
     for (const f of listings.get(parentId ?? 'root') ?? []) {
       if (await match(f)) return f;
@@ -81,6 +92,7 @@ mock.module('../lib/api', () => ({
   },
   renameFile: async (id: string) => { renames.push(id); },
   trashFiles: async (ids: string[]) => {
+    trashed.push(...ids);
     for (const [parent, entries] of listings) listings.set(parent, entries.filter((e) => !ids.includes(e.id)));
     return { trashed: ids, already_trashed: [], missing: [] };
   },
@@ -131,7 +143,12 @@ mock.module('../lib/runtime-trace', () => ({
 }));
 
 
-const { ensureAppBackupFolder, setBackupEncryption } = await import('./BackupService');
+const {
+  ensureAppBackupFolder,
+  ensureBackupFolders,
+  setBackupEncryption,
+  updateDeviceManifest,
+} = await import('./BackupService');
 
 const names = (parent: string) => (listings.get(parent) ?? []).map((e) => readable.get(e.id));
 
@@ -140,6 +157,10 @@ beforeEach(() => {
   created.length = 0;
   readable.clear();
   moves.length = 0;
+  renames.length = 0;
+  deleted.length = 0;
+  trashed.length = 0;
+  listedParents.length = 0;
   secure.clear();
   idCounter = 0;
   setBackupEncryption({
@@ -163,6 +184,46 @@ function existingBackups() {
   readable.set('backups', 'Backups');
   listings.set('backups', []);
 }
+
+describe('reserved mail backup folder', () => {
+  test('repair and device cleanup leave it alone while repairing other duplicates', async () => {
+    existingBackups();
+    listings.set('backups', [
+      { ...sealed('mail-old', 'backups'), created_at: '2026-09-01T00:00:00Z' },
+      { ...sealed('mail-new', 'backups'), created_at: '2026-09-02T00:00:00Z' },
+      { ...sealed('phone-old', 'backups'), created_at: '2026-09-01T00:00:00Z' },
+      { ...sealed('phone-new', 'backups'), created_at: '2026-09-02T00:00:00Z' },
+    ]);
+    readable.set('mail-old', 'beebeeb Mail Backup');
+    readable.set('mail-new', 'beebeeb Mail Backup');
+    readable.set('phone-old', 'Other Phone');
+    readable.set('phone-new', 'Other Phone');
+
+    const opaqueMailFile = { ...sealed('opaque-mail-file', 'mail-new', false), size_bytes: 512 };
+    const mailManifest = { ...sealed('mail-manifest', 'mail-old', false), size_bytes: 512 };
+    readable.set('mail-manifest', '.device.json');
+    listings.set('mail-old', [mailManifest]);
+    listings.set('mail-new', [opaqueMailFile]);
+    listings.set('phone-old', []);
+    listings.set('phone-new', [plaintext('regular-child', 'phone-new', 'photo.jpg', false)]);
+
+    const { deviceFolderId } = await ensureBackupFolders('camera_roll');
+    await updateDeviceManifest({ keep_vault_unlocked: true });
+
+    expect(deviceFolderId).not.toBe('mail-old');
+    expect(deviceFolderId).not.toBe('mail-new');
+    expect(readable.get(deviceFolderId)).toBe('beebeeb Mail Backup (Device)');
+    expect(listedParents).not.toContain('mail-old');
+    expect(listedParents).not.toContain('mail-new');
+    expect(moves).not.toContainEqual({ id: 'opaque-mail-file', parentId: 'mail-old' });
+    expect(trashed).not.toContain('mail-new');
+    expect(deleted).not.toContain('opaque-mail-file');
+    expect(deleted).not.toContain('mail-manifest');
+
+    expect(moves).toContainEqual({ id: 'regular-child', parentId: 'phone-old' });
+    expect(trashed).toContain('phone-new');
+  });
+});
 
 describe('ensureAppBackupFolder', () => {
   test('creates Backups › WhatsApp on first use, then reuses it', async () => {
