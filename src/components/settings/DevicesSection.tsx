@@ -24,6 +24,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -152,6 +153,8 @@ interface Props {
 }
 
 export default function DevicesSection({ c }: Props) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [devices, setDevices] = useState<ClientDevice[]>([]);
   const [sessions, setSessions] = useState<ClientSession[]>([]);
   const [loading, setLoading] = useState(true);
@@ -323,7 +326,7 @@ export default function DevicesSection({ c }: Props) {
 
         {/* Device header */}
         <TouchableOpacity
-          style={styles.deviceRow}
+          style={[styles.deviceRow, accessibilityLayout && styles.deviceRowAccessibility]}
           activeOpacity={0.6}
           onPress={() => toggleDevice(device.id)}
           accessibilityRole="button"
@@ -340,14 +343,14 @@ export default function DevicesSection({ c }: Props) {
             )}
           </View>
 
-          <View style={{ flex: 1, minWidth: 0 }}>
+          <View style={[styles.deviceInfo, accessibilityLayout && styles.deviceInfoAccessibility]}>
             <Text
               style={{ fontSize: 17, fontWeight: stopped ? '500' : '600', color: stopped ? c.ink3 : c.ink }}
-              numberOfLines={1}
+              numberOfLines={accessibilityLayout ? 3 : 1}
             >
               {device.hostname}
             </Text>
-            <Text style={{ fontSize: 13, marginTop: 2 }} numberOfLines={1}>
+            <Text style={{ fontSize: 13, marginTop: 2 }} numberOfLines={accessibilityLayout ? undefined : 1}>
               <Text style={{ fontFamily: fonts.mono, color: c.ink3 }}>
                 {device.platform}{device.bb_version ? ` ${device.bb_version}` : ''}
               </Text>
@@ -372,7 +375,7 @@ export default function DevicesSection({ c }: Props) {
           </View>
 
           {deviceSessions.length > 0 && (
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginLeft: 6 }}>
+            <View style={[styles.sessionCount, accessibilityLayout && styles.sessionCountAccessibility]}>
               <Text style={{ fontFamily: fonts.mono, fontSize: 13, color: c.ink3 }}>
                 {deviceSessions.length}
               </Text>
@@ -401,7 +404,7 @@ export default function DevicesSection({ c }: Props) {
                           }}
                         />
                       )}
-                      <View style={styles.sessionRow}>
+                      <View style={[styles.sessionRow, accessibilityLayout && styles.sessionRowAccessibility]}>
                         {/* Status dot */}
                         <View
                           style={[
@@ -410,14 +413,14 @@ export default function DevicesSection({ c }: Props) {
                           ]}
                         />
                         <View style={{ flex: 1, minWidth: 0 }}>
-                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                          <View style={[styles.sessionTitleRow, accessibilityLayout && styles.sessionTitleRowAccessibility]}>
                             <Text
                               style={{
                                 fontSize: 13,
                                 fontWeight: '400',
                                 color: c.ink,
                               }}
-                              numberOfLines={1}
+                              numberOfLines={accessibilityLayout ? undefined : 1}
                             >
                               {session.name}
                             </Text>
@@ -539,6 +542,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     gap: 12,
   },
+  deviceRowAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap', paddingVertical: 12 },
+  deviceInfo: { flex: 1, minWidth: 0 },
+  deviceInfoAccessibility: { flexBasis: '70%' },
+  sessionCount: { flexDirection: 'row', alignItems: 'center', gap: 4, marginLeft: 6 },
+  sessionCountAccessibility: { marginLeft: 48 },
   rowSep: { height: StyleSheet.hairlineWidth, marginLeft: 16 },
   tile: {
     width: 36,
@@ -572,6 +580,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingLeft: 44,
   },
+  sessionRowAccessibility: { flexWrap: 'wrap', paddingLeft: 20, gap: 6 },
+  sessionTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  sessionTitleRowAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   statusDot: {
     width: 7,
     height: 7,

@@ -14,7 +14,6 @@ import type { FileEntry } from './api';
 import type { CachedFileIndex } from './file-index-cache';
 import { loadFileIndex } from './file-index-loader';
 import { photoCandidatesFromIndex } from './photo-candidates';
-import { filterByExcludedFolders, filterByExcludedFoldersDirect } from './photo-library-filter';
 
 export interface PhotoCandidatesOptions {
   /** Explicit refresh (pull-to-refresh, retry after a bulk action found
@@ -22,12 +21,18 @@ export interface PhotoCandidatesOptions {
   force?: boolean;
 }
 
-export async function getPhotoCandidates(
+/** The Photos tab's raw material: the media rows, and the folder rows that place them. */
+export interface PhotoLibrary {
+  candidates: FileEntry[];
+  /** Every live folder row of the index, for source membership. Null on the
+   *  legacy media endpoint, which has no folder tree. */
+  folders: FileEntry[] | null;
+}
+
+export async function getPhotoLibrary(
   cachedIndex?: CachedFileIndex | null,
-  excludedFolderIds?: Set<string>,
   options: PhotoCandidatesOptions = {},
-): Promise<FileEntry[]> {
-  const excluded = excludedFolderIds ?? new Set<string>();
+): Promise<PhotoLibrary> {
   try {
     const { files } = await loadFileIndex({
       force: options.force,
@@ -39,8 +44,10 @@ export async function getPhotoCandidates(
       ...(cachedIndex !== undefined ? { cached: cachedIndex } : {}),
     });
     if (files) {
-      // Pass the FULL index (folder rows included) so exclusion is transitive.
-      return filterByExcludedFolders(files, photoCandidatesFromIndex(files), excluded);
+      return {
+        candidates: photoCandidatesFromIndex(files),
+        folders: files.filter((f) => f.is_folder),
+      };
     }
   } catch (err) {
     // Older API builds do not have /files/index yet. Because /files/{id}
@@ -52,7 +59,13 @@ export async function getPhotoCandidates(
     }
   }
 
-  // Legacy /files/media path has no folder tree — degrade to direct-parent
-  // exclusion (transitive exclusion only matters on the index path above).
-  return filterByExcludedFoldersDirect(await getAllImages(), excluded);
+  // Legacy /files/media path has no folder tree: no source filtering is possible.
+  return { candidates: await getAllImages(), folders: null };
+}
+
+export async function getPhotoCandidates(
+  cachedIndex?: CachedFileIndex | null,
+  options: PhotoCandidatesOptions = {},
+): Promise<FileEntry[]> {
+  return (await getPhotoLibrary(cachedIndex, options)).candidates;
 }

@@ -37,7 +37,7 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Image, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Image, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import { colors, fonts } from '../../theme';
 import { extractRawPreview, type RawExifInfo } from '../../lib/raw-extract';
@@ -65,6 +65,8 @@ interface RawRendererProps {
 type RawRenderStatus = 'loading' | 'ready' | 'failed';
 
 export function RawRenderer({ uri, fileName, formatLabel, cacheKey, onExifInfo }: RawRendererProps) {
+  const { fontScale } = useWindowDimensions();
+  const largeText = fontScale >= 1.35;
   const [status, setStatus] = useState<RawRenderStatus>('loading');
   const [previewUri, setPreviewUri] = useState<string | null>(null);
   const [imageFailed, setImageFailed] = useState(false);
@@ -152,10 +154,12 @@ export function RawRenderer({ uri, fileName, formatLabel, cacheKey, onExifInfo }
         testID="raw-image"
         onError={() => setImageFailed(true)}
       />
-      <View style={styles.captionWrap} pointerEvents="none">
-        <Text style={styles.captionText} testID="raw-caption">
-          Embedded preview · download for full quality
-        </Text>
+      <View style={[styles.captionLayer, largeText && styles.captionLayerLargeText]} pointerEvents="none">
+        <View style={styles.captionWrap}>
+          <Text style={styles.captionText} testID="raw-caption">
+            Embedded preview · download for full quality
+          </Text>
+        </View>
       </View>
     </View>
   );
@@ -196,10 +200,18 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 18,
   },
-  captionWrap: {
+  captionLayer: {
     position: 'absolute',
     bottom: 16,
-    alignSelf: 'center',
+    left: 16,
+    right: 16,
+    alignItems: 'center',
+  },
+  captionLayerLargeText: {
+    bottom: 128,
+  },
+  captionWrap: {
+    maxWidth: '100%',
     backgroundColor: 'rgba(0,0,0,0.6)',
     paddingHorizontal: 12,
     paddingVertical: 6,
@@ -209,6 +221,7 @@ const styles = StyleSheet.create({
     color: colors.white,
     fontSize: 11,
     fontFamily: fonts.mono,
+    textAlign: 'center',
   },
 });
 

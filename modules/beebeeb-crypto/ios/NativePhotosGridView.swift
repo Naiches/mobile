@@ -91,7 +91,7 @@ private final class PhotoGridLayout: UICollectionViewLayout {
 
   // 1322 — was 28, sized for a 13pt semibold label. The canvas month header is
   // SF 20/700, which needs the extra room plus breathing space above it.
-  private let headerHeight: CGFloat = 44
+  var headerHeight: CGFloat = 44
   private var transition: Transition?
   private var itemCounts: [Int] = []
   private var layoutWidth: CGFloat = 1
@@ -441,6 +441,8 @@ public final class NativePhotosGridView: ExpoView {
   private var pendingItemsAfterScroll: [NativePhotoGridItem]?
   private var thumbnailPrefetchTasks: [String: Task<Void, Never>] = [:]
   private var isPinchingGrid = false
+  private var isDragSelecting = false
+  private var isSelectionLongPressActive = false
   private var autoscrollLink: CADisplayLink?
   private var autoscrollVelocity: CGFloat = 0
   private var lastViewportDragPoint: CGPoint?
@@ -458,6 +460,7 @@ public final class NativePhotosGridView: ExpoView {
   private lazy var gridLayout: PhotoGridLayout = {
     let layout = PhotoGridLayout()
     layout.currentColumns = currentColumns
+    layout.headerHeight = PhotoGridHeaderView.preferredHeight(compatibleWith: traitCollection)
     layout.itemCountsProvider = { [weak self] in
       self?.sections.map(\.items.count) ?? []
     }
@@ -514,6 +517,7 @@ public final class NativePhotosGridView: ExpoView {
     drag.cancelsTouchesInView = false
     selectionDragRecognizer = drag
     collectionView.addGestureRecognizer(drag)
+    collectionView.panGestureRecognizer.require(toFail: drag)
   }
 
   deinit {
@@ -527,6 +531,19 @@ public final class NativePhotosGridView: ExpoView {
   public override func layoutSubviews() {
     super.layoutSubviews()
     collectionView.frame = bounds
+  }
+
+  public override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+    super.traitCollectionDidChange(previousTraitCollection)
+    guard previousTraitCollection?.preferredContentSizeCategory != traitCollection.preferredContentSizeCategory else {
+      return
+    }
+
+    gridLayout.headerHeight = PhotoGridHeaderView.preferredHeight(compatibleWith: traitCollection)
+    gridLayout.invalidateLayout()
+    for header in collectionView.visibleSupplementaryViews(ofKind: UICollectionView.elementKindSectionHeader) {
+      header.setNeedsLayout()
+    }
   }
 
   func setItems(_ rawItems: [[String: Any]]) {
@@ -577,6 +594,7 @@ public final class NativePhotosGridView: ExpoView {
     selectedIds = selectedIds.intersection(Set(nextItems.map(\.id)))
     if selectedIds.isEmpty {
       selectionMode = false
+      setDragSelectionActive(false)
     }
     itemSignature = nextSignature
     let layoutChanged = nextLayoutSignature != layoutSignature
@@ -615,6 +633,9 @@ public final class NativePhotosGridView: ExpoView {
     guard ids != selectedIds || nextSelectionMode != selectionMode else { return }
     selectedIds = ids
     selectionMode = nextSelectionMode
+    if !nextSelectionMode {
+      setDragSelectionActive(false)
+    }
     applySelectedState()
   }
 
@@ -623,6 +644,7 @@ public final class NativePhotosGridView: ExpoView {
     selectionMode = enabled
     if !enabled {
       selectedIds.removeAll()
+      setDragSelectionActive(false)
     }
     applySelectedState()
   }
@@ -669,35 +691,68 @@ public final class NativePhotosGridView: ExpoView {
   }
 
   @objc private func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
-    guard recognizer.state == .began else { return }
-    let point = recognizer.location(in: collectionView)
-    guard let indexPath = collectionView.indexPathForItem(at: point),
-          let item = item(at: indexPath) else { return }
-    selectionMode = true
-    selectedIds = [item.id]
-    lastSelectionDragIndexPath = indexPath
-    applySelectedState()
-    dispatchSelectionChange()
+    switch recognizer.state {
+    case .began:
+      let point = recognizer.location(in: collectionView)
+      guard let indexPath = collectionView.indexPathForItem(at: point),
+            let item = item(at: indexPath) else { return }
+      isSelectionLongPressActive = true
+      selectionMode = true
+      selectedIds = [item.id]
+      lastSelectionDragIndexPath = indexPath
+      applySelectedState()
+      dispatchSelectionChange()
+    case .ended, .cancelled, .failed:
+      isSelectionLongPressActive = false
+      if !isDragSelecting {
+        setDragSelectionActive(false)
+      }
+    default:
+      break
+    }
   }
 
   @objc private func handleSelectionDrag(_ recognizer: UIPanGestureRecognizer) {
-    guard selectionMode else { return }
+    guard selectionMode else {
+      setDragSelectionActive(false)
+      return
+    }
     let contentPoint = recognizer.location(in: collectionView)
     let viewportPoint = recognizer.location(in: self)
     lastViewportDragPoint = viewportPoint
 
     switch recognizer.state {
     case .began:
-      selectDragPath(to: contentPoint)
+      setDragSelectionActive(true)
+      beginDragPath(to: contentPoint)
       updateAutoscroll(viewportPoint: viewportPoint)
     case .changed:
       selectDragPath(to: contentPoint)
       updateAutoscroll(viewportPoint: viewportPoint)
     default:
-      stopAutoscroll()
-      lastSelectionDragIndexPath = nil
+      setDragSelectionActive(false)
       dispatchSelectionChange()
     }
+  }
+
+  private func beginDragPath(to point: CGPoint) {
+    guard let indexPath = selectableIndexPath(at: point) else {
+      if !isSelectionLongPressActive {
+        lastSelectionDragIndexPath = nil
+      }
+      return
+    }
+    let anchor = PhotoGridDragSelectionPolicy.anchor(
+      forNewDragAt: indexPath,
+      pendingLongPressAnchor: lastSelectionDragIndexPath,
+      longPressIsActive: isSelectionLongPressActive
+    )
+    if anchor == indexPath {
+      selectItem(at: indexPath)
+    } else {
+      selectContiguousRange(from: anchor, to: indexPath)
+    }
+    lastSelectionDragIndexPath = indexPath
   }
 
   private func selectDragPath(to point: CGPoint) {
@@ -731,8 +786,15 @@ public final class NativePhotosGridView: ExpoView {
       return
     }
 
+    let itemCount = sections.reduce(0) { $0 + $1.items.count }
+    guard let selectedRange = PhotoGridDragSelectionPolicy.selectedRange(
+      from: startIndex,
+      to: endIndex,
+      itemCount: itemCount
+    ) else { return }
+
     var changed = false
-    for flatIndex in min(startIndex, endIndex)...max(startIndex, endIndex) {
+    for flatIndex in selectedRange {
       guard let indexPath = indexPath(forFlatItemIndex: flatIndex) else { continue }
       changed = selectItem(at: indexPath) || changed
     }
@@ -792,19 +854,13 @@ public final class NativePhotosGridView: ExpoView {
   }
 
   private func updateAutoscroll(viewportPoint: CGPoint) {
-    let edge: CGFloat = 112
-    let maxVelocity: CGFloat = 420
     let minY = collectionView.frame.minY + collectionView.adjustedContentInset.top
     let maxY = collectionView.frame.maxY - collectionView.adjustedContentInset.bottom
-    if viewportPoint.y < minY + edge {
-      let pressure = min(1, max(0, (minY + edge - viewportPoint.y) / edge))
-      autoscrollVelocity = -maxVelocity * pressure * pressure
-    } else if viewportPoint.y > maxY - edge {
-      let pressure = min(1, max(0, (viewportPoint.y - (maxY - edge)) / edge))
-      autoscrollVelocity = maxVelocity * pressure * pressure
-    } else {
-      autoscrollVelocity = 0
-    }
+    autoscrollVelocity = PhotoGridDragSelectionPolicy.autoscrollVelocity(
+      pointerY: viewportPoint.y,
+      visibleMinY: minY,
+      visibleMaxY: maxY
+    )
 
     if abs(autoscrollVelocity) > 1 {
       if autoscrollLink == nil {
@@ -833,7 +889,10 @@ public final class NativePhotosGridView: ExpoView {
     let minY = -collectionView.adjustedContentInset.top
     let maxY = max(minY, collectionView.contentSize.height - collectionView.bounds.height + collectionView.adjustedContentInset.bottom)
     let nextY = min(maxY, max(minY, collectionView.contentOffset.y + autoscrollVelocity * elapsed))
-    guard nextY != collectionView.contentOffset.y else { return }
+    guard nextY != collectionView.contentOffset.y else {
+      stopAutoscroll()
+      return
+    }
 
     collectionView.setContentOffset(CGPoint(x: collectionView.contentOffset.x, y: nextY), animated: false)
     if let viewportPoint = lastViewportDragPoint {
@@ -849,6 +908,18 @@ public final class NativePhotosGridView: ExpoView {
     autoscrollLink = nil
     autoscrollVelocity = 0
     lastAutoscrollTimestamp = 0
+  }
+
+  private func setDragSelectionActive(_ active: Bool) {
+    isDragSelecting = active
+    collectionView.isScrollEnabled = PhotoGridDragSelectionPolicy.isUserScrollingEnabled(
+      isDragSelecting: isDragSelecting
+    )
+    if !active {
+      stopAutoscroll()
+      lastViewportDragPoint = nil
+      lastSelectionDragIndexPath = nil
+    }
   }
 
   private func resetPinchMetrics() {
@@ -1209,6 +1280,7 @@ extension NativePhotosGridView: UICollectionViewDataSource, UICollectionViewDele
     (collectionView.cellForItem(at: indexPath) as? PhotoGridCell)?.setSelectionMode(true, selected: false)
     if selectedIds.isEmpty {
       selectionMode = false
+      setDragSelectionActive(false)
       applySelectedState()
     }
     dispatchSelectionChange()
@@ -1304,7 +1376,7 @@ extension NativePhotosGridView: UIGestureRecognizerDelegate {
 
   public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
     if gestureRecognizer === selectionDragRecognizer || otherGestureRecognizer === selectionDragRecognizer {
-      return otherGestureRecognizer === collectionView.panGestureRecognizer || gestureRecognizer === collectionView.panGestureRecognizer
+      return false
     }
     return gestureRecognizer is UIPinchGestureRecognizer || otherGestureRecognizer is UIPinchGestureRecognizer
   }
@@ -1562,6 +1634,7 @@ private final class PhotoGridCell: UICollectionViewCell {
 
 private final class PhotoGridHeaderView: UICollectionReusableView {
   static let reuseIdentifier = "PhotoGridHeaderView"
+  private static let minimumHeight: CGFloat = 44
 
   private let label = UILabel()
   private let count = UILabel()
@@ -1570,8 +1643,9 @@ private final class PhotoGridHeaderView: UICollectionReusableView {
     super.init(frame: frame)
     // 1322 — canvas Photos artboard: month headers are SF 20/700 sitting on
     // the background, not 13pt semibold chips.
-    label.font = UIFont.systemFont(ofSize: 20, weight: .bold)
-    count.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+    applyFonts()
+    label.adjustsFontForContentSizeCategory = true
+    count.adjustsFontForContentSizeCategory = true
     // Brand ink tokens as trait-aware fallback (light #2a2520 / dark #e8e6e3);
     // the RN side normally overrides via headerTextColor/headerCountColor so
     // the in-app appearance setting wins over the system trait.
@@ -1585,12 +1659,54 @@ private final class PhotoGridHeaderView: UICollectionReusableView {
     fatalError("init(coder:) has not been implemented")
   }
 
+  override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+    super.traitCollectionDidChange(previousTraitCollection)
+    guard previousTraitCollection?.preferredContentSizeCategory != traitCollection.preferredContentSizeCategory else {
+      return
+    }
+    applyFonts()
+    setNeedsLayout()
+  }
+
   override func layoutSubviews() {
     super.layoutSubviews()
     label.sizeToFit()
     count.sizeToFit()
-    label.frame.origin = CGPoint(x: 18, y: bounds.height - label.bounds.height - 6)
-    count.frame.origin = CGPoint(x: label.frame.maxX + 8, y: bounds.height - count.bounds.height - 7)
+    if traitCollection.preferredContentSizeCategory.isAccessibilityCategory {
+      label.frame.origin = CGPoint(x: 18, y: 6)
+      count.frame.origin = CGPoint(x: 18, y: label.frame.maxY + 2)
+    } else {
+      label.frame.origin = CGPoint(x: 18, y: bounds.height - label.bounds.height - 6)
+      count.frame.origin = CGPoint(x: label.frame.maxX + 8, y: bounds.height - count.bounds.height - 7)
+    }
+  }
+
+  private func applyFonts() {
+    label.font = Self.labelFont(compatibleWith: traitCollection)
+    count.font = Self.countFont(compatibleWith: traitCollection)
+  }
+
+  private static func labelFont(compatibleWith traitCollection: UITraitCollection?) -> UIFont {
+    UIFontMetrics(forTextStyle: .title3).scaledFont(
+      for: UIFont.systemFont(ofSize: 20, weight: .bold),
+      compatibleWith: traitCollection
+    )
+  }
+
+  private static func countFont(compatibleWith traitCollection: UITraitCollection?) -> UIFont {
+    UIFontMetrics(forTextStyle: .caption1).scaledFont(
+      for: UIFont.systemFont(ofSize: 13, weight: .regular),
+      compatibleWith: traitCollection
+    )
+  }
+
+  static func preferredHeight(compatibleWith traitCollection: UITraitCollection?) -> CGFloat {
+    let labelLineHeight = labelFont(compatibleWith: traitCollection).lineHeight
+    let countLineHeight = countFont(compatibleWith: traitCollection).lineHeight
+    if traitCollection?.preferredContentSizeCategory.isAccessibilityCategory == true {
+      return ceil(6 + labelLineHeight + 2 + countLineHeight + 7)
+    }
+    return max(minimumHeight, ceil(max(labelLineHeight, countLineHeight) + 13))
   }
 
   func configure(label: String, count: Int) {

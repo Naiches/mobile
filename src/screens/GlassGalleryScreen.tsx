@@ -653,7 +653,7 @@ export default function GlassGalleryScreen() {
                     : null,
                 ]}
               >
-                <Text style={[token, { color: c.ink, flex: 1 }]} numberOfLines={1}>
+                <Text style={[token, { color: c.ink, flex: 1 }]}>
                   {name}
                 </Text>
                 <Text style={[typeScale.caption2, styles.mono, { color: c.ink3 }]}>
@@ -704,7 +704,7 @@ export default function GlassGalleryScreen() {
                 ]}
               >
                 <View style={styles.cellText}>
-                  <Text style={[typeScale.body, { color: c.ink }]} numberOfLines={1}>
+                  <Text style={[typeScale.body, { color: c.ink }]}>
                     {row.label}
                   </Text>
                   <Text style={[typeScale.footnote, { color: c.ink3 }]}>{row.meta}</Text>
@@ -863,6 +863,7 @@ const styles = StyleSheet.create({
   group: { overflow: 'hidden' },
   typeRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'baseline',
     gap: 10,
     paddingHorizontal: 16,
@@ -874,6 +875,7 @@ const styles = StyleSheet.create({
   cellBody: {
     flex: 1,
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'center',
     gap: 8,
     paddingVertical: 13,

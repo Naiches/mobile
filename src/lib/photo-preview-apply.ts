@@ -227,8 +227,8 @@ export async function runApply(plan: ApplyPlan, opts: ApplyOptions): Promise<App
  * (`DELETE /files/previews`), then the local preview cache is emptied. Returns how
  * many the server removed; throws when the server could not be asked.
  */
-export async function turnOffPreviews(): Promise<number> {
-  const removed = await deleteAllPhotoPreviews();
+export async function turnOffPreviews(signal?: AbortSignal): Promise<number> {
+  const removed = await deleteAllPhotoPreviews(signal);
   await clearPreviewCache().catch(() => {});
   return removed;
 }

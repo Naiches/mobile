@@ -53,7 +53,6 @@ func expect(_ condition: Bool, _ label: String) {
 let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-jspeer-\(UUID().uuidString)", isDirectory: true)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 
 let schema = """
 CREATE TABLE IF NOT EXISTS backup_assets (
@@ -377,4 +376,6 @@ do {
 print("manifest-js-peer-test: \(failures.isEmpty ? "PASS" : "FAIL")")
 for f in failures { print("  FAILED: \(f)") }
 print("manifest-js-peer-test: \(total) assertions, \(failures.count) failed")
-exit(failures.isEmpty ? 0 : 1)
+let exitCode: Int32 = failures.isEmpty ? 0 : 1
+try? fm.removeItem(at: root)
+exit(exitCode)

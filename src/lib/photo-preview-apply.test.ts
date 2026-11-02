@@ -7,7 +7,8 @@ let inFlight = 0;
 let maxInFlight = 0;
 let uploadImpl: (...a: any[]) => Promise<unknown>;
 let bulkCalls = 0;
-let bulkImpl: () => Promise<number>;
+let bulkImpl: (signal?: AbortSignal) => Promise<number>;
+let bulkSignals: Array<AbortSignal | undefined> = [];
 let cacheCleared = 0;
 let dropped: string[] = [];
 let locked = false;
@@ -33,7 +34,11 @@ mock.module('../../modules/beebeeb-crypto', () => ({
 mock.module('./api', () => ({
   getApiUrl: () => 'http://api.test',
   getToken: async () => 'tok',
-  deleteAllPhotoPreviews: async () => { bulkCalls += 1; return bulkImpl(); },
+  deleteAllPhotoPreviews: async (signal?: AbortSignal) => {
+    bulkCalls += 1;
+    bulkSignals.push(signal);
+    return bulkImpl(signal);
+  },
 }));
 mock.module('./photo-preview-cache', () => ({
   clearPreviewCache: async () => { cacheCleared += 1; },
@@ -62,7 +67,7 @@ function opts(over = {}) {
 const plan = (n: number) => ({ toCreate: Array.from({ length: n }, (_, i) => `f${i}`), skippedNotOnPhone: 0 });
 
 beforeEach(() => {
-  store.clear(); uploads = []; inFlight = 0; maxInFlight = 0; bulkCalls = 0; cacheCleared = 0; dropped = [];
+  store.clear(); uploads = []; inFlight = 0; maxInFlight = 0; bulkCalls = 0; bulkSignals = []; cacheCleared = 0; dropped = [];
   accountId = 'acct-1'; generation = 0; locked = false; setItemCalls = 0;
   uploadImpl = async () => { await tick(); return { bytes: 1 }; };
   bulkImpl = async () => 13;
@@ -172,8 +177,10 @@ describe('runApply', () => {
 
 describe('turnOffPreviews / rebuildPreviews', () => {
   test('Off uses the bulk server route and empties the local cache', async () => {
-    expect(await turnOffPreviews()).toBe(13);
+    const abort = new AbortController();
+    expect(await turnOffPreviews(abort.signal)).toBe(13);
     expect(bulkCalls).toBe(1);
+    expect(bulkSignals).toEqual([abort.signal]);
     expect(cacheCleared).toBe(1);
   });
 

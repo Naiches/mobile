@@ -1,6 +1,7 @@
 import ExpoModulesCore
 #if os(iOS)
 import BackgroundTasks
+import MetricKit
 import UIKit
 
 // Registered in expo-module.config.json under apple.appDelegateSubscribers.
@@ -43,6 +44,8 @@ public class BeebeebAppDelegate: ExpoAppDelegateSubscriber {
     // (`app-delegate-launch-guard.test.ts`) fails if `.shared` is
     // reintroduced into this function.
     NativeBackupEngine.registerBackgroundTaskEarly()
+    // Run diagnostics: a handful of observer registrations, no I/O beyond one UserDefaults read.
+    RunDiagnostics.start()
     return true
   }
 
@@ -69,6 +72,94 @@ public class BeebeebAppDelegate: ExpoAppDelegateSubscriber {
     DispatchQueue.global(qos: .userInitiated).async {
       NativeBackupEngine.reattachBackgroundSessionForPendingEvents()
     }
+  }
+}
+
+/// Facts about how the previous run ended, kept in UserDefaults for the JS run log. Only plain
+/// numbers are stored: no file names, ids, paths or stack frames.
+///
+/// - `cleanExit` is set when iOS posts `willTerminate`. iOS rarely sends that for an app that
+///   was suspended in the background, so a missing marker after a background run means "killed
+///   while in the background", which JS infers.
+/// - MetricKit delivers crash diagnostics some time after the launch that follows a crash; they
+///   are kept until JS consumes them.
+enum RunDiagnostics {
+  private static let cleanExitKey = "io.beebeeb.runDiag.cleanExit"
+  private static let crashesKey = "io.beebeeb.runDiag.crashes"
+  private static let maxStoredCrashes = 5
+  private static let lock = NSLock()
+  private static var previousCleanExit = false
+  private static var started = false
+  private static var subscriber: AnyObject?
+
+  static func start() {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !started else { return }
+    started = true
+    let defaults = UserDefaults.standard
+    previousCleanExit = defaults.bool(forKey: cleanExitKey)
+    defaults.set(false, forKey: cleanExitKey)
+    NotificationCenter.default.addObserver(
+      forName: UIApplication.willTerminateNotification, object: nil, queue: nil
+    ) { _ in
+      UserDefaults.standard.set(true, forKey: cleanExitKey)
+      UserDefaults.standard.synchronize()
+    }
+    if #available(iOS 14.0, *) {
+      let metricSubscriber = RunDiagnosticsMetricSubscriber()
+      subscriber = metricSubscriber
+      MXMetricManager.shared.add(metricSubscriber)
+    }
+  }
+
+  /// The previous run's facts. The crash list is cleared once read.
+  static func consumePreviousRun() -> [String: Any] {
+    lock.lock()
+    defer { lock.unlock() }
+    let defaults = UserDefaults.standard
+    let crashes = defaults.array(forKey: crashesKey) as? [[String: Int]] ?? []
+    defaults.removeObject(forKey: crashesKey)
+    return ["cleanExit": previousCleanExit, "crashes": crashes]
+  }
+
+  static func storeCrashes(_ crashes: [[String: Int]]) {
+    guard !crashes.isEmpty else { return }
+    lock.lock()
+    defer { lock.unlock() }
+    let defaults = UserDefaults.standard
+    let existing = defaults.array(forKey: crashesKey) as? [[String: Int]] ?? []
+    defaults.set(Array((existing + crashes).suffix(maxStoredCrashes)), forKey: crashesKey)
+  }
+
+  /// `phys_footprint` of this process in bytes (what iOS compares with the memory limit), or 0.
+  static func physFootprintBytes() -> Int64 {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) {
+      $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+      }
+    }
+    return result == KERN_SUCCESS ? Int64(info.phys_footprint) : 0
+  }
+}
+
+@available(iOS 14.0, *)
+private final class RunDiagnosticsMetricSubscriber: NSObject, MXMetricManagerSubscriber {
+  func didReceive(_ payloads: [MXMetricPayload]) {}
+
+  func didReceive(_ payloads: [MXDiagnosticPayload]) {
+    var crashes: [[String: Int]] = []
+    for payload in payloads {
+      for crash in payload.crashDiagnostics ?? [] {
+        var entry: [String: Int] = [:]
+        if let exceptionType = crash.exceptionType { entry["exceptionType"] = exceptionType.intValue }
+        if let signal = crash.signal { entry["signal"] = signal.intValue }
+        crashes.append(entry)
+      }
+    }
+    RunDiagnostics.storeCrashes(crashes)
   }
 }
 #endif

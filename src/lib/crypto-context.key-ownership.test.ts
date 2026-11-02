@@ -234,6 +234,7 @@ mock.module('../../modules/beebeeb-crypto', () => cryptoMock);
 mock.module('../services/BackupService', () => ({
   setBackupEncryption: () => {},
   getKeepVaultUnlocked: async () => false,
+  resolveProtectedBackupsRoot: async () => null,
 }));
 // Task 1594 round 6 (reviewer follow-up): recorded (not just a no-op) so a
 // test can prove a specific trace fired — no existing test in this file

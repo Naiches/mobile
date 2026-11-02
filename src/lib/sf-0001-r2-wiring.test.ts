@@ -122,7 +122,7 @@ describe('M3/M4/M5: the extensions', () => {
   guarded(
     'M3 (round 3): the File Provider maps a mismatch to .cannotSynchronize with the mismatch sentence, never .notAuthenticated',
     fileProvider,
-    (s) => /if let mismatch = error as\? UploadItemIdEcho\.Mismatch \{\s*return NSFileProviderError\(\s*\.cannotSynchronize,\s*userInfo: \[NSLocalizedDescriptionKey: mismatch\.errorDescription \?\? UploadItemIdEcho\.message\]\s*\)\s*\}/.test(body(s, 'static func mapError(_ error: Error) -> Error {')),
+    (s) => /if let mismatch = error as\? UploadItemIdEcho\.Mismatch \{\s*return NSFileProviderError\(\s*\.cannotSynchronize,\s*userInfo: \[NSLocalizedDescriptionKey: mismatch\.errorDescription \?\? UploadItemIdEcho\.message\]\s*\)\s*\}/.test(body(s, 'private static func mappedError(_ error: Error) -> Error {')),
     (s) => s.replace(/(if let mismatch = error as\? UploadItemIdEcho\.Mismatch \{\s*return NSFileProviderError\(\s*)\.cannotSynchronize/, '$1.notAuthenticated'),
   );
   guarded(

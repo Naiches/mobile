@@ -1,13 +1,14 @@
 // @ts-nocheck -- compile the shipped Swift API against URLProtocol, no app/device.
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const nativeTest = process.platform === 'darwin' ? test : test.skip;
 nativeTest('File Provider follows all folder cursors and refuses partial or repeated pages', () => {
   const dir = mkdtempSync(join(tmpdir(), 'bb-files-paging-'));
+  try {
   writeFileSync(join(dir, 'Driver.swift'), String.raw`
 import Foundation
 
@@ -54,16 +55,27 @@ final class StubProtocol: URLProtocol {
         let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!
         guard query.contains(URLQueryItem(name: "parent_id", value: "folder")) else { fatalError("lost parent") }
       }
+      StubProtocol.requests = []
+      let capped = try await api.listFiles(parentId: nil, trashed: true, maxEntries: 350)
+      guard capped.count == 350, Set(capped.map(\.id)).count == 350 else { fatalError("expected exactly 350 capped rows, got \(capped.count)") }
+      guard StubProtocol.requests.count == 2 else { fatalError("capped listing fetched \(StubProtocol.requests.count) pages") }
+      for request in StubProtocol.requests {
+        let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!
+        guard query.contains(URLQueryItem(name: "trashed", value: "true")) else { fatalError("lost trashed flag") }
+      }
       StubProtocol.mode = "fail"
       do { _ = try await api.listFiles(parentId: nil); fatalError("partial listing accepted") } catch {}
       StubProtocol.mode = "repeat"
       do { _ = try await api.listFiles(parentId: nil); fatalError("repeated cursor accepted") } catch {}
-      print("paging: 5 assertions passed, 0 failed")
+      print("paging: 8 assertions passed, 0 failed")
     } catch { fatalError("unexpected error: \(error)") }
   }
 }
 `);
   execFileSync('swiftc', ['-module-cache-path', join(dir, 'modules'), join(import.meta.dir, '../../targets/file-provider/ApiClient.swift'), join(dir, 'Driver.swift'), '-o', join(dir, 'paging')], { timeout: 60000 });
   const output = execFileSync(join(dir, 'paging'), [], { encoding: 'utf8', timeout: 15000 });
-  expect(output).toContain('paging: 5 assertions passed, 0 failed');
+  expect(output).toContain('paging: 8 assertions passed, 0 failed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90000);

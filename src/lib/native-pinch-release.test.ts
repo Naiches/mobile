@@ -1,7 +1,7 @@
 // @ts-nocheck -- execute native gesture control flow with UIKit boundary stubs.
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const nativeTest = process.platform === 'darwin' ? test : test.skip;
@@ -17,6 +17,7 @@ nativeTest('native pinch freezes layout until one cross-dissolve on release; can
   };
   const methods = ['@objc private func handlePinch(', '  private func finishPinch(', '  private func cancelPinch(', '  private func columnsFor('].map(extract).join('\n');
   const dir = mkdtempSync(join(tmpdir(), 'bb-native-pinch-'));
+  try {
   writeFileSync(join(dir, 'main.swift'), String.raw`
 import Foundation
 import CoreGraphics
@@ -74,4 +75,7 @@ Fixture().run()
 `);
   execFileSync('swiftc', ['-module-cache-path',join(dir,'modules'),join(dir,'main.swift'),'-o',join(dir,'pinch')], {timeout:60000});
   expect(execFileSync(join(dir,'pinch'), [], {encoding:'utf8'})).toContain('5 assertions passed, 0 failed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90000);

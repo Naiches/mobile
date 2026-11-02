@@ -25,3 +25,23 @@ export function singleFlight<T>(run: () => Promise<T>): () => Promise<T> {
     return current;
   };
 }
+
+/** Coalesce overlapping work for the same key while allowing other keys through. */
+export function keyedSingleFlight<A, T, K = A>(
+  run: (arg: A) => Promise<T>,
+  keyOf: (arg: A) => K = ((arg: A) => arg as unknown as K),
+): (arg: A) => Promise<T> {
+  const inFlight = new Map<K, Promise<T>>();
+  return (arg: A) => {
+    const key = keyOf(arg);
+    const existing = inFlight.get(key);
+    if (existing) return existing;
+    const current = Promise.resolve()
+      .then(() => run(arg))
+      .finally(() => {
+        if (inFlight.get(key) === current) inFlight.delete(key);
+      });
+    inFlight.set(key, current);
+    return current;
+  };
+}

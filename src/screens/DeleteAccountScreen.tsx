@@ -1,24 +1,24 @@
 /**
- * Delete-account screen — task 1399, App Review guideline 5.1.1(v).
+ * Delete-account screen (App Review guideline 5.1.1(v): deletion must be
+ * offered in-app).
  *
- * "If your app supports account creation, you must also offer account
- * deletion within the app" — the web may only FINISH a deletion that was
- * INITIATED in-app. This screen replaces the old PrivacyScreen alert that
- * sent users to a web page (App Review rejects that pattern for an app like
- * ours — cloud storage is not on Apple's "highly regulated industries"
- * exception list).
+ * Deletion never starts from a session alone. The flow here:
+ *   1. type "DELETE" and tick the acknowledgement;
+ *   2. when the account has 2FA, type the current code (or a recovery code);
+ *   3. password step-up (`requestConfirmation`, the app's own sheet);
+ *   4. `POST /api/v1/account/delete/request` makes the server email a
+ *      single-use link (valid 1 hour). NOTHING is deleted yet.
+ *   5. The screen shows "Check your email" with a masked address and Resend.
+ *      The account is deleted only after the owner opens the link and
+ *      confirms on the page; the next API call after that signs the app out
+ *      through the usual account-deleted handler. This screen therefore
+ *      never says "deleted" and never signs out.
  *
- * Mirrors the web client's `src/pages/delete-account.tsx`: irreversibility
- * copy, a typed "DELETE" confirmation, an acknowledgement checkbox, then
- * step-up re-auth before the destructive call. On mobile, step-up re-auth is
- * `requestConfirmation()` (the app's own password-prompt sheet,
- * `ConfirmActionPrompt` → `confirmAction`, already used by
- * BiometricLockScreen) rather than a separate inline password field — one
- * password prompt, not two.
+ * A server without the request route (404) gets an "update needed" message.
+ * The screen deliberately does not fall back to the old DELETE endpoint.
  *
- * Voice: honest, no reassurance ("We can't recover this," not "your data is
- * safe"). No emojis. Danger styling matches PrivacyScreen's `ActionRow
- * danger` (c.red icon/text, no gradient, no icon decoration for drama).
+ * Voice: honest, no reassurance. No emojis. Danger styling matches
+ * PrivacyScreen's `ActionRow danger`.
  */
 
 import React, { useCallback, useMemo, useState } from 'react';
@@ -30,6 +30,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -39,8 +40,13 @@ import { useTheme } from '../lib/theme-context';
 import { radii, spacing, type Colors } from '../theme';
 import { useAuth } from '../lib/auth';
 import { requestConfirmation } from '../lib/confirm-action';
-import { deleteAccountPermanently, friendlyError } from '../lib/api';
-import { purgeAllPlaintextCaches, purgeThenSignOut } from '../lib/account-cleanup';
+import { ApiError, friendlyError, requestAccountDeletion } from '../lib/api';
+import {
+  DELETION_LINK_TTL_LABEL,
+  NEEDS_UPDATE_MESSAGE,
+  classifyDeletionRequestError,
+  maskEmail,
+} from '../lib/delete-account-flow';
 
 type C = Colors;
 
@@ -52,82 +58,172 @@ const DESTROYED_ITEMS: [string, string][] = [
   ['Device backups', 'Photo, contact, and calendar backups'],
 ];
 
-function formatShredDate(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
-}
-
 export default function DeleteAccountScreen() {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const { colors: c, resolved } = useTheme();
-  const { user, signOut } = useAuth();
+  const { user } = useAuth();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   const [confirmation, setConfirmation] = useState('');
   const [understood, setUnderstood] = useState(false);
+  const [totpCode, setTotpCode] = useState('');
+  const [serverRequiresCode, setServerRequiresCode] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [emailSent, setEmailSent] = useState(false);
+  const [resent, setResent] = useState(false);
 
-  // Client-side gate — tapping "Delete permanently" while this is false never
-  // calls handleDelete, so a typo in the confirmation field sends ZERO
-  // network requests (task 1399 verification).
-  const canDelete = confirmation === 'DELETE' && understood && !loading;
+  const needsCode = user?.totp_enabled === true || serverRequiresCode;
+  const codeReady = !needsCode || totpCode.trim().length >= 6;
 
-  const styles = useMemo(() => makeStyles(c, resolved), [c, resolved]);
+  // Client-side gate: a typo in the confirmation field, a missing code or an
+  // unticked box sends ZERO network requests.
+  const canDelete = confirmation === 'DELETE' && understood && codeReady && !loading;
+  // Resend only needs a fresh code (a used code is refused) and the password.
+  const canResend = codeReady && !loading;
 
-  const handleDelete = useCallback(async () => {
-    if (!canDelete) return;
+  const styles = useMemo(
+    () => makeStyles(c, resolved, accessibilityLayout),
+    [accessibilityLayout, c, resolved],
+  );
+
+  const send = useCallback(async (isResend: boolean) => {
     setError(null);
+    setResent(false);
 
-    // Step-up re-auth: prompts for the password and exchanges it for a
-    // confirmation token via `confirmAction` (OPAQUE, with the plaintext
-    // fallback for legacy accounts). A wrong password re-prompts in place
-    // (requestConfirmation's own retry loop) and NEVER returns a token, so
-    // `deleteAccountPermanently` below is never reached — the destructive
-    // DELETE /api/v1/auth/account call is not made until a correct password
-    // has been proven to the server.
+    // Step-up re-auth: the password sheet exchanges it for a single-use
+    // confirmation token. A wrong password re-prompts in place and never
+    // returns a token, so the request below is not made without one.
     const token = await requestConfirmation({
-      title: 'Confirm account deletion',
-      message: 'Enter your password to permanently delete your account. This cannot be undone.',
+      title: isResend ? 'Send the link again' : 'Confirm account deletion',
+      message: isResend
+        ? 'Enter your password to email a new confirmation link.'
+        : 'Enter your password. We will email you a link to confirm. Nothing is deleted until you use it.',
     });
-    if (!token) return; // cancelled, or requestConfirmation's sheet already showed the error
+    if (!token) return; // cancelled, or the sheet already showed the error
 
     setLoading(true);
     try {
-      const { shred_after } = await deleteAccountPermanently(confirmation, token);
-      const shredDate = formatShredDate(shred_after);
-      // Show the honest outcome BEFORE signing out — signOut() flips
-      // isAuthenticated and the navigator swaps to the unauthenticated stack
-      // out from under this screen, so the notice must be seen first.
-      await new Promise<void>((resolve) => {
-        Alert.alert(
-          'Account deleted',
-          `Your account has been permanently deleted. Encrypted data still on our servers is shredded after ${shredDate}.`,
-          [{ text: 'OK', onPress: () => resolve() }],
-        );
-      });
-      // Purge every on-disk plaintext cache BEFORE signing out (Codex P1 —
-      // the account is deleted server-side, but decrypted thumbnails/names/
-      // caches from this session must not survive on the device either).
-      // signOut() also purges internally (every ordinary sign-out does), but
-      // this call makes the deletion flow's own cleanup guarantee explicit
-      // rather than solely dependent on signOut()'s internal step order.
-      // Task 1667 round 9 (Codex P1): mode 'account-deleted' — the native
-      // reset keeps NOTHING of this account (no pending marks: user id,
-      // PhotoKit identifiers, file ids), and the signOut() that follows runs
-      // its own purge in the same mode (account-cleanup.ts, sticky until the
-      // next session), so it cannot carry anything forward again.
-      const deletedAccountId = user?.user_id ?? null;
-      await purgeThenSignOut({
-        purge: () => purgeAllPlaintextCaches({ mode: 'account-deleted', accountId: deletedAccountId }),
-        signOut,
-      });
+      await requestAccountDeletion(token, needsCode ? totpCode.trim() : undefined);
+      // Single-use codes: clear it so a resend asks for a fresh one.
+      setTotpCode('');
+      setEmailSent(true);
+      setResent(isResend);
     } catch (err) {
-      setError(friendlyError(err));
+      const failure = classifyDeletionRequestError(err, ApiError);
+      if (failure.kind === 'email_sent') {
+        setTotpCode('');
+        setEmailSent(true);
+        setResent(isResend);
+      } else if (failure.kind === 'needs_update') setError(NEEDS_UPDATE_MESSAGE);
+      else if (failure.kind === 'code_required') {
+        setServerRequiresCode(true);
+        setError('Enter the 6-digit code from your authenticator app, or a recovery code.');
+      }
+      else if (failure.kind === 'invalid_code') setError('That code did not match. Check your authenticator app and try again.');
+      else setError(friendlyError(err));
+    } finally {
       setLoading(false);
     }
-  }, [canDelete, confirmation, signOut, user?.user_id]);
+  }, [needsCode, totpCode]);
+
+  const handleDelete = useCallback(() => {
+    if (!canDelete) return Promise.resolve();
+    return send(false);
+  }, [canDelete, send]);
+
+  const handleResend = useCallback(() => {
+    if (!canResend) return Promise.resolve();
+    return send(true);
+  }, [canResend, send]);
+
+  const totpField = needsCode ? (
+    <>
+      <Text style={styles.label}>
+        {emailSent ? 'New 2FA code, to send the link again' : 'Two-factor code'}
+      </Text>
+      <TextInput
+        style={styles.input}
+        value={totpCode}
+        onChangeText={setTotpCode}
+        placeholder="123456"
+        placeholderTextColor={c.ink4}
+        keyboardType="default"
+        autoCapitalize="none"
+        autoCorrect={false}
+        spellCheck={false}
+        editable={!loading}
+        textContentType="oneTimeCode"
+        testID="delete-account-totp-input"
+        accessibilityLabel="Two-factor code"
+      />
+    </>
+  ) : null;
+
+  if (emailSent) {
+    return (
+      <View style={[styles.root, { paddingTop: insets.top }]}>
+        <View style={styles.header}>
+          <View style={[styles.titleRow, styles.emailTitleRow]}>
+            <Ionicons name="mail-outline" size={18} color={c.ink} />
+            <Text style={styles.title}>Check your email</Text>
+          </View>
+        </View>
+        <ScrollView
+          contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 40 }]}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.card} testID="delete-account-email-sent">
+            <Text style={styles.sentText}>
+              We sent a link to {maskEmail(user?.email)}. Deleting starts only after you confirm
+              on the page it opens. The link expires in {DELETION_LINK_TTL_LABEL}.
+            </Text>
+            <Text style={styles.sentText}>
+              Until then nothing has changed: your account and files are still here and you stay
+              signed in. After the account is deleted you have 30 days to cancel the deletion from
+              the email we send then.
+            </Text>
+          </View>
+          {resent && (
+            <Text style={styles.sentNote} testID="delete-account-resent">A new link was sent. The old one no longer works.</Text>
+          )}
+          {totpField}
+          {error && (
+            <View style={styles.errorBanner} testID="delete-account-error">
+              <Text style={styles.errorText}>{error}</Text>
+            </View>
+          )}
+          <View style={styles.buttonRow}>
+            <TouchableOpacity
+              style={[styles.button, styles.cancelButton, !canResend && styles.buttonDisabled]}
+              onPress={handleResend}
+              disabled={!canResend}
+              accessibilityRole="button"
+              accessibilityLabel="Send the link again"
+              testID="delete-account-resend"
+            >
+              {loading
+                ? <ActivityIndicator size="small" color={c.ink} />
+                : <Text style={styles.cancelButtonText}>Resend</Text>}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.button, styles.cancelButton]}
+              onPress={() => navigation.goBack()}
+              disabled={loading}
+              accessibilityRole="button"
+              accessibilityLabel="Done"
+              testID="delete-account-done"
+            >
+              <Text style={styles.cancelButtonText}>Done</Text>
+            </TouchableOpacity>
+          </View>
+        </ScrollView>
+      </View>
+    );
+  }
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
@@ -144,11 +240,11 @@ export default function DeleteAccountScreen() {
           <Ionicons name="chevron-back" size={22} color={c.amber} />
           <Text style={{ fontSize: 16, color: c.amber, marginLeft: 2 }}>Privacy</Text>
         </TouchableOpacity>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
+        <View style={styles.titleRow}>
           <Ionicons name="trash" size={18} color={c.red} />
           <Text style={styles.title}>Delete account</Text>
         </View>
-        <Text style={styles.subtitle}>This cannot be undone. Read carefully.</Text>
+        <Text style={styles.subtitle}>Read carefully. After 30 days this cannot be undone.</Text>
       </View>
 
       <ScrollView
@@ -159,9 +255,10 @@ export default function DeleteAccountScreen() {
         {/* Warning banner */}
         <View style={styles.warningBanner} testID="delete-account-warning">
           <Text style={styles.warningText}>
-            Within 30 days, your encrypted data is permanently shredded from all regions.
-            After that there is nothing to recover — not for you, not for us, not for anyone
-            with a court order. We can't recover this.
+            We will email you a link first. Nothing is deleted until you confirm on that page.
+            After you confirm you have 30 days to cancel the deletion from the email we send.
+            Then your encrypted data is permanently shredded from all regions and there is
+            nothing to recover, not for you, not for us, not for anyone with a court order.
           </Text>
         </View>
 
@@ -208,12 +305,14 @@ export default function DeleteAccountScreen() {
           testID="delete-account-understood-checkbox"
         >
           <View style={[styles.checkbox, understood && styles.checkboxChecked]}>
-            {understood && <Text style={styles.checkmark}>{'✓'}</Text>}
+            {understood && <Ionicons name="checkmark" size={14} color={c.paper} />}
           </View>
           <Text style={styles.checkLabel}>
             I understand my files are encrypted and cannot be recovered after deletion.
           </Text>
         </TouchableOpacity>
+
+        {totpField}
 
         {error && (
           <View style={styles.errorBanner} testID="delete-account-error">
@@ -238,13 +337,13 @@ export default function DeleteAccountScreen() {
             onPress={handleDelete}
             disabled={!canDelete}
             accessibilityRole="button"
-            accessibilityLabel="Delete account permanently"
+            accessibilityLabel="Email me the deletion link"
             accessibilityState={{ disabled: !canDelete }}
             testID="delete-account-submit"
           >
             {loading
               ? <ActivityIndicator size="small" color={c.paper} />
-              : <Text style={styles.dangerButtonText}>Delete permanently</Text>
+              : <Text style={styles.dangerButtonText}>Email me the link</Text>
             }
           </TouchableOpacity>
         </View>
@@ -253,7 +352,7 @@ export default function DeleteAccountScreen() {
   );
 }
 
-function makeStyles(c: C, resolved: 'light' | 'dark') {
+function makeStyles(c: C, resolved: 'light' | 'dark', accessibilityLayout: boolean) {
   return StyleSheet.create({
     root: { flex: 1, backgroundColor: c.paper },
     header: {
@@ -263,6 +362,14 @@ function makeStyles(c: C, resolved: 'light' | 'dark') {
       borderBottomColor: c.line,
     },
     backButton: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8 },
+    titleRow: {
+      flexDirection: 'row',
+      alignItems: accessibilityLayout ? 'flex-start' : 'center',
+      flexWrap: accessibilityLayout ? 'wrap' : 'nowrap',
+      gap: 8,
+      marginTop: 4,
+    },
+    emailTitleRow: { marginTop: 12 },
     title: { fontSize: 22, fontWeight: '700', color: c.ink },
     subtitle: { fontSize: 12, color: c.ink3, marginTop: 2 },
     scrollContent: { paddingHorizontal: 14, paddingTop: spacing.md },
@@ -292,17 +399,24 @@ function makeStyles(c: C, resolved: 'light' | 'dark') {
       marginBottom: spacing.lg,
       overflow: 'hidden',
     },
-    itemRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 9, paddingHorizontal: 12 },
+    itemRow: {
+      flexDirection: accessibilityLayout ? 'column' : 'row',
+      alignItems: accessibilityLayout ? 'flex-start' : 'center',
+      gap: accessibilityLayout ? 4 : 0,
+      paddingVertical: 9,
+      paddingHorizontal: 12,
+    },
     itemRowBorder: { borderBottomWidth: 1, borderBottomColor: c.line },
-    itemLabel: { fontSize: 13, color: c.ink, flex: 1 },
-    itemDetail: { fontSize: 11, color: c.ink3 },
+    itemLabel: { fontSize: 13, color: c.ink, flex: accessibilityLayout ? undefined : 1 },
+    itemDetail: { fontSize: 11, color: c.ink3, flexShrink: 1 },
     label: { fontSize: 12, fontWeight: '600', color: c.ink2, marginBottom: 6 },
     input: {
-      height: 44,
+      minHeight: 44,
       borderWidth: 1,
       borderColor: c.line,
       borderRadius: radii.md,
       paddingHorizontal: spacing.md,
+      paddingVertical: 10,
       fontSize: 14,
       fontWeight: '600',
       color: c.ink,
@@ -322,7 +436,6 @@ function makeStyles(c: C, resolved: 'light' | 'dark') {
       marginTop: 1,
     },
     checkboxChecked: { backgroundColor: c.red, borderColor: c.red },
-    checkmark: { fontSize: 12, color: c.paper, fontWeight: '700' },
     checkLabel: { flex: 1, fontSize: 12, color: c.ink2, lineHeight: 17 },
     errorBanner: {
       paddingHorizontal: 12,
@@ -333,11 +446,16 @@ function makeStyles(c: C, resolved: 'light' | 'dark') {
       borderColor: resolved === 'dark' ? '#5c2828' : '#fecaca',
       marginBottom: spacing.md,
     },
+    sentText: { fontSize: 13, color: c.ink2, lineHeight: 19, padding: 12 },
+    sentNote: { fontSize: 12, color: c.ink3, marginBottom: spacing.md },
     errorText: { fontSize: 12, color: c.red, lineHeight: 17 },
-    buttonRow: { flexDirection: 'row', gap: 10 },
+    buttonRow: { flexDirection: accessibilityLayout ? 'column' : 'row', gap: 10 },
     button: {
-      flex: 1,
-      height: 46,
+      flex: accessibilityLayout ? undefined : 1,
+      width: accessibilityLayout ? '100%' : undefined,
+      minHeight: 46,
+      paddingHorizontal: spacing.md,
+      paddingVertical: 12,
       borderRadius: radii.md,
       alignItems: 'center',
       justifyContent: 'center',

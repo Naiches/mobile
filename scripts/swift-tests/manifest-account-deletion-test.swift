@@ -46,7 +46,6 @@ func expect(_ condition: Bool, _ label: String) {
 let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-acct-del-\(UUID().uuidString)", isDirectory: true)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 
 // The engine's backup_assets columns (NativeBackupEngine.ensureTables), plus
 // the JS layer's backup_verification (BackupDatabase.ts), which the reset
@@ -662,11 +661,14 @@ do {
 
 // MARK: - Report
 
+let exitCode: Int32
 if failures.isEmpty {
   print("ManifestAccountDeletionTests: \(total) assertions, 0 failed")
-  exit(0)
+  exitCode = 0
 } else {
   for f in failures { print("FAIL: \(f)") }
   print("ManifestAccountDeletionTests: \(failures.count) of \(total) assertions FAILED")
-  exit(1)
+  exitCode = 1
 }
+try? fm.removeItem(at: root)
+exit(exitCode)

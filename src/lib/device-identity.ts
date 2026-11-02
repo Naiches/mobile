@@ -46,6 +46,7 @@
 
 import { Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
+import { settleWithDeadline } from './fetch-deadline';
 
 // ── Storage keys ────────────────────────────────────────────────────────────
 
@@ -57,6 +58,9 @@ export const DEVICE_ID_KEY = 'bb_sync_device_id';
 
 /** Legacy per-store keys we migrate FROM (kept for one-time reconciliation). */
 const LEGACY_BACKUP_DEVICE_ID_KEY = 'beebeeb_device_id';
+
+/** A native keychain bridge must not leave app startup or upload setup hung. */
+export const DEVICE_ID_STORAGE_TIMEOUT_MS = 2_000;
 
 // ── Secure storage abstraction (SecureStore on native, localStorage on web) ──
 
@@ -77,7 +81,13 @@ const storage = {
       return { ok: true, value: typeof window === 'undefined' ? null : window.localStorage.getItem(key) };
     }
     try {
-      return { ok: true, value: await SecureStore.getItemAsync(key) };
+      return {
+        ok: true,
+        value: await settleWithDeadline(
+          () => SecureStore.getItemAsync(key),
+          DEVICE_ID_STORAGE_TIMEOUT_MS,
+        ),
+      };
     } catch {
       return { ok: false };
     }
@@ -90,7 +100,10 @@ const storage = {
       return window.localStorage.getItem(key) === value;
     }
     try {
-      await SecureStore.setItemAsync(key, value);
+      await settleWithDeadline(
+        () => SecureStore.setItemAsync(key, value),
+        DEVICE_ID_STORAGE_TIMEOUT_MS,
+      );
     } catch {
       // SecureStore can fail on devices without a secure enclave, or while
       // the device is locked. The caller decides what an unpersisted id may

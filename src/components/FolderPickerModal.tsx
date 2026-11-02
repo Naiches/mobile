@@ -24,6 +24,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -53,6 +54,14 @@ interface FolderPickerModalProps {
   busy?: boolean;
   onCancel: () => void;
   onConfirm: (targetId: string | null) => void;
+  /**
+   * Choosing a folder for something other than a move (e.g. a Photos source).
+   * `confirmLabel` words the action button; `blockRootHint` turns the Drive
+   * root into a place that cannot be chosen, with this hint under the list.
+   */
+  confirmLabel?: (folderName: string) => string;
+  blockRootHint?: string;
+  testID?: string;
 }
 
 const ROOT_NAME = 'Drive';
@@ -65,9 +74,14 @@ export default function FolderPickerModal({
   busy = false,
   onCancel,
   onConfirm,
+  confirmLabel,
+  blockRootHint,
+  testID,
 }: FolderPickerModalProps) {
   const { colors: c } = useTheme();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   // Navigation stack within the picker. Starts at the vault root.
   const [stack, setStack] = useState<Crumb[]>([{ id: null, name: ROOT_NAME }]);
@@ -109,7 +123,8 @@ export default function FolderPickerModal({
   // cancel), so these just delegate — a failed move leaves the user in place.
   const confirm = () => onConfirm(current.id);
 
-  const alreadyHere = current.id === currentParentId;
+  const rootBlocked = !!blockRootHint && current.id === null;
+  const alreadyHere = rootBlocked || current.id === currentParentId;
 
   return (
     <Modal
@@ -118,19 +133,20 @@ export default function FolderPickerModal({
       presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : 'fullScreen'}
       onRequestClose={onCancel}
     >
-      <View style={[styles.root, { backgroundColor: c.paper, paddingTop: Platform.OS === 'android' ? insets.top : 0 }]}>
+      <View testID={testID} style={[styles.root, { backgroundColor: c.paper, paddingTop: Platform.OS === 'android' ? insets.top : 0 }]}>
         {/* Header */}
-        <View style={[styles.header, { borderBottomColor: c.line }]}>
+        <View style={[styles.header, accessibilityLayout && styles.headerAccessibility, { borderBottomColor: c.line }]}>
           <TouchableOpacity
             onPress={onCancel}
             disabled={busy}
             hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
             accessibilityRole="button"
-            accessibilityLabel="Cancel move"
+            accessibilityLabel={confirmLabel ? 'Cancel' : 'Cancel move'}
+            testID={testID ? `${testID}-cancel` : undefined}
           >
             <Text style={[styles.headerAction, { color: busy ? c.ink4 : c.amberDeep }]}>Cancel</Text>
           </TouchableOpacity>
-          <Text style={[styles.headerTitle, { color: c.ink }]} numberOfLines={1}>
+          <Text style={[styles.headerTitle, { color: c.ink }]} numberOfLines={accessibilityLayout ? 2 : 1}>
             {title}
           </Text>
           {/* Spacer to balance the Cancel button so the title stays centered. */}
@@ -141,7 +157,7 @@ export default function FolderPickerModal({
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
-          style={[styles.breadcrumbBar, { borderBottomColor: c.line }]}
+          style={[styles.breadcrumbBar, accessibilityLayout && styles.breadcrumbBarAccessibility, { borderBottomColor: c.line }]}
           contentContainerStyle={styles.breadcrumbContent}
         >
           {stack.map((crumb, index) => {
@@ -160,7 +176,7 @@ export default function FolderPickerModal({
                 >
                   <Text
                     style={[styles.crumbText, { color: isLast ? c.ink : c.amberDeep }]}
-                    numberOfLines={1}
+                    numberOfLines={accessibilityLayout ? undefined : 1}
                   >
                     {crumb.name}
                   </Text>
@@ -177,14 +193,14 @@ export default function FolderPickerModal({
           keyboardShouldPersistTaps="handled"
           renderItem={({ item }) => (
             <TouchableOpacity
-              style={[styles.row, { borderBottomColor: c.line }]}
+              style={[styles.row, accessibilityLayout && styles.rowAccessibility, { borderBottomColor: c.line }]}
               onPress={() => drillInto(item)}
               disabled={busy}
               accessibilityRole="button"
               accessibilityLabel={`Open ${item.name}`}
             >
               <Ionicons name="folder" size={22} color={c.amber} style={styles.rowIcon} />
-              <Text style={[styles.rowName, { color: c.ink }]} numberOfLines={1}>
+              <Text style={[styles.rowName, { color: c.ink }]} numberOfLines={accessibilityLayout ? 3 : 1}>
                 {item.name}
               </Text>
               <Ionicons name="chevron-forward" size={18} color={c.ink4} />
@@ -203,7 +219,7 @@ export default function FolderPickerModal({
         <View style={[styles.footer, { borderTopColor: c.line, paddingBottom: bottomAnchorInset(insets.bottom, insets.bottom + 12) }]}>
           {alreadyHere && (
             <Text style={[styles.footerHint, { color: c.ink3 }]}>
-              {`Already in “${current.name}”.`}
+              {rootBlocked ? blockRootHint : `Already in “${current.name}”.`}
             </Text>
           )}
           <TouchableOpacity
@@ -211,13 +227,14 @@ export default function FolderPickerModal({
             onPress={confirm}
             disabled={alreadyHere || busy}
             accessibilityRole="button"
-            accessibilityLabel={`Move to ${current.name}`}
+            accessibilityLabel={confirmLabel ? confirmLabel(current.name) : `Move to ${current.name}`}
+            testID={testID ? `${testID}-confirm` : undefined}
           >
             {busy ? (
               <ActivityIndicator color={c.ink} />
             ) : (
-              <Text style={[styles.moveButtonText, { color: c.ink }]} numberOfLines={1}>
-                {`Move to “${current.name}”`}
+              <Text style={[styles.moveButtonText, { color: c.ink }]} numberOfLines={accessibilityLayout ? 3 : 1}>
+                {confirmLabel ? confirmLabel(current.name) : `Move to “${current.name}”`}
               </Text>
             )}
           </TouchableOpacity>
@@ -236,6 +253,7 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
+  headerAccessibility: { alignItems: 'flex-start' },
   headerAction: { fontSize: 16, fontWeight: '500', minWidth: 56 },
   headerTitle: { flex: 1, textAlign: 'center', fontSize: 17, fontWeight: '700' },
   headerSpacer: { minWidth: 56 },
@@ -243,6 +261,7 @@ const styles = StyleSheet.create({
     maxHeight: 44,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
+  breadcrumbBarAccessibility: { maxHeight: 96 },
   breadcrumbContent: { alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12 },
   crumbWrap: { flexDirection: 'row', alignItems: 'center' },
   crumbChevron: { marginHorizontal: 4 },
@@ -254,6 +273,7 @@ const styles = StyleSheet.create({
     paddingVertical: 15,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
+  rowAccessibility: { alignItems: 'flex-start' },
   rowIcon: { marginRight: 14 },
   rowName: { flex: 1, fontSize: 16, fontWeight: '500' },
   empty: { alignItems: 'center', justifyContent: 'center', paddingVertical: 48, gap: 10 },
@@ -266,10 +286,12 @@ const styles = StyleSheet.create({
   },
   footerHint: { fontSize: 13, textAlign: 'center', marginBottom: 10 },
   moveButton: {
-    height: 50,
+    minHeight: 50,
     borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
   },
-  moveButtonText: { fontSize: 16, fontWeight: '700' },
+  moveButtonText: { fontSize: 16, fontWeight: '700', textAlign: 'center' },
 });

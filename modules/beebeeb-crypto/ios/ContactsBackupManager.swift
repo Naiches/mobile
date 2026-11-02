@@ -26,6 +26,43 @@ final class ContactsBackupManager {
   /// sweeps elsewhere in this file never touch it.
   private static let legacyLastHashKey = "io.beebeeb.contactsBackupLastHash"
 
+  private static let runAccountKey = "io.beebeeb.contactsBackupRunAccount"
+
+  /// Progress of the run in flight, read by `status()`. In memory only: a
+  /// run that dies with the process must not leave "running" behind.
+  private let stateLock = NSLock()
+  private var isRunning = false
+  private var progressDone = 0
+  private var progressTotal = 0
+
+  /// Record of the last runs, scoped to the bound account so an account
+  /// switch never shows the previous account's backup as this one's.
+  private var ledger: CategoryRunLedger {
+    let id = accountId ?? UserDefaults.standard.string(forKey: Self.runAccountKey)
+    let scope = id.map { SHA256.hash(data: Data($0.utf8)).map { String(format: "%02x", $0) }.joined() } ?? "unbound"
+    return CategoryRunLedger(defaults: .standard, prefix: "io.beebeeb.contactsBackupRun.\(scope).")
+  }
+
+  private func beginRun() -> Bool {
+    stateLock.lock(); defer { stateLock.unlock() }
+    if isRunning { return false }
+    isRunning = true
+    progressDone = 0
+    progressTotal = 0
+    return true
+  }
+
+  private func setProgress(done: Int, total: Int) {
+    stateLock.lock(); defer { stateLock.unlock() }
+    progressDone = done
+    progressTotal = total
+  }
+
+  private func endRun() {
+    stateLock.lock(); defer { stateLock.unlock() }
+    isRunning = false
+  }
+
   private var authToken: String?
   /// Task 1531 [P0]: the account `authToken` belongs to. Set alongside
   /// `authToken` by `enable(authToken:userId:)`, cleared alongside it by
@@ -79,9 +116,13 @@ final class ContactsBackupManager {
     UserDefaults.standard.removeObject(forKey: Self.legacyLastHashKey)
   }
 
-  func enable(authToken: String, userId: String, runNow: Bool = true) {
+  /// Bind the manager and shared native engine to an account without asking
+  /// for permission and without starting an export. Manual UI actions use this
+  /// before `backupNow`, so a forced request cannot race an automatic run.
+  func prepare(authToken: String, userId: String) {
     self.authToken = authToken
     self.accountId = userId
+    UserDefaults.standard.set(userId, forKey: Self.runAccountKey)
     // Task 1531 [P2] round 6 (delta review 3, finding N3): also mirror the
     // token into the ENGINE's own Keychain slot (`io.beebeeb.backupToken`,
     // via `NativeBackupEngine.token`'s setter) — not just this manager's
@@ -109,6 +150,11 @@ final class ContactsBackupManager {
     // triggers via `start()`, now guaranteed regardless of which backup
     // surface is enabled first.
     NativeBackupEngine.shared.bindAccount(userId: userId)
+    RuntimeTrace.event("backup.contacts.prepare")
+  }
+
+  func enable(authToken: String, userId: String, runNow: Bool = true) {
+    prepare(authToken: authToken, userId: userId)
     if runNow { NativeBackupEngine.shared.clearAuxiliaryAccountRefusal(accountId: userId) }
     RuntimeTrace.event("backup.contacts.enable", ["runNow": runNow])
     // Task 1531 [P2] round 6 (finding N2): a refused/failed upload never
@@ -128,7 +174,10 @@ final class ContactsBackupManager {
     let shouldRunNow = runNow || !hasUploadedForThisAccount
     CNContactStore().requestAccess(for: .contacts) { [weak self] granted, _ in
       RuntimeTrace.event("backup.contacts.permission", ["granted": granted])
-      guard granted else { return }
+      guard granted else {
+        self?.ledger.recordFailure(code: "permission_denied")
+        return
+      }
       if shouldRunNow {
         self?.backup()
       }
@@ -154,6 +203,7 @@ final class ContactsBackupManager {
     defaults.removeObject(forKey: Self.lastScanAtKey)
     defaults.removeObject(forKey: Self.lastScanCountKey)
     defaults.removeObject(forKey: Self.lastUploadAtKey)
+    ledger.reset()
     // Task 1531 [P2] round 6 (finding N5): see `legacyLastHashKey`'s doc
     // comment — belt-and-braces cleanup alongside the `init()` sweep.
     defaults.removeObject(forKey: Self.legacyLastHashKey)
@@ -167,30 +217,108 @@ final class ContactsBackupManager {
     ])
   }
 
-  func backup() {
-    guard !NativeBackupEngine.shared.accountUploadRefused else { return }
-    guard let token = authToken, let accountId, !accountId.isEmpty else { return }
+  @discardableResult
+  func backup(force: Bool = false) -> CategoryBackupRunAdmission {
+    guard !NativeBackupEngine.shared.accountUploadRefused else { return .accountRefused }
+    guard let token = authToken, let accountId, !accountId.isEmpty else { return .notBound }
+    guard beginRun() else { return .alreadyRunning }
     RuntimeTrace.event("backup.contacts.start")
+    let runLedger = ledger
     DispatchQueue.global(qos: .background).async { [weak self] in
       guard let self else { return }
+      func fail(_ code: String, refusedCount: Int? = nil) {
+        runLedger.recordFailure(code: code, refusedCount: refusedCount)
+        self.endRun()
+      }
+      // Limited access (iOS 18) shows only the contacts the user picked: a
+      // partial set must never replace the full backup.
+      if Self.isLimitedAccess {
+        RuntimeTrace.event("backup.contacts.limited_access")
+        fail("limited_access")
+        return
+      }
       do {
-        let export = try self.exportContacts()
+        let total = try self.countContacts()
+        self.setProgress(done: 0, total: total)
+        let export = try self.exportContacts(total: total)
         self.recordScan(count: export.count)
         RuntimeTrace.event("backup.contacts.exported", [
           "bytes": export.data.count,
           "contactCount": export.count
         ])
+        // Parse the file back before anything leaves the device: a count that
+        // does not match, or a file that does not parse, is a failed run and
+        // the previous good backup stays where it is.
+        let outcome = BackupExportVerification.verifyVCards(export.data, expected: export.count)
+        guard outcome.ok else {
+          RuntimeTrace.event("backup.contacts.verify_failed", ["reason": outcome.reason ?? "unknown"])
+          fail("verify_failed")
+          return
+        }
+        // An empty or much smaller export than the backup it would replace is
+        // more likely a store that is off or still syncing than real deletions.
+        // With no verified count on this device, the baseline is the backup
+        // already on the server.
+        let gate = BackupExportVerification.gate(
+          count: export.count,
+          localBaseline: runLedger.lastVerifiedCount,
+          force: force,
+          serverBaseline: {
+            guard let base = self.serverBaseURL, let folder = self.parentFolderId, !folder.isEmpty else { return .unavailable }
+            return CategoryBackupBaselineFetcher(apiUrl: base, token: token, parentFolderId: folder)
+              .baseline(fileName: "contacts.vcf", count: BackupExportVerification.countVCards)
+          })
+        switch gate {
+        case .refuse(let code, let refused, let stored):
+          if let stored { runLedger.setVerifiedCount(stored) }
+          RuntimeTrace.event("backup.contacts.refused", ["code": code, "count": export.count])
+          fail(code, refusedCount: refused)
+          return
+        case .proceed(let stored):
+          if let stored { runLedger.setVerifiedCount(stored) }
+        }
         let digest = Self.contentDigest(data: export.data)
         guard self.shouldUpload(digest: digest, accountId: accountId) else {
           RuntimeTrace.event("backup.contacts.skipped_unchanged")
+          runLedger.recordSuccess(count: export.count, bytes: export.data.count, uploaded: false)
+          self.endRun()
           return
         }
-        self.upload(data: export.data, fileName: "contacts.vcf", mimeType: "text/vcard", token: token, accountId: accountId, digest: digest)
+        BackupExportVerification.uploadIfVerified(outcome) {
+          self.upload(data: export.data, fileName: "contacts.vcf", mimeType: "text/vcard", token: token, accountId: accountId, digest: digest) { ok in
+            if ok {
+              runLedger.recordSuccess(count: export.count, bytes: export.data.count, uploaded: true)
+              self.endRun()
+            } else {
+              fail("upload_failed")
+            }
+          }
+        }
       } catch {
         RuntimeTrace.event("backup.contacts.failed", ["error": error.localizedDescription])
-        // Contact export failed — permissions not granted or empty contacts
+        fail(Self.isPermissionDenied ? "permission_denied" : "export_failed")
       }
     }
+    return .started
+  }
+
+  /// Run now: used by "Back up now" and when access is granted after a denial.
+  @discardableResult
+  func backupNow(force: Bool = false) -> CategoryBackupRunAdmission {
+    backup(force: force)
+  }
+
+  private static var isPermissionDenied: Bool {
+    let status = CNContactStore.authorizationStatus(for: .contacts)
+    return status == .denied || status == .restricted
+  }
+
+  /// iOS 18 limited contacts access: the app sees only the contacts the user chose.
+  private static var isLimitedAccess: Bool {
+    if #available(iOS 18.0, *) {
+      return CNContactStore.authorizationStatus(for: .contacts) == .limited
+    }
+    return false
   }
 
   func status() -> [String: Any] {
@@ -207,7 +335,15 @@ final class ContactsBackupManager {
       hasStoredHash ||
       defaults.string(forKey: Self.lastScanAtKey) != nil ||
       defaults.string(forKey: Self.lastUploadAtKey) != nil
-    return [
+    stateLock.lock()
+    let running = isRunning, done = progressDone, total = progressTotal
+    stateLock.unlock()
+    var result: [String: Any] = [
+      "running": running,
+      "progressDone": done,
+      "progressTotal": total,
+      "permissionDenied": Self.isPermissionDenied,
+      "limitedAccess": Self.isLimitedAccess,
       "lastScanAt": defaults.string(forKey: Self.lastScanAtKey) as Any? ?? NSNull(),
       "lastScanCount": defaults.integer(forKey: Self.lastScanCountKey),
       "lastUploadAt": defaults.string(forKey: Self.lastUploadAtKey) as Any? ?? NSNull(),
@@ -217,16 +353,28 @@ final class ContactsBackupManager {
       "parentFolderId": parentFolderId as Any? ?? NSNull(),
       "hasKnownBackupState": hasKnownBackupState
     ]
+    for (key, value) in ledger.fields() { result[key] = value }
+    return result
   }
 
-  private func exportContacts() throws -> (data: Data, count: Int) {
+  /// Cheap first pass (identifiers only) so progress can say "340 of 1,234".
+  private func countContacts() throws -> Int {
+    let request = CNContactFetchRequest(keysToFetch: [CNContactIdentifierKey as CNKeyDescriptor])
+    var n = 0
+    try CNContactStore().enumerateContacts(with: request) { _, _ in n += 1 }
+    return n
+  }
+
+  private func exportContacts(total: Int) throws -> (data: Data, count: Int) {
     let store = CNContactStore()
     let keys: [CNKeyDescriptor] = [CNContactVCardSerialization.descriptorForRequiredKeys()]
     let request = CNContactFetchRequest(keysToFetch: keys)
     var contacts: [CNContact] = []
     try store.enumerateContacts(with: request) { contact, _ in
       contacts.append(contact)
+      if contacts.count % 25 == 0 { self.setProgress(done: contacts.count, total: max(total, contacts.count)) }
     }
+    setProgress(done: contacts.count, total: max(total, contacts.count))
     return (try CNContactVCardSerialization.data(with: contacts), contacts.count)
   }
 
@@ -258,7 +406,7 @@ final class ContactsBackupManager {
   }
 
   /// Per-account UserDefaults key for the dedup digest. Hashes `accountId`
-  /// (mirrors `CalendarBackupManager.stateKeyComponent(for:)`) rather than
+  /// (mirrors `CalendarBackupIdentity.itemKey`) rather than
   /// interpolating it raw — defensive against a future account-id format
   /// that isn't UserDefaults-key-safe, and consistent with the existing
   /// per-calendar key derivation.
@@ -290,15 +438,17 @@ final class ContactsBackupManager {
   // temp files and calling the Rust upload function instead of the Swift HTTP
   // uploader. NativeBackupEngine already demonstrates the pattern. For now this
   // continues using the legacy Swift uploader which still works correctly.
-  private func upload(data: Data, fileName: String, mimeType: String, token: String, accountId: String, digest: String) {
+  private func upload(data: Data, fileName: String, mimeType: String, token: String, accountId: String, digest: String, completion: @escaping (Bool) -> Void) {
     guard let serverBaseURL else {
       RuntimeTrace.event("backup.contacts.upload_aborted", ["reason": "missing_server_url"])
       NSLog("[BeebeebBackup] contacts upload aborted: serverURL not configured in keychain (sign in again to set)")
+      completion(false)
       return
     }
     guard let parentFolderId, !parentFolderId.isEmpty else {
       RuntimeTrace.event("backup.contacts.upload_aborted", ["reason": "missing_parent_folder"])
       NSLog("[BeebeebBackup] contacts upload aborted: backup destination folder not configured")
+      completion(false)
       return
     }
     NativeEncryptedBackupUploader.shared.upload(
@@ -315,9 +465,11 @@ final class ContactsBackupManager {
         self.recordUploadSuccess(digest: digest, accountId: accountId)
         RuntimeTrace.event("backup.contacts.upload_success")
         NSLog("[BeebeebBackup] contacts upload succeeded")
+        completion(true)
       case .failure(let error):
         RuntimeTrace.event("backup.contacts.upload_failed", ["error": error.localizedDescription])
         NSLog("[BeebeebBackup] contacts upload failed: \(error.localizedDescription)")
+        completion(false)
       }
     }
   }

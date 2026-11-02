@@ -15,6 +15,14 @@ protocol FileProviderCacheReading {
 
 extension CacheManager: FileProviderCacheReading {}
 
+/// Looks a row up by id. Kept apart from `FileProviderCacheReading` so a test double of that
+/// protocol stays valid; the working set uses it to skip folders that are no longer cached.
+protocol FileProviderItemLookup {
+  func item(id: String) -> CachedItem?
+}
+
+extension CacheManager: FileProviderItemLookup {}
+
 protocol FileProviderContainerRefreshing {
   func refreshContainer(containerId: String) async -> FileProviderRefreshOutcome
   /// Task 1722 round 4: refreshes materialized folders whose cached listing is stale.
@@ -81,6 +89,8 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     self.refresher = refresher
   }
 
+  /// Only the first-load refresh (empty cache, observer still waiting) is cancelled here; a
+  /// background refresh of an already delivered listing keeps running (see `startBackgroundRefresh`).
   func invalidate() {
     refreshTask?.cancel()
     refreshTask = nil
@@ -90,20 +100,17 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
   func enumerateItems(for observer: NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage) {
     let parent = (containerId == BeebeebConstants.rootContainerIdentifier) ? nil : containerId
-    let rows = cache.children(parent: parent)
+    let rows = visibleChildren(parent: parent)
     NSLog("[Beebeeb] Files enumerateItems cached=%ld", rows.count)
     let hasCachedListing = cache.syncState(key: "container.\(containerId).anchor") != nil
     if rows.isEmpty && hasCachedListing {
       let delivered = deliveredRows(ownRows: rows)
       recordDeliveredAnchor(rows: delivered)
-      observer.didEnumerate(delivered.map { FileProviderItem(cached: $0) as NSFileProviderItem })
+      observer.didEnumerate(deliveredItems(delivered))
       observer.finishEnumerating(upTo: nil)
       noteListedFolder()
 
-      refreshTask?.cancel()
-      refreshTask = Task.detached { [containerId, refresher] in
-        _ = await refresher.refreshContainer(containerId: containerId)
-      }
+      startBackgroundRefresh()
       startMaterializedRefresh()
       return
     }
@@ -115,14 +122,26 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         guard !Task.isCancelled else { return }
         switch outcome {
         case .success:
-          let refreshedRows = self.deliveredRows(ownRows: cache.children(parent: parent))
+          let refreshedRows = self.deliveredRows(ownRows: self.visibleChildren(parent: parent))
           guard !Task.isCancelled else { return }
-          let refreshedItems = refreshedRows.map { FileProviderItem(cached: $0) as NSFileProviderItem }
+          let refreshedItems = self.deliveredItems(refreshedRows)
           self.recordDeliveredAnchor(rows: refreshedRows)
           observer.didEnumerate(refreshedItems)
           observer.finishEnumerating(upTo: nil)
           self.noteListedFolder()
-        case .notAuthenticated, .serverUnreachable:
+        case .notAuthenticated:
+          FileProviderAuthRequirement.record()
+          if self.isWorkingSet {
+            // The working set is not a place the user opens: an authentication error here is
+            // what leaves the sync-problem badge on the whole location, with no folder to show
+            // "Open Beebeeb" in. It delivers nothing and finishes; the recovery signals it and
+            // the folders the user opens report the error themselves.
+            observer.didEnumerate([])
+            observer.finishEnumerating(upTo: nil)
+          } else {
+            observer.finishEnumeratingWithError(outcome.fileProviderError)
+          }
+        case .serverUnreachable:
           observer.finishEnumeratingWithError(outcome.fileProviderError)
         }
       }
@@ -130,7 +149,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     }
 
     let delivered = deliveredRows(ownRows: rows)
-    let items = delivered.map { FileProviderItem(cached: $0) as NSFileProviderItem }
+    let items = deliveredItems(delivered)
     recordDeliveredAnchor(rows: delivered)
     observer.didEnumerate(items)
     observer.finishEnumerating(upTo: nil)
@@ -140,11 +159,45 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     // sees fresh state. Errors are swallowed — the user already sees the
     // cached listing, and any persistent failure (auth, offline) surfaces
     // through the main app.
-    refreshTask?.cancel()
-    refreshTask = Task.detached { [containerId, refresher] in
-      _ = await refresher.refreshContainer(containerId: containerId)
-    }
+    startBackgroundRefresh()
     startMaterializedRefresh()
+  }
+
+  // MARK: - Background refresh
+
+  private static let refreshLock = NSLock()
+  private static var refreshesInFlight = Set<String>()
+  private static var refreshesQueued = Set<String>()
+
+  /// Refreshes the container after its cached listing was delivered. iOS invalidates an
+  /// enumerator right after `enumerateItems`, so this must not hang off `refreshTask`: that
+  /// cancelled every refresh (NSURLError -999) and rows deleted elsewhere were never pruned.
+  /// Coalesced per container across enumerators: one pass in flight, and a request that
+  /// arrives meanwhile queues exactly one more pass, which sees the newest server state.
+  /// The sign-out and purge-epoch guards live in `SyncEngine.refreshContainer`.
+  private func startBackgroundRefresh() {
+    let id = containerId
+    Self.refreshLock.lock()
+    if Self.refreshesInFlight.contains(id) {
+      Self.refreshesQueued.insert(id)
+      Self.refreshLock.unlock()
+      return
+    }
+    Self.refreshesInFlight.insert(id)
+    Self.refreshLock.unlock()
+
+    Task.detached { [refresher] in
+      while true {
+        _ = await refresher.refreshContainer(containerId: id)
+        Self.refreshLock.lock()
+        if Self.refreshesQueued.remove(id) == nil {
+          Self.refreshesInFlight.remove(id)
+          Self.refreshLock.unlock()
+          return
+        }
+        Self.refreshLock.unlock()
+      }
+    }
   }
 
   func enumerateChanges(for observer: NSFileProviderChangeObserver, from anchor: NSFileProviderSyncAnchor) {
@@ -161,14 +214,36 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     observer.finishEnumeratingChanges(upTo: current, moreComing: false)
   }
 
+  /// The items for `rows` (the Trash folder is already among them for the root and working set).
+  private func deliveredItems(_ rows: [CachedItem]) -> [NSFileProviderItem] {
+    rows.map { FileProviderItem(cached: $0) as NSFileProviderItem }
+  }
+
+  /// A folder's cached children without the internal backup manifest (`isHiddenBackupManifest`).
+  private func visibleChildren(parent: String?) -> [CachedItem] {
+    cache.children(parent: parent).filter { !$0.isHiddenBackupManifest }
+  }
+
   /// What this enumerator vends: a folder's own children, or for the working set the root's
   /// children plus the children of every folder the system has materialized (task 1722 round 4).
   private func deliveredRows(ownRows: [CachedItem]) -> [CachedItem] {
-    guard isWorkingSet else { return ownRows }
+    // The internal backup manifest is never listed: the shared hide rule for it applies to the
+    // rows assembled here.
     var rows = ownRows
-    var seen = Set(ownRows.map(\.id))
+    // The read-only Trash folder itself (never its contents) is part of the location's top level
+    // and of the working set: iOS never lists a materialized folder again, so the working set is
+    // how an existing install learns the folder is there.
+    if containerId == BeebeebConstants.rootContainerIdentifier { rows.append(.trashContainer()) }
+    guard isWorkingSet else { return rows }
+    var seen = Set(rows.map(\.id))
+    let lookup = cache as? FileProviderItemLookup
     for folder in cache.materializedContainerIds() where folder != BeebeebConstants.rootContainerIdentifier {
-      for row in cache.children(parent: folder) where seen.insert(row.id).inserted {
+      // Trash is its own read-only place, never part of the working set (Recents, search).
+      if FilesTrash.isTrashNamespace(folder) { continue }
+      // A folder that has left the cache (trashed or deleted elsewhere) takes its children with
+      // it: pruning a listing removes the folder's row, not the rows below it.
+      if let lookup, lookup.item(id: folder) == nil { continue }
+      for row in visibleChildren(parent: folder) where seen.insert(row.id).inserted {
         rows.append(row)
       }
     }
@@ -187,7 +262,8 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
   /// Task 1722 round 4: a folder the system has just listed is materialized from now on, so its
   /// children join the working set even before materializedItemsDidChange reports it.
   private func noteListedFolder() {
-    guard !isWorkingSet, containerId != BeebeebConstants.rootContainerIdentifier else { return }
+    guard !isWorkingSet, containerId != BeebeebConstants.rootContainerIdentifier,
+          !FilesTrash.isTrashNamespace(containerId) else { return }
     cache.noteContainerMaterialized(containerId)
   }
 
@@ -200,7 +276,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
   private func snapshotAnchor() -> NSFileProviderSyncAnchor {
     let parent = (containerId == BeebeebConstants.rootContainerIdentifier) ? nil : containerId
-    return snapshotAnchor(rows: deliveredRows(ownRows: cache.children(parent: parent)))
+    return snapshotAnchor(rows: deliveredRows(ownRows: visibleChildren(parent: parent)))
   }
 
   private func recordDeliveredAnchor(rows: [CachedItem]) {

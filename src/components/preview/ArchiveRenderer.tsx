@@ -13,6 +13,7 @@ import {
   FlatList,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -292,9 +293,10 @@ interface ArchiveRendererProps {
    * bar (full-bleed preview). Same contract as ZipRenderer's. */
   topInset?: number;
   bottomInset?: number;
+  onScrollOffsetChange?: (offset: number) => void;
 }
 
-export function ArchiveRenderer({ data, extension, colors: c, topInset = 0, bottomInset = 0 }: ArchiveRendererProps) {
+export function ArchiveRenderer({ data, extension, colors: c, topInset = 0, bottomInset = 0, onScrollOffsetChange }: ArchiveRendererProps) {
   const [summary, setSummary] = useState<ArchiveSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -384,7 +386,7 @@ export function ArchiveRenderer({ data, extension, colors: c, topInset = 0, bott
 
   if (!summary) return null;
 
-  return <ArchiveContents summary={summary} colors={c} topInset={topInset} bottomInset={bottomInset} />;
+  return <ArchiveContents summary={summary} colors={c} topInset={topInset} bottomInset={bottomInset} onScrollOffsetChange={onScrollOffsetChange} />;
 }
 
 // ---------------------------------------------------------------------------
@@ -396,9 +398,12 @@ interface ArchiveContentsProps {
   colors: Colors;
   topInset: number;
   bottomInset: number;
+  onScrollOffsetChange?: (offset: number) => void;
 }
 
-function ArchiveContents({ summary, colors: c, topInset, bottomInset }: ArchiveContentsProps) {
+function ArchiveContents({ summary, colors: c, topInset, bottomInset, onScrollOffsetChange }: ArchiveContentsProps) {
+  const { fontScale } = useWindowDimensions();
+  const largeText = fontScale >= 1.35;
   const { entries, fileCount, folderCount, totalSize, format } = summary;
   const formatLabel = FORMAT_LABELS[format];
 
@@ -426,13 +431,13 @@ function ArchiveContents({ summary, colors: c, topInset, bottomInset }: ArchiveC
             <View style={styles.rowText}>
               <Text
                 style={[styles.rowName, { color: c.ink }]}
-                numberOfLines={1}
+                numberOfLines={largeText ? undefined : 1}
               >
                 {item.path || item.name}
               </Text>
               <Text
                 style={[styles.rowMeta, { color: c.ink3 }]}
-                numberOfLines={1}
+                numberOfLines={largeText ? undefined : 1}
               >
                 {item.isFolder
                   ? 'Folder'
@@ -442,13 +447,13 @@ function ArchiveContents({ summary, colors: c, topInset, bottomInset }: ArchiveC
           </View>
         );
       },
-    [c],
+    [c, largeText],
   );
 
   return (
     <View style={[styles.container, { backgroundColor: c.paper, paddingTop: topInset }]}>
       <View style={[styles.header, { borderBottomColor: c.line }]}>
-        <View style={styles.headerRow}>
+        <View style={[styles.headerRow, largeText && styles.headerRowLargeText]}>
           <Text style={[styles.headerTitle, { color: c.ink }]}>
             {fileCount} {fileCount === 1 ? 'file' : 'files'}
             {folderCount > 0
@@ -482,6 +487,8 @@ function ArchiveContents({ summary, colors: c, topInset, bottomInset }: ArchiveC
           initialNumToRender={20}
           windowSize={11}
           removeClippedSubviews
+          scrollEventThrottle={16}
+          onScroll={(event) => onScrollOffsetChange?.(event.nativeEvent.contentOffset.y)}
         />
       )}
     </View>
@@ -527,6 +534,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     gap: 12,
+  },
+  headerRowLargeText: {
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+    gap: 4,
   },
   headerTitle: {
     fontSize: 14,

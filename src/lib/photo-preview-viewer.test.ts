@@ -32,6 +32,7 @@ mock.module('./photo-preview-sync', () => ({
 }));
 mock.module('./expected-user', () => ({ getExpectedUserId: () => 'acct-1' }));
 mock.module('./shared-folder-keys', () => ({ sharedMasterHandleId: () => 7 }));
+mock.module('./runtime-trace', () => ({ recordRuntimeTrace: () => {} }));
 mock.module('../../modules/beebeeb-crypto', () => ({
   uploadPhotoPreviewNative: async (...a: any[]) => { uploads.push(a); return uploadImpl(); },
 }));
@@ -39,6 +40,7 @@ mock.module('../../modules/beebeeb-crypto', () => ({
 const {
   chooseImageSource, loadViewerImage, shouldGenerateFromOpenedOriginal,
   prepareGenerateFromOpenedOriginal, __resetPhotoPreviewViewerForTests, loadStoredPreview, zoomExceedsPreview,
+  displayedPhotoPreviewInfo,
 } = await import('./photo-preview-viewer');
 
 const file = (over = {}) => ({ id: 'f1', mime_type: 'image/jpeg', has_preview: true, ...over });
@@ -57,8 +59,8 @@ describe('chooseImageSource', () => {
     expect(chooseImageSource(file({ has_preview: false }), null, true)).toBe('existing');
     expect(chooseImageSource(file({ has_preview: undefined }), null, true)).toBe('existing');
   });
-  test('unsupported server always uses the existing path', () => {
-    expect(chooseImageSource(file(), 'file:///c.img', false)).toBe('existing');
+  test('unsupported server can use a validated local copy but never downloads one', () => {
+    expect(chooseImageSource(file(), 'file:///c.img', false)).toBe('cache');
     expect(chooseImageSource(file(), null, false)).toBe('existing');
   });
   test('an offline-pinned file never downloads a preview, but uses a cached one', () => {
@@ -76,6 +78,17 @@ describe('loadViewerImage', () => {
     cached = 'file:///c.img';
     const r = await loadViewerImage(file(), existing);
     expect(r).toEqual({ uri: 'file:///c.img', kind: 'preview', source: 'cache' });
+    expect(fetchCalls).toEqual([]);
+  });
+
+  test('an already-cached stored preview does not wait for server capability', async () => {
+    cached = 'file:///c.img';
+    supported = false;
+    expect(await loadViewerImage(file(), existing)).toEqual({
+      uri: 'file:///c.img',
+      kind: 'preview',
+      source: 'cache',
+    });
     expect(fetchCalls).toEqual([]);
   });
   test('download stores, trims keeping the shown file', async () => {
@@ -96,10 +109,10 @@ describe('loadViewerImage', () => {
     expect(r.source).toBe('existing');
     expect(fetchCalls).toEqual([]);
   });
-  test('old server never touches the cache and does not throw', async () => {
+  test('old server uses a validated local copy without downloading', async () => {
     supported = false; cached = 'file:///c.img';
     const r = await loadViewerImage(file(), existing);
-    expect(r.source).toBe('existing');
+    expect(r.source).toBe('cache');
     expect(fetchCalls).toEqual([]);
   });
   test('a throwing cache layer falls back instead of crashing', async () => {
@@ -109,6 +122,28 @@ describe('loadViewerImage', () => {
   });
   test('without a fallback and without a preview it rejects', async () => {
     await expect(loadViewerImage(file({ has_preview: false }))).rejects.toThrow();
+  });
+});
+
+describe('displayedPhotoPreviewInfo', () => {
+  test('identifies a displayed stored preview and reports its bytes instead of the original size', () => {
+    expect(displayedPhotoPreviewInfo('preview', {
+      preview_px: 3840,
+      preview_bytes: 513_000,
+    }, 1_000_000)).toEqual({
+      detail: 'Preview · 4K',
+      sizeBytes: 513_000,
+    });
+  });
+
+  test('keeps the ordinary image detail and original bytes after View original', () => {
+    expect(displayedPhotoPreviewInfo('original', {
+      preview_px: 3840,
+      preview_bytes: 513_000,
+    }, 1_000_000)).toEqual({
+      detail: 'Image',
+      sizeBytes: 1_000_000,
+    });
   });
 });
 

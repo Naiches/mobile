@@ -36,7 +36,6 @@ func expect(_ condition: Bool, _ label: String) {
 let fm = FileManager.default
 let root = fm.temporaryDirectory.appendingPathComponent("bb-1667-r7-\(UUID().uuidString)", isDirectory: true)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 
 // The engine's backup_assets columns (NativeBackupEngine.ensureTables).
 let schema = """
@@ -551,11 +550,14 @@ do {
 
 // MARK: - Report
 
+let exitCode: Int32
 if failures.isEmpty {
   print("ManifestFailClosedTests: \(total) assertions, 0 failed")
-  exit(0)
+  exitCode = 0
 } else {
   for f in failures { print("FAIL: \(f)") }
   print("ManifestFailClosedTests: \(failures.count) of \(total) assertions FAILED")
-  exit(1)
+  exitCode = 1
 }
+try? fm.removeItem(at: root)
+exit(exitCode)

@@ -1,6 +1,17 @@
 import UIKit
 import UniformTypeIdentifiers
 
+private func scaledSystemFont(
+    size: CGFloat,
+    weight: UIFont.Weight = .regular,
+    relativeTo textStyle: UIFont.TextStyle,
+    compatibleWith traitCollection: UITraitCollection? = nil
+) -> UIFont {
+    let font = UIFont.systemFont(ofSize: size, weight: weight)
+    let metrics = UIFontMetrics(forTextStyle: textStyle)
+    return metrics.scaledFont(for: font, compatibleWith: traitCollection)
+}
+
 /// Share Extension view controller for "Save to Beebeeb".
 ///
 /// Flow:
@@ -71,6 +82,7 @@ final class ShareViewController: UIViewController {
     private let containerView = UIView()
     private let headerView = UIView()
     private let fileIconView = UIView()
+    private let fileIconLabel = UILabel()
     private let fileNameLabel = UILabel()
     private let fileSizeLabel = UILabel()
     private let tableView = UITableView(frame: .zero, style: .grouped)
@@ -103,6 +115,15 @@ final class ShareViewController: UIViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         performSetup()
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        guard previousTraitCollection?.preferredContentSizeCategory != traitCollection.preferredContentSizeCategory,
+              isViewLoaded else { return }
+        applyDynamicTypeFonts()
+        tableView.beginUpdates()
+        tableView.endUpdates()
     }
 
 
@@ -344,9 +365,45 @@ final class ShareViewController: UIViewController {
         ])
 
         setupHeader()
-        setupTableView()
         setupBottomBar()
+        setupTableView()
         setupProgressOverlay()
+        applyDynamicTypeFonts()
+    }
+
+    private func applyDynamicTypeFonts() {
+        fileIconLabel.font = scaledSystemFont(
+            size: 16,
+            weight: .bold,
+            relativeTo: .body,
+            compatibleWith: traitCollection
+        )
+        fileNameLabel.font = scaledSystemFont(
+            size: 16,
+            weight: .semibold,
+            relativeTo: .body,
+            compatibleWith: traitCollection
+        )
+        fileNameLabel.numberOfLines = traitCollection.preferredContentSizeCategory.isAccessibilityCategory ? 2 : 1
+        fileSizeLabel.font = scaledSystemFont(size: 13, relativeTo: .footnote, compatibleWith: traitCollection)
+        cancelButton.titleLabel?.font = scaledSystemFont(
+            size: 16,
+            weight: .medium,
+            relativeTo: .body,
+            compatibleWith: traitCollection
+        )
+        saveButton.titleLabel?.font = scaledSystemFont(
+            size: 16,
+            weight: .semibold,
+            relativeTo: .body,
+            compatibleWith: traitCollection
+        )
+        progressLabel.font = scaledSystemFont(
+            size: 15,
+            weight: .medium,
+            relativeTo: .subheadline,
+            compatibleWith: traitCollection
+        )
     }
 
     private func setupHeader() {
@@ -359,19 +416,18 @@ final class ShareViewController: UIViewController {
         fileIconView.translatesAutoresizingMaskIntoConstraints = false
         headerView.addSubview(fileIconView)
 
-        let iconLabel = UILabel()
-        iconLabel.text = "F"
-        iconLabel.font = UIFont.systemFont(ofSize: 16, weight: .bold)
-        iconLabel.textColor = Self.amberColor
-        iconLabel.textAlignment = .center
-        iconLabel.translatesAutoresizingMaskIntoConstraints = false
-        fileIconView.addSubview(iconLabel)
+        fileIconLabel.text = "F"
+        fileIconLabel.textColor = Self.amberColor
+        fileIconLabel.textAlignment = .center
+        fileIconLabel.adjustsFontForContentSizeCategory = true
+        fileIconLabel.translatesAutoresizingMaskIntoConstraints = false
+        fileIconView.addSubview(fileIconLabel)
 
         // File name
         fileNameLabel.text = fileName
-        fileNameLabel.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
         fileNameLabel.textColor = Self.textPrimary
         fileNameLabel.lineBreakMode = .byTruncatingMiddle
+        fileNameLabel.adjustsFontForContentSizeCategory = true
         fileNameLabel.translatesAutoresizingMaskIntoConstraints = false
         headerView.addSubview(fileNameLabel)
 
@@ -384,24 +440,37 @@ final class ShareViewController: UIViewController {
         // gate (task 1671: showError() leaves headerView on screen, so a
         // "Sign in to Beebeeb first" error was shown next to a lying "0 B").
         fileSizeLabel.text = "Preparing…"
-        fileSizeLabel.font = UIFont.systemFont(ofSize: 13)
         fileSizeLabel.textColor = Self.textSecondary
+        fileSizeLabel.adjustsFontForContentSizeCategory = true
         fileSizeLabel.translatesAutoresizingMaskIntoConstraints = false
         headerView.addSubview(fileSizeLabel)
 
+        let preferredHeaderHeight = headerView.heightAnchor.constraint(equalToConstant: 72)
+        preferredHeaderHeight.priority = UILayoutPriority(rawValue: 749)
+        let preferredIconWidth = fileIconView.widthAnchor.constraint(equalToConstant: 40)
+        preferredIconWidth.priority = UILayoutPriority(rawValue: 749)
+        let preferredIconHeight = fileIconView.heightAnchor.constraint(equalToConstant: 40)
+        preferredIconHeight.priority = UILayoutPriority(rawValue: 749)
         NSLayoutConstraint.activate([
             headerView.topAnchor.constraint(equalTo: containerView.topAnchor),
             headerView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
             headerView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
-            headerView.heightAnchor.constraint(equalToConstant: 72),
+            headerView.heightAnchor.constraint(greaterThanOrEqualToConstant: 72),
+            preferredHeaderHeight,
 
             fileIconView.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 20),
             fileIconView.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            fileIconView.widthAnchor.constraint(equalToConstant: 40),
-            fileIconView.heightAnchor.constraint(equalToConstant: 40),
+            fileIconView.widthAnchor.constraint(greaterThanOrEqualToConstant: 40),
+            fileIconView.heightAnchor.constraint(greaterThanOrEqualToConstant: 40),
+            preferredIconWidth,
+            preferredIconHeight,
 
-            iconLabel.centerXAnchor.constraint(equalTo: fileIconView.centerXAnchor),
-            iconLabel.centerYAnchor.constraint(equalTo: fileIconView.centerYAnchor),
+            fileIconLabel.centerXAnchor.constraint(equalTo: fileIconView.centerXAnchor),
+            fileIconLabel.centerYAnchor.constraint(equalTo: fileIconView.centerYAnchor),
+            fileIconLabel.leadingAnchor.constraint(greaterThanOrEqualTo: fileIconView.leadingAnchor, constant: 8),
+            fileIconLabel.trailingAnchor.constraint(lessThanOrEqualTo: fileIconView.trailingAnchor, constant: -8),
+            fileIconLabel.topAnchor.constraint(greaterThanOrEqualTo: fileIconView.topAnchor, constant: 8),
+            fileIconLabel.bottomAnchor.constraint(lessThanOrEqualTo: fileIconView.bottomAnchor, constant: -8),
 
             fileNameLabel.leadingAnchor.constraint(equalTo: fileIconView.trailingAnchor, constant: 12),
             fileNameLabel.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -20),
@@ -409,6 +478,7 @@ final class ShareViewController: UIViewController {
 
             fileSizeLabel.leadingAnchor.constraint(equalTo: fileNameLabel.leadingAnchor),
             fileSizeLabel.topAnchor.constraint(equalTo: fileNameLabel.bottomAnchor, constant: 2),
+            fileSizeLabel.bottomAnchor.constraint(lessThanOrEqualTo: headerView.bottomAnchor, constant: -14),
         ])
     }
 
@@ -417,6 +487,10 @@ final class ShareViewController: UIViewController {
         tableView.separatorStyle = .none
         tableView.delegate = self
         tableView.dataSource = self
+        tableView.rowHeight = UITableView.automaticDimension
+        tableView.estimatedRowHeight = 48
+        tableView.sectionHeaderHeight = UITableView.automaticDimension
+        tableView.estimatedSectionHeaderHeight = 32
         tableView.register(FolderCell.self, forCellReuseIdentifier: FolderCell.reuseID)
         tableView.translatesAutoresizingMaskIntoConstraints = false
         tableView.isHidden = true
@@ -426,7 +500,7 @@ final class ShareViewController: UIViewController {
             tableView.topAnchor.constraint(equalTo: headerView.bottomAnchor),
             tableView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
-            tableView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor, constant: -60),
+            tableView.bottomAnchor.constraint(equalTo: bottomBar.topAnchor),
         ])
     }
 
@@ -437,7 +511,7 @@ final class ShareViewController: UIViewController {
 
         cancelButton.setTitle("Cancel", for: .normal)
         cancelButton.setTitleColor(Self.textSecondary, for: .normal)
-        cancelButton.titleLabel?.font = UIFont.systemFont(ofSize: 16, weight: .medium)
+        cancelButton.titleLabel?.adjustsFontForContentSizeCategory = true
         cancelButton.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
         cancelButton.translatesAutoresizingMaskIntoConstraints = false
         bottomBar.addSubview(cancelButton)
@@ -445,7 +519,7 @@ final class ShareViewController: UIViewController {
         saveButton.setTitle("Save", for: .normal)
         saveButton.setTitleColor(Self.bgColor, for: .normal)
         saveButton.backgroundColor = Self.amberColor
-        saveButton.titleLabel?.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
+        saveButton.titleLabel?.adjustsFontForContentSizeCategory = true
         saveButton.layer.cornerRadius = 8
         saveButton.translatesAutoresizingMaskIntoConstraints = false
         saveButton.addTarget(self, action: #selector(saveTapped), for: .touchUpInside)
@@ -453,19 +527,25 @@ final class ShareViewController: UIViewController {
 
         bottomBar.isHidden = true
 
+        let preferredBottomBarHeight = bottomBar.heightAnchor.constraint(equalToConstant: 60)
+        preferredBottomBarHeight.priority = UILayoutPriority(rawValue: 749)
         NSLayoutConstraint.activate([
             bottomBar.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
             bottomBar.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
             bottomBar.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
-            bottomBar.heightAnchor.constraint(equalToConstant: 60),
+            bottomBar.heightAnchor.constraint(greaterThanOrEqualToConstant: 60),
+            preferredBottomBarHeight,
 
             cancelButton.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 20),
             cancelButton.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
+            cancelButton.trailingAnchor.constraint(lessThanOrEqualTo: saveButton.leadingAnchor, constant: -12),
 
             saveButton.trailingAnchor.constraint(equalTo: bottomBar.trailingAnchor, constant: -20),
             saveButton.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
-            saveButton.widthAnchor.constraint(equalToConstant: 80),
-            saveButton.heightAnchor.constraint(equalToConstant: 36),
+            saveButton.topAnchor.constraint(greaterThanOrEqualTo: bottomBar.topAnchor, constant: 12),
+            saveButton.bottomAnchor.constraint(lessThanOrEqualTo: bottomBar.bottomAnchor, constant: -12),
+            saveButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 80),
+            saveButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 36),
         ])
     }
 
@@ -487,9 +567,10 @@ final class ShareViewController: UIViewController {
         progressBar.addSubview(progressFill)
 
         progressLabel.text = "Saving..."
-        progressLabel.font = UIFont.systemFont(ofSize: 15, weight: .medium)
         progressLabel.textColor = Self.textPrimary
         progressLabel.textAlignment = .center
+        progressLabel.numberOfLines = 0
+        progressLabel.adjustsFontForContentSizeCategory = true
         progressLabel.translatesAutoresizingMaskIntoConstraints = false
         progressOverlay.addSubview(progressLabel)
 
@@ -503,6 +584,8 @@ final class ShareViewController: UIViewController {
 
             progressLabel.centerXAnchor.constraint(equalTo: progressOverlay.centerXAnchor),
             progressLabel.centerYAnchor.constraint(equalTo: progressOverlay.centerYAnchor, constant: -20),
+            progressLabel.leadingAnchor.constraint(greaterThanOrEqualTo: progressOverlay.leadingAnchor, constant: 32),
+            progressLabel.trailingAnchor.constraint(lessThanOrEqualTo: progressOverlay.trailingAnchor, constant: -32),
 
             progressBar.topAnchor.constraint(equalTo: progressLabel.bottomAnchor, constant: 16),
             progressBar.leadingAnchor.constraint(equalTo: progressOverlay.leadingAnchor, constant: 40),
@@ -538,17 +621,29 @@ final class ShareViewController: UIViewController {
 
             let errorLabel = UILabel()
             errorLabel.text = message
-            errorLabel.font = UIFont.systemFont(ofSize: 16, weight: .medium)
+            errorLabel.font = scaledSystemFont(
+                size: 16,
+                weight: .medium,
+                relativeTo: .body,
+                compatibleWith: self.traitCollection
+            )
             errorLabel.textColor = Self.textPrimary
             errorLabel.textAlignment = .center
             errorLabel.numberOfLines = 0
+            errorLabel.adjustsFontForContentSizeCategory = true
             errorLabel.translatesAutoresizingMaskIntoConstraints = false
             self.containerView.addSubview(errorLabel)
 
             let okButton = UIButton(type: .system)
             okButton.setTitle("OK", for: .normal)
             okButton.setTitleColor(Self.amberColor, for: .normal)
-            okButton.titleLabel?.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
+            okButton.titleLabel?.font = scaledSystemFont(
+                size: 16,
+                weight: .semibold,
+                relativeTo: .body,
+                compatibleWith: self.traitCollection
+            )
+            okButton.titleLabel?.adjustsFontForContentSizeCategory = true
             okButton.addTarget(self, action: #selector(self.cancelTapped), for: .touchUpInside)
             okButton.translatesAutoresizingMaskIntoConstraints = false
             self.containerView.addSubview(okButton)
@@ -767,8 +862,14 @@ extension ShareViewController: UITableViewDelegate, UITableViewDataSource {
     func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
         let header = UIView()
         let label = UILabel()
-        label.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+        label.font = scaledSystemFont(
+            size: 12,
+            weight: .semibold,
+            relativeTo: .caption1,
+            compatibleWith: tableView.traitCollection
+        )
         label.textColor = Self.textTertiary
+        label.adjustsFontForContentSizeCategory = true
 
         if !recentFolders.isEmpty && section == 0 {
             label.text = "RECENT"
@@ -780,13 +881,12 @@ extension ShareViewController: UITableViewDelegate, UITableViewDataSource {
         header.addSubview(label)
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 20),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: header.trailingAnchor, constant: -20),
+            label.topAnchor.constraint(greaterThanOrEqualTo: header.topAnchor, constant: 4),
             label.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -4),
+            header.heightAnchor.constraint(greaterThanOrEqualToConstant: 32),
         ])
         return header
-    }
-
-    func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
-        return 32
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -822,9 +922,6 @@ extension ShareViewController: UITableViewDelegate, UITableViewDataSource {
         tableView.reloadData()
     }
 
-    func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
-        return 48
-    }
 }
 
 // MARK: - FolderCell
@@ -848,11 +945,10 @@ private final class FolderCell: UITableViewCell {
         selectionStyle = .none
 
         folderIcon.text = "\u{1F4C1}"
-        folderIcon.font = UIFont.systemFont(ofSize: 18)
+        folderIcon.adjustsFontForContentSizeCategory = true
         folderIcon.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(folderIcon)
 
-        nameLabel.font = UIFont.systemFont(ofSize: 15, weight: .regular)
         nameLabel.textColor = .white
         // Task 1671 (Issue 2a): explicit left alignment, and a
         // content-hugging trailing constraint below (`.lessThanOrEqualTo`
@@ -862,23 +958,29 @@ private final class FolderCell: UITableViewCell {
         // pinned against the checkmark at the far right, a huge gap between
         // them.
         nameLabel.textAlignment = .left
+        nameLabel.numberOfLines = 0
+        nameLabel.adjustsFontForContentSizeCategory = true
         nameLabel.setContentHuggingPriority(.required, for: .horizontal)
+        nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(nameLabel)
 
         checkmark.text = "\u{2713}"
-        checkmark.font = UIFont.systemFont(ofSize: 16, weight: .bold)
+        checkmark.adjustsFontForContentSizeCategory = true
         checkmark.textColor = UIColor(red: 0.851, green: 0.467, blue: 0.024, alpha: 1)
         checkmark.isHidden = true
         checkmark.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(checkmark)
+
+        applyDynamicTypeFonts()
 
         NSLayoutConstraint.activate([
             folderIcon.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
             folderIcon.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
 
             nameLabel.leadingAnchor.constraint(equalTo: folderIcon.trailingAnchor, constant: 10),
-            nameLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            nameLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 15),
+            nameLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -15),
             // `.lessThanOrEqualTo`, not `.equalTo`: the label hugs its own
             // text right after the icon (required content-hugging priority
             // above) instead of being force-stretched to fill the row, which
@@ -888,6 +990,29 @@ private final class FolderCell: UITableViewCell {
             checkmark.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
             checkmark.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
         ])
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        guard previousTraitCollection?.preferredContentSizeCategory != traitCollection.preferredContentSizeCategory else {
+            return
+        }
+        applyDynamicTypeFonts()
+    }
+
+    private func applyDynamicTypeFonts() {
+        folderIcon.font = scaledSystemFont(
+            size: 18,
+            relativeTo: .body,
+            compatibleWith: traitCollection
+        )
+        nameLabel.font = scaledSystemFont(size: 15, relativeTo: .subheadline, compatibleWith: traitCollection)
+        checkmark.font = scaledSystemFont(
+            size: 16,
+            weight: .bold,
+            relativeTo: .body,
+            compatibleWith: traitCollection
+        )
     }
 
     func configure(name: String, isSelected: Bool) {

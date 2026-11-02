@@ -32,6 +32,7 @@ mock.module('react-native', () => ({
   View, Text, TouchableOpacity, Modal,
   StyleSheet: { create: (s: unknown) => s },
   Platform: { OS: 'ios', select: (o: Record<string, unknown>) => o.ios ?? o.default },
+  useWindowDimensions: () => ({ width: 390, height: 844, scale: 3, fontScale: 1 }),
 }));
 mock.module('@expo/vector-icons', () => ({ Ionicons: () => null }));
 mock.module('react-native-gesture-handler', () => ({ GestureHandlerRootView: passthrough }));

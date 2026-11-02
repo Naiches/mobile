@@ -32,6 +32,13 @@ interface CacheEntry {
 
 const memoryCache = new Map<string, CacheEntry>();
 
+/** Drop the in-memory index (the files stay on disk and are found again on demand). */
+export function trimPhotoMemoryCache(): number {
+  const dropped = memoryCache.size;
+  memoryCache.clear();
+  return dropped;
+}
+
 function normalizedExtension(extension?: string | null): string | null {
   if (!extension) return null;
   const ext = extension.replace(/^\./, '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
@@ -229,4 +236,9 @@ export async function prunePhotoCacheForRemoteFiles(
 export async function clearPhotoCache(): Promise<void> {
   memoryCache.clear();
   await FileSystem.deleteAsync(CACHE_DIR, { idempotent: true });
+}
+
+/** Forget the in-memory index only (the files were cleared by the cache page). */
+export function forgetPhotoMemoryCache(): void {
+  memoryCache.clear();
 }

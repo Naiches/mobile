@@ -16,9 +16,9 @@
  *
  * Imports no app module (fs + child_process only), so it needs no `mock.module` calls.
  */
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -74,6 +74,8 @@ import CryptoKit
 
 enum BeebeebConstants {
   static let rootContainerIdentifier = "io.beebeeb.root"
+  static let trashContainerIdentifier = "io.beebeeb.trash"
+  static let trashItemPrefix = "trash:"
   static let masterKeyLabel = "io.beebeeb.master-key"
   static let fileProviderDomainIdentifier = NSFileProviderDomainIdentifier("io.beebeeb.files.harness")
   static var fileProviderDomain: NSFileProviderDomain {
@@ -262,12 +264,22 @@ final class CacheManager {
     return rows.values.filter { $0.parentId == parent }.sorted { $0.id < $1.id }
   }
   @discardableResult
-  func replaceChildren(parent: String?, with items: [CachedItem], expectedEpoch: Int) -> Bool {
+  func replaceChildren(parent: String?, with items: [CachedItem], expectedEpoch: Int, pruningNamespacePrefix: String? = nil) -> Bool {
     lock.lock(); defer { lock.unlock() }
     guard expectedEpoch == epoch else { return false }
     writes.append("replaceChildren")
     for (id, row) in rows where row.parentId == parent && !items.contains(where: { $0.id == id }) { rows[id] = nil }
     for item in items { rows[item.id] = item }
+    if let prefix = pruningNamespacePrefix, let parent {
+      var reachable = Set(rows.values.filter { $0.parentId == parent }.map(\.id))
+      var changed = true
+      while changed {
+        let before = reachable.count
+        for row in rows.values where row.parentId.map(reachable.contains) == true { reachable.insert(row.id) }
+        changed = reachable.count != before
+      }
+      for id in rows.keys where id.hasPrefix(prefix) && !reachable.contains(id) { rows[id] = nil }
+    }
     return true
   }
   @discardableResult
@@ -319,6 +331,7 @@ final class ApiClient {
   var calls: [String] { callsLock.lock(); defer { callsLock.unlock() }; return recordedCalls }
   private func record(_ call: String) { callsLock.lock(); recordedCalls.append(call); callsLock.unlock() }
   private(set) var patchedNames: [String?] = []
+  private(set) var listLimits: [Int?] = []
   /// SF-0002 part 1: the file_id the real ApiClient puts in the upload-init
   /// body (it sends fileId.lowercased(), ApiClient.swift).
   private(set) var uploadInitFileIds: [String] = []
@@ -327,12 +340,14 @@ final class ApiClient {
   /// SF-0001 round 2: the init answer names this id instead of the requested one.
   var initEchoOverride: String?
 
-  func reset() { listings = [:]; downloadResult = .failure(ApiError.invalidResponse); callsLock.lock(); recordedCalls = []; callsLock.unlock(); patchedNames = []; uploadInitFileIds = []; chunkFailures = []; initEchoOverride = nil; chunkTimeoutsLock.lock(); recordedChunkTimeouts = []; chunkTimeoutsLock.unlock() }
+  func reset() { listings = [:]; downloadResult = .failure(ApiError.invalidResponse); callsLock.lock(); recordedCalls = []; callsLock.unlock(); patchedNames = []; listLimits = []; createdFolderIds = []; createFolderFailure = nil; uploadInitFileIds = []; chunkFailures = []; initEchoOverride = nil; chunkTimeoutsLock.lock(); recordedChunkTimeouts = []; chunkTimeoutsLock.unlock() }
   func count(_ prefix: String) -> Int { calls.filter { $0.hasPrefix(prefix) }.count }
 
-  func listFiles(parentId: String?) async throws -> [FileEntryDto] {
-    record("list \(parentId ?? "root")")
-    return try (listings[parentId ?? "root"] ?? .success([])).get()
+  func listFiles(parentId: String?, trashed: Bool = false, maxEntries: Int? = nil) async throws -> [FileEntryDto] {
+    record("\(trashed ? "list-trashed" : "list") \(parentId ?? "root")")
+    listLimits.append(maxEntries)
+    let rows = try (listings[(trashed ? "trashed:" : "") + (parentId ?? "root")] ?? .success([])).get()
+    return maxEntries.map { Array(rows.prefix($0)) } ?? rows
   }
   func downloadEncrypted(fileId: String) async throws -> DownloadedEncryptedFile {
     record("download \(fileId)")
@@ -345,6 +360,15 @@ final class ApiClient {
                         size_bytes: 0, is_folder: false, chunk_count: 1, created_at: nil, updated_at: "2026-10-14T00:00:00Z")
   }
   func deleteFile(fileId: String, expectedUser: String?) async throws { record("delete \(fileId)") }
+  private(set) var createdFolderIds: [String] = []
+  var createFolderFailure: Error?
+  func createFolder(folderId: String, nameEncrypted: String, parentId: String?, expectedUser: String?) async throws -> FileEntryDto {
+    record("create-folder \(folderId) parent=\(parentId ?? "root")")
+    if let createFolderFailure { throw createFolderFailure }
+    createdFolderIds.append(folderId)
+    return FileEntryDto(id: folderId, parent_id: parentId, name_encrypted: nameEncrypted, name_nonce: nil, mime_type: nil,
+                        size_bytes: 0, is_folder: true, chunk_count: 0, created_at: "2026-10-14T00:00:00Z", updated_at: "2026-10-14T00:00:00Z")
+  }
   func initUploadV2(fileId: String, nameEncrypted: String, fileSizeBytes: Int64, mimeType: String?, parentId: String?,
                     isMedia: Bool, chunkSizeBytes: Int, chunkCount: Int, expectedUser: String?) async throws -> UploadV2InitResponse {
     record("upload-init \(fileId)")
@@ -1276,6 +1300,574 @@ func createRetriesADroppedChunkAndStopsOnARefusal() async {
   check(ApiClient.shared.count("upload-complete") == 0, "a refused chunk: nothing is completed, got \(ApiClient.shared.calls)")
 }
 
+// ---- Files kept showing items deleted elsewhere: the background refresh was cancelled ----
+// iOS invalidates an enumerator right after enumerateItems. The refresh that prunes rows deleted on the
+// server used to be cancelled with it (NSURLError -999), so the cache was never reconciled. Only the
+// first-load path, which still has to answer the observer, may be cancelled by invalidate().
+final class CancellationAwareRefresher: FileProviderContainerRefreshing, @unchecked Sendable {
+  private let lock = NSLock()
+  private var started = 0, finished = 0, running = 0, maxRunning = 0, sawCancel = false
+  var delayNanos: UInt64 = 150_000_000
+  var startedCount: Int { lock.lock(); defer { lock.unlock() }; return started }
+  var finishedCount: Int { lock.lock(); defer { lock.unlock() }; return finished }
+  var maxConcurrent: Int { lock.lock(); defer { lock.unlock() }; return maxRunning }
+  var cancelled: Bool { lock.lock(); defer { lock.unlock() }; return sawCancel }
+  func refreshContainer(containerId: String) async -> FileProviderRefreshOutcome {
+    lock.lock(); started += 1; running += 1; maxRunning = max(maxRunning, running); lock.unlock()
+    try? await Task.sleep(nanoseconds: delayNanos)
+    // A cancelled URLSession request fails with -999 and never reaches the cache.
+    let wasCancelled = Task.isCancelled
+    let outcome: FileProviderRefreshOutcome = wasCancelled ? .serverUnreachable : await SyncEngine.refreshContainer(containerId: containerId)
+    lock.lock(); running -= 1; finished += 1; if wasCancelled { sawCancel = true }; lock.unlock()
+    return outcome
+  }
+  func refreshMaterializedContainers() async {}
+}
+
+func enumerateOnce(_ enumerator: FileProviderEnumerator, wait: Bool = true) async -> ListingObserver {
+  let observer = ListingObserver()
+  enumerator.enumerateItems(for: observer, startingAt: NSFileProviderPage(Data()))
+  if wait {
+    let done = await withCheckedContinuation { continuation in
+      DispatchQueue.global().async { continuation.resume(returning: observer.wait()) }
+    }
+    check(done, "enumeration finished")
+  }
+  return observer
+}
+
+func backgroundRefreshSurvivesInvalidate() async {
+  reset()
+  CacheManager.shared.rows["keep"] = row("keep", name: "keep.txt")
+  CacheManager.shared.rows["gone"] = row("gone", name: "gone.txt")
+  ApiClient.shared.listings["root"] = .success([dto("keep", parent: nil, name: "keep.txt")])
+  let refresher = CancellationAwareRefresher()
+  let enumerator = FileProviderEnumerator(containerIdentifier: .rootContainer, cache: CacheManager.shared, refresher: refresher)
+  let first = await enumerateOnce(enumerator)
+  // The location's root also carries the read-only Trash folder; it is not a cached row.
+  let firstNames = first.items.map(\.filename).filter { $0 != "Beebeeb Trash" }.sorted()
+  check(firstNames == ["gone.txt", "keep.txt"], "the cached listing is shown first, got \(firstNames)")
+  enumerator.invalidate()
+  let settled1 = await waitUntil { refresher.finishedCount == 1 }
+  check(settled1, "the refresh finished after invalidate()")
+  check(!refresher.cancelled, "invalidate() did not cancel the background refresh")
+  check(CacheManager.shared.item(id: "gone") == nil, "a row deleted on the server is gone from the cache after enumeration")
+  check(CacheManager.shared.item(id: "keep") != nil, "a row still on the server stays")
+  check(ApiClient.shared.count("list root") == 1, "the server was listed once, got \(ApiClient.shared.calls)")
+}
+
+func backgroundRefreshesAreCoalescedPerContainer() async {
+  reset()
+  CacheManager.shared.rows["keep"] = row("keep", name: "keep.txt")
+  ApiClient.shared.listings["root"] = .success([dto("keep", parent: nil, name: "keep.txt")])
+  let refresher = CancellationAwareRefresher()
+  for _ in 0..<5 {
+    let enumerator = FileProviderEnumerator(containerIdentifier: .rootContainer, cache: CacheManager.shared, refresher: refresher)
+    _ = await enumerateOnce(enumerator)
+    enumerator.invalidate()
+  }
+  let settled2 = await waitUntil { refresher.startedCount >= 1 && refresher.startedCount == refresher.finishedCount }
+  check(settled2, "the refreshes settled")
+  try? await Task.sleep(nanoseconds: 400_000_000)
+  check(refresher.maxConcurrent == 1, "at most one refresh per container is in flight, got \(refresher.maxConcurrent)")
+  check(refresher.startedCount <= 2, "five enumerations start at most two refreshes (one running, one queued), got \(refresher.startedCount)")
+  check(!refresher.cancelled, "no coalesced refresh was cancelled")
+}
+
+func firstLoadStaysCancellable() async {
+  reset()
+  ApiClient.shared.listings["root"] = .success([dto("a", parent: nil, name: "a.txt")])
+  let refresher = CancellationAwareRefresher()
+  let enumerator = FileProviderEnumerator(containerIdentifier: .rootContainer, cache: CacheManager.shared, refresher: refresher)
+  let observer = await enumerateOnce(enumerator, wait: false)
+  enumerator.invalidate()
+  let settled3 = await waitUntil { refresher.finishedCount == 1 }
+  check(settled3, "the first-load refresh ended")
+  check(refresher.cancelled, "invalidate() cancels the first-load refresh, which still has to answer the observer")
+  check(CacheManager.shared.item(id: "a") == nil, "a cancelled first load writes nothing")
+  check(observer.items.isEmpty, "a cancelled first load vends nothing")
+}
+
+// ---- The root "Backups" folder is protected in the Files app ----
+// The app publishes the folder's id through sync_state; the extension offers no delete, rename or
+// move for it and refuses those calls if Files sends them anyway. Items inside stay manageable.
+func deleteReturning(_ id: String) async -> NSError? {
+  let ext = FileProviderExtension(domain: BeebeebConstants.fileProviderDomain)
+  return await withCheckedContinuation { continuation in
+    _ = ext.deleteItem(identifier: NSFileProviderItemIdentifier(id), baseVersion: NSFileProviderItemVersion(), options: [],
+                       request: NSFileProviderRequest()) { error in continuation.resume(returning: error as NSError?) }
+  }
+}
+
+func backupsRootIsProtected() async {
+  let guarded: NSFileProviderItemCapabilities = [.allowsDeleting, .allowsRenaming, .allowsReparenting]
+  func seed() {
+    reset()
+    CacheManager.shared.rows["B"] = row("B", name: "Backups", folder: true)
+    CacheManager.shared.rows["D"] = row("D", parent: "B", name: "Camera Roll", folder: true)
+    CacheManager.shared.rows["x"] = row("x", parent: "B", name: "notes.txt")
+    CacheManager.shared.rows["other"] = row("other", name: "Taxes", folder: true)
+    CacheManager.shared.setSyncState(key: FileProviderItem.protectedBackupsRootKey, value: "b")
+  }
+
+  seed()
+  let rootCaps = FileProviderItem(cached: CacheManager.shared.rows["B"]!).capabilities
+  check(rootCaps.isDisjoint(with: guarded), "the Backups root offers no delete, rename or move, got \(rootCaps.rawValue)")
+  check(rootCaps.contains(.allowsContentEnumerating) && rootCaps.contains(.allowsAddingSubItems), "the Backups root can still be opened and filled")
+  check(!rootCaps.contains(.allowsTrashing), "the Backups root offers no trashing")
+  for id in ["D", "x", "other"] {
+    let caps = FileProviderItem(cached: CacheManager.shared.rows[id]!).capabilities
+    check(caps.isSuperset(of: guarded), "\(id) keeps delete, rename and move, got \(caps.rawValue)")
+  }
+  let protectedVersion = FileProviderItem(cached: CacheManager.shared.rows["B"]!).itemVersion.metadataVersion
+  CacheManager.shared.state = [:]
+  check(FileProviderItem(cached: CacheManager.shared.rows["B"]!).itemVersion.metadataVersion != protectedVersion,
+        "protecting the folder changes its item version, so Files re-reads its capabilities")
+
+  seed()
+  let deleteError = await deleteReturning("B")
+  check(isProviderError(deleteError, .deletionRejected), "deleting the Backups root is refused with deletionRejected, got \(describe(deleteError))")
+  check(ApiClient.shared.count("delete") == 0, "a refused delete sends nothing to the server, got \(ApiClient.shared.calls)")
+  check(CacheManager.shared.item(id: "B") != nil, "a refused delete keeps the cache row")
+
+  let renameResult = await modifyReturningPending(Template("B", parent: NSFileProviderItemIdentifier.rootContainer.rawValue, filename: "Archive"), [.filename])
+  check(renameResult.2 != nil && renameResult.0 == nil, "renaming the Backups root is refused, got \(describe(renameResult.2))")
+  let moveResult = await modifyReturningPending(Template("B", parent: "other", filename: "Backups"), [.parentItemIdentifier])
+  check(moveResult.2 != nil && moveResult.0 == nil, "moving the Backups root is refused, got \(describe(moveResult.2))")
+  check(ApiClient.shared.count("patch") == 0, "refused rename and move send nothing to the server, got \(ApiClient.shared.calls)")
+  let touch = await modifyReturningPending(Template("B", parent: NSFileProviderItemIdentifier.rootContainer.rawValue, filename: "Backups"), [.lastUsedDate])
+  check(touch.2 == nil, "a change Beebeeb does not store (lastUsedDate) is not an error, got \(describe(touch.2))")
+
+  let insideDelete = await deleteReturning("D")
+  check(insideDelete == nil && ApiClient.shared.count("delete D") == 1, "items inside Backups can be deleted, got \(describe(insideDelete)) \(ApiClient.shared.calls)")
+  let insideRename = await modifyReturningPending(Template("x", parent: "B", filename: "renamed.txt"), [.filename])
+  check(insideRename.2 == nil && ApiClient.shared.count("patch x") == 1, "items inside Backups can be renamed, got \(describe(insideRename.2)) \(ApiClient.shared.calls)")
+
+  // Sign-out clears sync_state with the rest of the cache: nothing stays protected.
+  CacheManager.shared.state = [:]
+  let afterSignOut = FileProviderItem(cached: CacheManager.shared.rows["B"]!).capabilities
+  check(afterSignOut.isSuperset(of: guarded), "after sign-out the id is forgotten, got \(afterSignOut.rawValue)")
+}
+
+
+// ---- Files app: authentication recovery, badge sources, read-only Trash ----
+let authFlagKey = "files.authRequiredAt"
+let trashId = "io.beebeeb.trash"
+
+func flagIsRecent() -> Bool {
+  guard let raw = CacheManager.shared.syncState(key: authFlagKey), let at = Double(raw) else { return false }
+  return abs(Date().timeIntervalSince1970 - at) < 10
+}
+
+func dtoUpdated(_ id: String, parent: String?, name: String?, folder: Bool = false, updated: String) -> ApiClient.FileEntryDto {
+  ApiClient.FileEntryDto(id: id, parent_id: parent, name_encrypted: name, name_nonce: nil, mime_type: folder ? nil : "text/plain",
+                         size_bytes: folder ? 0 : 5, is_folder: folder, chunk_count: 1, created_at: nil, updated_at: updated)
+}
+
+// Files reports "Authentication Required" for a listing that ends -1000. The app opens from
+// that button and must know why: the extension records when it reported the error.
+func notAuthenticatedRecordsAFlagAndRecoveryEndsClean() async {
+  reset()
+  BeebeebKeychainCore.keyResult = .failure(BeebeebKeychainCore.LoadError.seKeyNotFound)
+  ApiClient.shared.listings["F"] = .success([
+    dto("c1", parent: "F", name: encryptedName("c1", "Taxes"), folder: true),
+    dto("c3", parent: "F", name: encryptedName("c3", "notes.txt")),
+  ])
+  check(CacheManager.shared.syncState(key: authFlagKey) == nil, "no flag before anything failed")
+  let refused = await list("F")
+  check(isProviderError(refused.error, .notAuthenticated), "no key: -1000, got \(describe(refused.error))")
+  check(flagIsRecent(), "the -1000 listing records a timestamp, got \(CacheManager.shared.syncState(key: authFlagKey) ?? "nil")")
+
+  // A content fetch that ends -1000 records it as well.
+  reset()
+  CacheManager.shared.rows["f1"] = row("f1", name: "notes.txt", size: 5)
+  BeebeebKeychainCore.keyResult = .failure(BeebeebKeychainCore.LoadError.notFound)
+  let (_, fetchError) = await fetch("f1")
+  check(isProviderError(fetchError, .notAuthenticated), "fetch without key: -1000, got \(describe(fetchError))")
+  check(flagIsRecent(), "a -1000 fetch records the flag")
+
+  // A listing that works records nothing.
+  reset()
+  ApiClient.shared.listings["F"] = .success([dto("c3", parent: "F", name: encryptedName("c3", "notes.txt"))])
+  let fine = await list("F")
+  check(fine.error == nil && fine.items.count == 1, "a healthy listing succeeds")
+  check(CacheManager.shared.syncState(key: authFlagKey) == nil, "a healthy listing records no flag")
+
+  // Recovery: the same folder, key now available. The listing succeeds and carries no error.
+  reset()
+  BeebeebKeychainCore.keyResult = .failure(BeebeebKeychainCore.LoadError.seKeyNotFound)
+  ApiClient.shared.listings["F"] = .success([
+    dto("c1", parent: "F", name: encryptedName("c1", "Taxes"), folder: true),
+    dto("c3", parent: "F", name: encryptedName("c3", "notes.txt")),
+  ])
+  _ = await list("F")
+  BeebeebKeychainCore.keyResult = .success(BeebeebKeychainCore.goodKey)
+  let recovered = await list("F")
+  check(recovered.error == nil, "after recovery the listing ends without an error, got \(describe(recovered.error))")
+  check(recovered.items.map(\.filename).sorted() == ["Taxes", "notes.txt"], "after recovery the real names are listed, got \(recovered.items.map(\.filename))")
+  check(flagIsRecent(), "the flag stays until the app has handled it (the app clears it)")
+}
+
+// The working set is not a place the user opens. A -1000 there is what leaves the blue
+// sync-problem badge on the Beebeeb location, with no folder to show "Open Beebeeb" in.
+func workingSetNeverCarriesAnAuthenticationError() async {
+  reset()
+  BeebeebKeychainCore.keyResult = .failure(BeebeebKeychainCore.LoadError.seKeyNotFound)
+  ApiClient.shared.listings["root"] = .success([dto("c1", parent: nil, name: encryptedName("c1", "Taxes"), folder: true)])
+  let ws = await list(NSFileProviderItemIdentifier.workingSet.rawValue)
+  check(ws.error == nil, "the working set finishes without an error, got \(describe(ws.error))")
+  check(ws.items.isEmpty, "the working set vends nothing it cannot name, got \(ws.items.map(\.filename))")
+  check(flagIsRecent(), "the working set still records that authentication is needed")
+  // The root folder, which the user does open, still shows Authentication Required.
+  let root = await list(NSFileProviderItemIdentifier.rootContainer.rawValue)
+  check(isProviderError(root.error, .notAuthenticated), "the root folder still ends -1000, got \(describe(root.error))")
+}
+
+// Errors Files treats as a dead end leave the red/blue badge on an item until the user removes it.
+// Anything transient must be reported as something Files retries; a cancellation is not a failure.
+func transientFailuresAreRetryableNotDeadEnds() async {
+  let transient: [(String, Error)] = [
+    ("timed out", URLError(.timedOut)),
+    ("offline", URLError(.notConnectedToInternet)),
+    ("connection lost", URLError(.networkConnectionLost)),
+    ("cannot connect", URLError(.cannotConnectToHost)),
+  ]
+  for (label, failure) in transient {
+    let mapped = FileProviderExtension.mapError(failure) as NSError
+    check(isProviderError(mapped, .serverUnreachable), "\(label): retryable -1004, got \(describe(mapped))")
+  }
+  for (label, failure) in [("URLError.cancelled", URLError(.cancelled) as Error), ("CancellationError", CancellationError() as Error)] {
+    let mapped = FileProviderExtension.mapError(failure) as NSError
+    check(mapped.domain == NSCocoaErrorDomain && mapped.code == NSUserCancelledError, "\(label): a cancellation, not a sync error, got \(describe(mapped))")
+  }
+  check(isProviderError(FileProviderExtension.mapError(CryptoBridge.CryptoBridgeError.decodeFailed) as NSError, .cannotSynchronize),
+        "an error nobody can retry past is still -2005")
+
+  for (label, failure) in [("bad URL", URLError(.badURL)), ("refused TLS", URLError(.serverCertificateUntrusted))] {
+    check(isProviderError(FileProviderExtension.mapError(failure) as NSError, .cannotSynchronize), "\(label) is not retried forever, -2005")
+  }
+  reset()
+  CacheManager.shared.rows["f1"] = row("f1", name: "notes.txt", size: 5)
+  ApiClient.shared.downloadResult = .failure(URLError(.timedOut))
+  let (_, fetchError) = await fetch("f1")
+  check(isProviderError(fetchError, .serverUnreachable), "a timed-out download is retryable, got \(describe(fetchError))")
+}
+
+// ---- Trash ----
+func trashFolderIsListedAtTheTopAndIsReadOnly() async {
+  let readOnlyFolder: NSFileProviderItemCapabilities = [.allowsContentEnumerating, .allowsAddingSubItems]
+  reset()
+  CacheManager.shared.rows["keep"] = row("keep", name: "keep.txt")
+  ApiClient.shared.listings["root"] = .success([dto("keep", parent: nil, name: "keep.txt")])
+  let root = await list(NSFileProviderItemIdentifier.rootContainer.rawValue)
+  let names = root.items.map(\.filename).sorted()
+  check(names == ["Beebeeb Trash", "keep.txt"], "root lists the files and a uniquely named Trash folder, got \(names)")
+  let trash = root.items.first { $0.filename == "Beebeeb Trash" }!
+  check(trash.itemIdentifier.rawValue == trashId && trash.parentItemIdentifier == .rootContainer, "Trash sits at the top of the location")
+  check(trash.contentType == .folder, "Trash is a folder")
+  check((trash.capabilities ?? []) == readOnlyFolder, "Trash can be opened, with no rename, move or delete, got \(trash.capabilities?.rawValue ?? 0)")
+
+  let (looked, lookError) = await lookup(NSFileProviderItemIdentifier(trashId))
+  check(lookError == nil && looked?.filename == "Beebeeb Trash", "item(for: Trash) answers with the folder, got \(describe(lookError))")
+  check((looked?.capabilities ?? []) == readOnlyFolder, "the looked-up Trash is read-only")
+
+  // The system trash container stays unsupported (a different thing).
+  let (system, systemError) = await lookup(.trashContainer)
+  check(system == nil && isFeatureUnsupported(systemError), "the system trash container is still unsupported")
+
+  // Trash is not part of the working set.
+  let ws = await list(NSFileProviderItemIdentifier.workingSet.rawValue)
+  check(ws.items.contains { $0.itemIdentifier.rawValue == trashId }, "the working set carries the Trash folder itself, so an existing install learns of it")
+
+  // Its listing: trashed items, real names, ids that cannot be mistaken for live ones.
+  reset()
+  ApiClient.shared.listings["trashed:root"] = .success([
+    dtoUpdated("t1", parent: nil, name: encryptedName("t1", "old.txt"), updated: "2026-10-01T00:00:00Z"),
+    dtoUpdated("t2", parent: nil, name: encryptedName("t2", "Old folder"), folder: true, updated: "2026-10-02T00:00:00Z"),
+    dtoUpdated("t3", parent: "t2", name: encryptedName("t3", "inside.txt"), updated: "2026-10-02T00:00:00Z"),
+  ])
+  let listed = await list(trashId)
+  check(listed.error == nil, "Trash lists without error, got \(describe(listed.error))")
+  check(ApiClient.shared.count("list-trashed root") == 1 && ApiClient.shared.count("list root") == 0, "Trash asks the server for the trashed listing only, got \(ApiClient.shared.calls)")
+  check(ApiClient.shared.listLimits.compactMap { $0 }.last == 500, "Trash root caps the server listing at 500 rows")
+  check(listed.items.map(\.filename).sorted() == ["Old folder", "old.txt"], "Trash lists what was trashed on its own, got \(listed.items.map(\.filename))")
+  for item in listed.items {
+    check(item.itemIdentifier.rawValue.hasPrefix("trash:"), "\(item.filename): Trash ids are their own namespace, got \(item.itemIdentifier.rawValue)")
+    check(item.parentItemIdentifier.rawValue == trashId, "\(item.filename): its parent is Trash")
+    let caps = item.capabilities ?? []
+    let expected: NSFileProviderItemCapabilities = item.contentType == .folder ? [.allowsContentEnumerating, .allowsAddingSubItems] : [.allowsReading]
+    check(caps == expected, "\(item.filename): read-only capabilities, got \(caps.rawValue)")
+  }
+  check(CacheManager.shared.item(id: "t1") == nil && CacheManager.shared.item(id: "t2") == nil, "no live row is created for a trashed item")
+
+  // A trashed folder opens and lists its own contents.
+  ApiClient.shared.listings["trashed:t2"] = .success([
+    dtoUpdated("t3", parent: nil, name: encryptedName("t3", "inside.txt"), updated: "2026-10-02T00:00:00Z"),
+  ])
+  let inside = await list("trash:t2")
+  check(inside.error == nil && inside.items.map(\.filename) == ["inside.txt"], "a trashed folder lists its contents, got \(inside.items.map(\.filename)) \(describe(inside.error))")
+  check(ApiClient.shared.count("list-trashed t2") == 1, "it goes through the trashed listing of that folder, got \(ApiClient.shared.calls)")
+  check(inside.items.first?.parentItemIdentifier.rawValue == "trash:t2", "and its parent is the trashed folder")
+
+  // Opening a trashed file downloads the real id and derives its keys from it.
+  MasterKeyHandle.derivedFileIds = []
+  ApiClient.shared.downloadResult = .failure(ApiError.statusCode(503))
+  _ = await fetch("trash:t1")
+  check(ApiClient.shared.count("download t1") == 1, "a trashed file is downloaded by its server id, got \(ApiClient.shared.calls)")
+
+  // The server may refuse the download of a trashed file: say what to do instead of a generic failure.
+  for code in [403, 404, 409, 410] {
+    ApiClient.shared.downloadResult = .failure(ApiError.statusCode(code))
+    let (_, refused) = await fetch("trash:t1")
+    check(refused?.localizedDescription == "Restore it in the Beebeeb app to open it.", "HTTP \(code) on a trashed file explains how to open it, got \(refused?.localizedDescription ?? "nil")")
+  }
+  ApiClient.shared.downloadResult = .failure(ApiError.statusCode(503))
+  let (_, outage) = await fetch("trash:t1")
+  check(isProviderError(outage, .serverUnreachable), "a server outage on a trashed file is still retryable, got \(describe(outage))")
+  ApiClient.shared.downloadResult = .failure(ApiError.statusCode(404))
+  CacheManager.shared.rows["live1"] = row("live1", name: "live.txt", size: 5)
+  let (_, liveMissing) = await fetch("live1")
+  check(liveMissing?.localizedDescription != "Restore it in the Beebeeb app to open it.", "the message is for trashed items only")
+
+  // Restored on the server: the next listing drops it.
+  ApiClient.shared.listings["trashed:root"] = .success([
+    dtoUpdated("t2", parent: nil, name: encryptedName("t2", "Old folder"), folder: true, updated: "2026-10-02T00:00:00Z"),
+  ])
+  _ = await SyncEngine.refreshContainer(containerId: trashId)
+  check(CacheManager.shared.item(id: "trash:t1") == nil && CacheManager.shared.item(id: "trash:t2") != nil, "a restored item leaves Trash on the next listing")
+
+  // If the folder itself is later restored/purged, its nested cached names are unreachable and
+  // must leave the shared cache with it, even if that folder is never opened again.
+  ApiClient.shared.listings["trashed:root"] = .success([])
+  _ = await SyncEngine.refreshContainer(containerId: trashId)
+  check(CacheManager.shared.item(id: "trash:t2") == nil && CacheManager.shared.item(id: "trash:t3") == nil, "restoring a trashed folder prunes its nested cached rows")
+}
+
+func nothingCanBeWrittenInsideTrash() async {
+  func seed() {
+    reset()
+    CacheManager.shared.rows["trash:t1"] = row("trash:t1", parent: trashId, name: "old.txt")
+    CacheManager.shared.rows["trash:t2"] = row("trash:t2", parent: trashId, name: "Old folder", folder: true)
+    CacheManager.shared.rows["live"] = row("live", name: "live.txt")
+  }
+  seed()
+  for id in ["trash:t1", "trash:t2", trashId] {
+    let error = await deleteReturning(id)
+    check(isProviderError(error, .deletionRejected), "deleting \(id) is refused, got \(describe(error))")
+  }
+  check(ApiClient.shared.count("delete") == 0, "refused deletes send nothing, got \(ApiClient.shared.calls)")
+
+  let rename = await modifyReturningPending(Template("trash:t1", parent: trashId, filename: "new.txt"), [.filename])
+  check(rename.0 == nil && isProviderError(rename.2, .cannotSynchronize), "renaming in Trash is refused, got \(describe(rename.2))")
+  let moveOut = await modifyReturningPending(Template("trash:t1", parent: NSFileProviderItemIdentifier.rootContainer.rawValue, filename: "old.txt"), [.parentItemIdentifier])
+  check(moveOut.0 == nil && moveOut.2 != nil, "moving out of Trash is refused, got \(describe(moveOut.2))")
+  let moveIn = await modifyReturningPending(Template("live", parent: trashId, filename: "live.txt"), [.parentItemIdentifier])
+  check(moveIn.0 == nil && moveIn.2 != nil, "moving into Trash is refused, got \(describe(moveIn.2))")
+  let moveInFolder = await modifyReturningPending(Template("live", parent: "trash:t2", filename: "live.txt"), [.parentItemIdentifier])
+  check(moveInFolder.0 == nil && moveInFolder.2 != nil, "moving into a trashed folder is refused, got \(describe(moveInFolder.2))")
+  let content = await modifyReturningPending(Template("trash:t1", parent: trashId, filename: "old.txt"), [.contents])
+  check(content.0 == nil && content.2 != nil, "changing the contents of a trashed file is refused, got \(describe(content.2))")
+  check(ApiClient.shared.count("patch") == 0 && ApiClient.shared.count("upload") == 0, "refused writes send nothing, got \(ApiClient.shared.calls)")
+
+  for parent in [trashId, "trash:t2"] {
+    let ext = FileProviderExtension(domain: BeebeebConstants.fileProviderDomain)
+    let source = AppGroupContainer.directory("create-source").appendingPathComponent("into-trash.txt")
+    try! Data(repeating: 0x41, count: 16).write(to: source)
+    let created: (NSFileProviderItem?, NSError?) = await withCheckedContinuation { continuation in
+      _ = ext.createItem(basedOn: Template("new-item", parent: parent, filename: "into-trash.txt"), fields: [], contents: source, options: [],
+                         request: NSFileProviderRequest()) { item, _, _, error in continuation.resume(returning: (item, error as NSError?)) }
+    }
+    check(created.0 == nil && created.1 != nil, "creating inside \(parent) is refused, got \(describe(created.1))")
+  }
+  check(ApiClient.shared.count("upload") == 0, "a refused create uploads nothing, got \(ApiClient.shared.calls)")
+  check(CacheManager.shared.rows["live"] != nil && CacheManager.shared.writes.isEmpty, "refused writes leave the cache alone")
+
+  // Live items outside Trash are unaffected.
+  let ok = await deleteReturning("live")
+  check(ok == nil && ApiClient.shared.count("delete live") == 1, "a live item can still be deleted, got \(describe(ok))")
+}
+
+func trashedItemsStayOutOfEverythingElse() async {
+  reset()
+  // Live tree, plus rows of a trashed folder Files had listed before it was trashed on the web.
+  CacheManager.shared.rows["F"] = row("F", name: "Taxes", folder: true)
+  CacheManager.shared.rows["c1"] = row("c1", parent: "F", name: "2026 return.pdf")
+  CacheManager.shared.rows["keep"] = row("keep", name: "keep.txt")
+  CacheManager.shared.rows["trash:t1"] = row("trash:t1", parent: trashId, name: "old.txt")
+  CacheManager.shared.rows["trash:t2"] = row("trash:t2", parent: trashId, name: "Old folder", folder: true)
+  CacheManager.shared.rows["trash:t3"] = row("trash:t3", parent: "trash:t2", name: "inside.txt")
+  CacheManager.shared.materialized = ["F", "trash:t2", trashId]
+  ApiClient.shared.listings["root"] = .success([dto("keep", parent: nil, name: "keep.txt"), dto("F", parent: nil, name: "Taxes", folder: true)])
+
+  let ws = await list(NSFileProviderItemIdentifier.workingSet.rawValue)
+  let wsNames = ws.items.map(\.filename).sorted()
+  check(!wsNames.contains("old.txt") && !wsNames.contains("Old folder") && !wsNames.contains("inside.txt") && wsNames.contains("Beebeeb Trash"),
+        "the working set (Recents, search) carries the Trash folder but nothing from inside it, got \(wsNames)")
+  check(wsNames.contains("2026 return.pdf") && wsNames.contains("keep.txt"), "but still the live tree, got \(wsNames)")
+
+  let root = await list(NSFileProviderItemIdentifier.rootContainer.rawValue)
+  check(!root.items.map(\.filename).contains("old.txt"), "the root folder lists no trashed file, got \(root.items.map(\.filename))")
+
+  // The folder is trashed on the web: the root listing drops it. Its children must go with it.
+  ApiClient.shared.listings["root"] = .success([dto("keep", parent: nil, name: "keep.txt")])
+  _ = await SyncEngine.refreshContainer(containerId: BeebeebConstants.rootContainerIdentifier)
+  check(CacheManager.shared.item(id: "F") == nil, "setup: the trashed folder left the cache")
+  let after = await list(NSFileProviderItemIdentifier.workingSet.rawValue)
+  let afterNames = after.items.map(\.filename).sorted()
+  check(!afterNames.contains("2026 return.pdf"), "children of a folder trashed elsewhere leave the working set, got \(afterNames)")
+  check(afterNames.contains("keep.txt"), "the live tree stays, got \(afterNames)")
+}
+
+
+final class FolderTemplate: NSObject, NSFileProviderItem {
+  let itemIdentifier: NSFileProviderItemIdentifier
+  let parentItemIdentifier: NSFileProviderItemIdentifier
+  let filename: String
+  var contentType: UTType { .folder }
+  init(_ id: String, parent: String, filename: String) {
+    itemIdentifier = NSFileProviderItemIdentifier(id)
+    parentItemIdentifier = NSFileProviderItemIdentifier(parent)
+    self.filename = filename
+  }
+}
+
+func createFolderFromFilesApp(_ name: String, parent: String) async -> (NSFileProviderItem?, NSError?) {
+  let ext = FileProviderExtension(domain: BeebeebConstants.fileProviderDomain)
+  return await withCheckedContinuation { continuation in
+    _ = ext.createItem(basedOn: FolderTemplate("template-folder", parent: parent, filename: name), fields: [], contents: nil, options: [],
+                       request: NSFileProviderRequest()) { item, _, _, error in
+      continuation.resume(returning: (item, error as NSError?))
+    }
+  }
+}
+
+// A new folder made in Files used to end noSuchItem: a permanent error on the new folder.
+func foldersCanBeCreatedFromFiles() async {
+  reset()
+  let (made, error) = await createFolderFromFilesApp("Receipts", parent: NSFileProviderItemIdentifier.rootContainer.rawValue)
+  check(error == nil, "creating a folder succeeds, got \(describe(error))")
+  check(ApiClient.shared.count("create-folder") == 1 && ApiClient.shared.calls.contains { $0.hasSuffix("parent=root") }, "the server is asked once, in the root, got \(ApiClient.shared.calls)")
+  let id = ApiClient.shared.createdFolderIds.first ?? ""
+  check(id == id.lowercased() && !id.isEmpty, "the folder id is lowercase (keys derive from it), got \(id)")
+  check(made?.filename == "Receipts" && made?.contentType == .folder, "the created item is the folder, got \(made?.filename ?? "nil")")
+  check(made?.itemIdentifier.rawValue == id, "its id is the id the server holds")
+  check(CacheManager.shared.item(id: id)?.isFolder == true && CacheManager.shared.item(id: id)?.nameDecrypted == "Receipts", "the folder is cached with its name")
+
+  reset()
+  _ = await createFolderFromFilesApp("Inner", parent: "P1")
+  check(ApiClient.shared.calls.contains { $0.hasSuffix("parent=P1") }, "a folder is created inside its parent, got \(ApiClient.shared.calls)")
+
+  // A failure is reported as something Files retries, not as a dead end.
+  reset()
+  ApiClient.shared.createFolderFailure = URLError(.notConnectedToInternet)
+  let (none, offline) = await createFolderFromFilesApp("Later", parent: NSFileProviderItemIdentifier.rootContainer.rawValue)
+  check(none == nil && isProviderError(offline, .serverUnreachable), "an offline create is retryable, got \(describe(offline))")
+
+  // No key: -1000, never noSuchItem.
+  reset()
+  BeebeebKeychainCore.keyResult = .failure(BeebeebKeychainCore.LoadError.seKeyNotFound)
+  let (_, noKey) = await createFolderFromFilesApp("Locked", parent: NSFileProviderItemIdentifier.rootContainer.rawValue)
+  check(isProviderError(noKey, .notAuthenticated), "no key: -1000, got \(describe(noKey))")
+
+  // Inside Trash it is still refused.
+  reset()
+  let (_, refused) = await createFolderFromFilesApp("Nope", parent: trashId)
+  check(refused != nil && ApiClient.shared.count("create-folder") == 0, "no folder is created in Trash")
+}
+
+
+// The server's flat trash listing may or may not carry parent_id. Either way a trashed row has ONE
+// stable parent in the cache: it never moves between Trash and a trashed folder on a refresh.
+func trashedRowsKeepOneStableParent() async {
+  func parentOf(_ id: String) -> String? { CacheManager.shared.item(id: id)?.parentId }
+  func seed(withParentIds: Bool) {
+    reset()
+    ApiClient.shared.listings["trashed:root"] = .success([
+      dtoUpdated("t1", parent: nil, name: encryptedName("t1", "old.txt"), updated: "2026-10-01T00:00:00Z"),
+      dtoUpdated("t2", parent: nil, name: encryptedName("t2", "Old folder"), folder: true, updated: "2026-10-02T00:00:00Z"),
+      dtoUpdated("t3", parent: withParentIds ? "t2" : nil, name: encryptedName("t3", "inside.txt"), updated: "2026-10-02T00:00:00Z"),
+    ])
+    ApiClient.shared.listings["trashed:t2"] = .success([
+      dtoUpdated("t3", parent: nil, name: encryptedName("t3", "inside.txt"), updated: "2026-10-02T00:00:00Z"),
+    ])
+  }
+
+  // With parent_id: a cascade-trashed child is not at the top level; it lives under its folder.
+  seed(withParentIds: true)
+  _ = await SyncEngine.refreshContainer(containerId: trashId)
+  check(CacheManager.shared.children(parent: trashId).map(\.id).sorted() == ["trash:t1", "trash:t2"], "top level: only what was trashed on its own, got \(CacheManager.shared.children(parent: trashId).map(\.id))")
+  _ = await SyncEngine.refreshContainer(containerId: "trash:t2")
+  check(parentOf("trash:t3") == "trash:t2", "the child lives under its folder, got \(parentOf("trash:t3") ?? "nil")")
+  _ = await SyncEngine.refreshContainer(containerId: trashId)
+  check(parentOf("trash:t3") == "trash:t2", "a refresh of Trash does not move it, got \(parentOf("trash:t3") ?? "nil")")
+
+  // Without parent_id (the current server): the flat list is shown as it is and rows never move.
+  seed(withParentIds: false)
+  _ = await SyncEngine.refreshContainer(containerId: trashId)
+  check(CacheManager.shared.children(parent: trashId).map(\.id).sorted() == ["trash:t1", "trash:t2", "trash:t3"], "no parent_id: the flat list is shown, got \(CacheManager.shared.children(parent: trashId).map(\.id))")
+  _ = await SyncEngine.refreshContainer(containerId: "trash:t2")
+  check(parentOf("trash:t3") == trashId, "no parent_id: opening the folder does not re-park the row, got \(parentOf("trash:t3") ?? "nil")")
+  _ = await SyncEngine.refreshContainer(containerId: trashId)
+  _ = await SyncEngine.refreshContainer(containerId: "trash:t2")
+  check(parentOf("trash:t3") == trashId, "no parent_id: it stays put across refreshes, got \(parentOf("trash:t3") ?? "nil")")
+  check(CacheManager.shared.children(parent: trashId).count == 3, "the same id is never listed in two places")
+}
+
+// ---- The internal backup manifest never shows in the Files app ----
+// Backups/{Device}/.device.json is read by the app's backup screens, so it stays in the cache but is
+// never enumerated: not in its folder, not in the working set. A user's own file with that name elsewhere
+// stays; until the app has published the Backups root id the name alone decides.
+struct NoRefresh: FileProviderContainerRefreshing {
+  func refreshContainer(containerId: String) async -> FileProviderRefreshOutcome { .success }
+  func refreshMaterializedContainers() async {}
+}
+
+func backupManifestIsNotEnumerated() async {
+  func seed() {
+    reset()
+    CacheManager.shared.rows["B"] = row("B", name: "Backups", folder: true)
+    CacheManager.shared.rows["D"] = row("D", parent: "B", name: "My iPhone", folder: true)
+    CacheManager.shared.rows["m"] = row("m", parent: "D", name: ".device.json")
+    CacheManager.shared.rows["n"] = row("n", parent: "D", name: "notes.txt")
+    CacheManager.shared.rows["T"] = row("T", name: "Taxes", folder: true)
+    CacheManager.shared.rows["own"] = row("own", parent: "T", name: ".device.json")
+    CacheManager.shared.setSyncState(key: FileProviderItem.protectedBackupsRootKey, value: "b")
+    for id in ["D", "T"] { CacheManager.shared.setSyncState(key: "container.\(id).anchor", value: "1") }
+  }
+  func names(_ container: NSFileProviderItemIdentifier) async -> [String] {
+    let enumerator = FileProviderEnumerator(containerIdentifier: container, cache: CacheManager.shared, refresher: NoRefresh())
+    return await enumerateOnce(enumerator).items.map(\.filename).sorted()
+  }
+
+  seed()
+  let device = await names(NSFileProviderItemIdentifier("D"))
+  check(device == ["notes.txt"], "the device folder lists no manifest, got \(device)")
+  let own = await names(NSFileProviderItemIdentifier("T"))
+  check(own == [".device.json"], "a user's own .device.json outside a device folder stays, got \(own)")
+  CacheManager.shared.materialized = ["D", "T"]
+  let workingSet = await names(.workingSet)
+  check(workingSet.filter { $0 == ".device.json" }.count == 1, "exactly the user's own copy is in the working set, got \(workingSet)")
+  check(CacheManager.shared.item(id: "m") != nil, "the manifest stays in the cache for the app")
+
+  // The set a snapshot anchor is computed over hides it too: adding or replacing a manifest does not
+  // make Files rebuild its listing.
+  let enumerator = FileProviderEnumerator(containerIdentifier: NSFileProviderItemIdentifier("D"), cache: CacheManager.shared, refresher: NoRefresh())
+  var before: NSFileProviderSyncAnchor?
+  enumerator.currentSyncAnchor { before = $0 }
+  CacheManager.shared.rows["m2"] = row("m2", parent: "D", name: ".device.json")
+  var after: NSFileProviderSyncAnchor?
+  enumerator.currentSyncAnchor { after = $0 }
+  check(before != nil && before == after, "a manifest copy appearing does not change the anchor")
+
+  // Root id not known yet: the name alone decides.
+  CacheManager.shared.state = [:]
+  for id in ["D", "T"] { CacheManager.shared.setSyncState(key: "container.\(id).anchor", value: "1") }
+  let fallbackOwn = await names(NSFileProviderItemIdentifier("T"))
+  check(fallbackOwn == [], "before the Backups root id is known the name alone hides it, got \(fallbackOwn)")
+  let fallbackDevice = await names(NSFileProviderItemIdentifier("D"))
+  check(fallbackDevice == ["notes.txt"], "and it stays hidden in the device folder, got \(fallbackDevice)")
+}
+
 let scenarioTable: [(String, () async -> Void)] = [
   ("key-errors", keyFailuresAreAuthenticationRequired),
   ("other-errors", otherFailuresKeepTheirMeaning),
@@ -1298,6 +1890,19 @@ let scenarioTable: [(String, () async -> Void)] = [
   ("create-lowercase-id", createMintsALowercaseFileIdUsedForDerivation),
   ("chunk-retry", createRetriesADroppedChunkAndStopsOnARefusal),
   ("create-echo-mismatch", createAbortsOnAnotherItemsEcho),
+  ("refresh-survives-invalidate", backgroundRefreshSurvivesInvalidate),
+  ("refresh-coalesced", backgroundRefreshesAreCoalescedPerContainer),
+  ("first-load-cancellable", firstLoadStaysCancellable),
+  ("backups-protected", backupsRootIsProtected),
+  ("files-auth-flag", notAuthenticatedRecordsAFlagAndRecoveryEndsClean),
+  ("files-working-set-auth", workingSetNeverCarriesAnAuthenticationError),
+  ("files-retryable", transientFailuresAreRetryableNotDeadEnds),
+  ("files-trash-folder", trashFolderIsListedAtTheTopAndIsReadOnly),
+  ("files-trash-writes", nothingCanBeWrittenInsideTrash),
+  ("files-trash-excluded", trashedItemsStayOutOfEverythingElse),
+  ("files-create-folder", foldersCanBeCreatedFromFiles),
+  ("files-trash-stable", trashedRowsKeepOneStableParent),
+  ("manifest-hidden", backupManifestIsNotEnumerated),
 ]
 
 @main
@@ -1326,11 +1931,19 @@ const REAL_SOURCES = [
 ]);
 
 let compiled: { dir: string; binary: string } | null = null;
+const harnessRoots = new Set<string>();
+
+afterAll(() => {
+  for (const dir of harnessRoots) rmSync(dir, { recursive: true, force: true });
+  harnessRoots.clear();
+  compiled = null;
+});
 
 /** Compiles the shipped sources + doubles once per test file run. */
 function harnessBinary(): { dir: string; binary: string } {
   if (compiled) return compiled;
   const dir = mkdtempSync(join(tmpdir(), 'bb-1722-extension-'));
+  harnessRoots.add(dir);
   const doublesPath = join(dir, 'Doubles.swift');
   const scenariosPath = join(dir, 'Scenarios.swift');
   const binary = join(dir, 'harness');
@@ -1551,4 +2164,59 @@ describe('a Files-app upload survives a dropped chunk request', () => {
     // The old ladder (4 x the shared 60 s + 7 s backoff) is what got the extension killed.
     expect(attempt * 4 + 7).toBeGreaterThan(budget);
   });
+});
+
+// Files kept showing items deleted elsewhere because iOS invalidates the enumerator right after
+// enumerateItems and that cancelled the background refresh that prunes the cache.
+describe('the background refresh outlives the enumerator', () => {
+  nativeSwiftHarnessTest('invalidate() does not cancel the refresh; a row deleted on the server leaves the cache', () => {
+    expectScenario('refresh-survives-invalidate', 7);
+  }, 300_000);
+
+  nativeSwiftHarnessTest('refreshes are coalesced: one in flight per container, at most one queued', () => {
+    expectScenario('refresh-coalesced', 9);
+  }, 300_000);
+
+  nativeSwiftHarnessTest('the first-load refresh, which must answer the observer, is still cancelled by invalidate()', () => {
+    expectScenario('first-load-cancellable', 4);
+  }, 300_000);
+});
+
+describe('the root Backups folder is protected in the Files app', () => {
+  nativeSwiftHarnessTest('no delete, rename or move capability; those calls are refused; items inside are unaffected', () => {
+    expectScenario('backups-protected', 17);
+  }, 300_000);
+});
+
+describe('Files app: recover from Authentication Required, no stale error badge, read-only Trash', () => {
+  nativeSwiftHarnessTest('-1000 records a timestamp; after recovery the listing succeeds with no error', () => {
+    expectScenario('files-auth-flag', 14);
+  }, 300_000);
+  nativeSwiftHarnessTest('the working set never ends with an authentication error (the domain-level badge)', () => {
+    expectScenario('files-working-set-auth', 6);
+  }, 300_000);
+  nativeSwiftHarnessTest('transient network errors are retryable and cancellations are not sync errors', () => {
+    expectScenario('files-retryable', 10);
+  }, 300_000);
+  nativeSwiftHarnessTest('Trash is a read-only folder at the top that lists trashed items', () => {
+    expectScenario('files-trash-folder', 35);
+  }, 300_000);
+  nativeSwiftHarnessTest('nothing can be created, renamed, moved, changed or deleted inside Trash', () => {
+    expectScenario('files-trash-writes', 15);
+  }, 300_000);
+  nativeSwiftHarnessTest('trashed items are excluded from normal folders, Recents, search and the working set', () => {
+    expectScenario('files-trash-excluded', 9);
+  }, 300_000);
+  nativeSwiftHarnessTest('a folder made in Files is created on the server (no permanent noSuchItem error)', () => {
+    expectScenario('files-create-folder', 10);
+  }, 300_000);
+  nativeSwiftHarnessTest('a trashed row keeps one stable parent, with or without parent_id in the server listing', () => {
+    expectScenario('files-trash-stable', 7);
+  }, 300_000);
+});
+
+describe('the internal backup manifest is hidden in the Files app', () => {
+  nativeSwiftHarnessTest('not enumerated in its folder or the working set; a user copy elsewhere stays; name-only before the root id is known', () => {
+    expectScenario('manifest-hidden', 12);
+  }, 300_000);
 });

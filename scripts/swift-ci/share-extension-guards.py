@@ -311,11 +311,15 @@ def run_guards(root, out):
 
 def make_root():
     tmp = tempfile.mkdtemp(prefix="share-guards-")
-    for d in (IOS, TGT):
-        os.makedirs(os.path.join(tmp, d))
-        for f in swift_files(REPO, d):
-            shutil.copyfile(os.path.join(REPO, d, f), os.path.join(tmp, d, f))  # follows symlinks
-    return tmp
+    try:
+        for d in (IOS, TGT):
+            os.makedirs(os.path.join(tmp, d))
+            for f in swift_files(REPO, d):
+                shutil.copyfile(os.path.join(REPO, d, f), os.path.join(tmp, d, f))  # follows symlinks
+        return tmp
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
 
 
 def edit(root, rel, fn):

@@ -79,6 +79,29 @@ describe('rate-limited fetch', () => {
     expect(sleeps).toEqual([80, 80]);
   });
 
+  test('a slow response does not hold later file request launches behind it', async () => {
+    let resolveFirst!: (response: Response) => void;
+    const firstResponse = new Promise<Response>((resolve) => { resolveFirst = resolve; });
+    let calls = 0;
+    const fetcher = createRateLimitedFetch({
+      fetchImpl: async () => {
+        calls += 1;
+        return calls === 1 ? firstResponse : new Response('{}', { status: 200 });
+      },
+      sleep: async () => {},
+      bucketSpacingMs: { files: 1, general: 0, auth: 0, shares: 0, external: 0 },
+    });
+
+    const first = fetcher('https://api.beebeeb.io/api/v1/files/slow-list');
+    const second = fetcher('https://api.beebeeb.io/api/v1/files/open-status');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const callsBeforeFirstSettled = calls;
+    resolveFirst(new Response('{}', { status: 200 }));
+    await Promise.all([first, second]);
+
+    expect(callsBeforeFirstSettled).toBe(2);
+  });
+
   test('honors Retry-After before the next request in the bucket', async () => {
     let now = 5_000;
     const calls: number[] = [];

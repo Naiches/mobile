@@ -1,8 +1,10 @@
 import React from 'react';
 import {
+  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
@@ -18,11 +20,17 @@ export default function DevicePairingScreen() {
   const navigation = useNavigation<Nav>();
   const insets = useSafeAreaInsets();
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   return (
-    <View style={[styles.root, { backgroundColor: c.paper2, paddingTop: insets.top, paddingBottom: insets.bottom }]}>
+    <ScrollView
+      style={[styles.root, { backgroundColor: c.paper2 }]}
+      contentContainerStyle={[styles.content, { paddingTop: insets.top, paddingBottom: insets.bottom }]}
+      showsVerticalScrollIndicator={false}
+    >
       {/* Header */}
-      <View style={styles.header}>
+      <View style={[styles.header, accessibilityLayout && styles.headerAccessibility]}>
         <TouchableOpacity
           onPress={() => navigation.goBack()}
           style={styles.backButton}
@@ -33,8 +41,13 @@ export default function DevicePairingScreen() {
           <View style={[styles.backArrow, { borderColor: c.ink2 }]} />
           <Text style={[styles.backText, { color: c.ink2 }]}>Back</Text>
         </TouchableOpacity>
-        <Text style={[styles.heading, { color: c.ink }]}>Add a device</Text>
-        <View style={styles.headerSpacer} />
+        <Text
+          style={[styles.heading, accessibilityLayout && styles.headingAccessibility, { color: c.ink }]}
+          numberOfLines={accessibilityLayout ? 2 : 1}
+        >
+          Add a device
+        </Text>
+        {!accessibilityLayout && <View style={styles.headerSpacer} />}
       </View>
 
       <Text style={[styles.subheading, { color: c.ink3 }]}>
@@ -95,12 +108,13 @@ export default function DevicePairingScreen() {
       <Text style={[styles.footnote, { color: c.ink4 }]}>
         Your key material never leaves either device. Pairing uses an encrypted local channel.
       </Text>
-    </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
+  content: { flexGrow: 1 },
 
   header: {
     flexDirection: 'row',
@@ -108,6 +122,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
   },
+  headerAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   backButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -129,6 +144,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     letterSpacing: -0.2,
   },
+  headingAccessibility: { flex: undefined, flexBasis: '100%', width: '100%', textAlign: 'left', marginTop: spacing.sm },
   headerSpacer: { minWidth: 60 },
 
   subheading: {

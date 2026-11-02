@@ -18,4 +18,11 @@ describe('deviceIdHeader', () => {
     })).toEqual({})
     expect(await deviceIdHeader(async () => '')).toEqual({})
   })
+
+  test('a device id read that never settles is omitted after a bounded wait', async () => {
+    expect(await deviceIdHeader(
+      () => new Promise<never>(() => {}),
+      5,
+    )).toEqual({})
+  })
 })

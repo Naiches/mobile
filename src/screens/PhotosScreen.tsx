@@ -1,18 +1,21 @@
 import { thumbnailKeyFor } from '../lib/thumbnail';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../App';
 import {
   ActivityIndicator,
   Alert,
   Animated,
+  AppState,
   Dimensions,
   FlatList,
   Platform,
   RefreshControl,
+  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -34,8 +37,25 @@ import { NativePhotosGridView, type NativePhotoGridItem } from '../../modules/be
 import { radii, spacing } from '../theme';
 import { useTheme } from '../lib/theme-context';
 import { GlassCircle, GlassSurface, SCROLL_EDGE, ScrollEdgeBlur, glassMaterial, useTabBarBottomInset } from '../components/glass';
-import { friendlyError, trashFiles } from '../lib/api';
-import { getPhotoCandidates } from '../lib/photo-index-source';
+import { friendlyError, restoreFile, trashFiles as trashFilesApi } from '../lib/api';
+import { getPhotoLibrary, type PhotoLibrary } from '../lib/photo-index-source';
+import { getProtectedBackupsRootId } from '../lib/protected-folders';
+import { resolveProtectedBackupsRoot } from '../services/BackupService';
+import {
+  ALL_SOURCES,
+  DEFAULT_PHOTO_SOURCES,
+  buildSourceChips,
+  type PhotoSources,
+} from '../lib/photo-source-filter';
+import { loadPhotoSources } from '../lib/photo-sources';
+import { computeVisiblePhotos, makeFolderNameDecryptor, resolveFolderNames } from '../lib/photo-sources-view';
+import {
+  BACKUP_REFRESH_INTERVAL_MS,
+  PhotoRefreshTimeoutError,
+  backupCompletedAdvanced,
+  createPhotoRefreshDeadline,
+  createRefreshScheduler,
+} from '../lib/photo-refresh';
 import { isStaleAccountError } from '../lib/account-epoch';
 import type { FileEntry } from '../lib/api';
 import { guessMimeType } from '../lib/media';
@@ -49,9 +69,11 @@ import {
   isVisibleMediaFile,
   mediaMimeType,
   photoCandidatesFromIndex,
+  previewMimeType,
 } from '../lib/photo-candidates';
 import { getPhotoPermission, photoPermissionGranted } from '../lib/photo-permissions';
 import { useBackup } from '../lib/backup-context';
+import { useCoachMarks, useCoachMarkTarget } from '../lib/coach-marks-context';
 import { AutoBackupBanner } from './photos/AutoBackupBanner';
 import { useCrypto } from '../lib/crypto-context';
 import {
@@ -75,12 +97,13 @@ import { getCachedThumbnail, pruneThumbnailsForRemoteFiles } from '../lib/thumbn
 import { decryptToTempFile } from '../lib/native-decrypt';
 import { prunePhotoCacheForRemoteFiles } from '../lib/photo-cache';
 import { onFilesDeleted } from '../lib/delete-cascade';
-import { removeFromFileProviderCache } from '../lib/file-provider-mount';
+import { removeFromFileProviderCache, syncDecryptedEntriesToFileProvider } from '../lib/file-provider-mount';
 import { loadCachedFileIndex } from '../lib/file-index-cache';
-import { getRemoteCreatedAtMap, getRemoteToLocalMap, markRemoteDeleted } from '../services/BackupDatabase';
+import { getRemoteCreatedAtMap, getRemoteToLocalMap, markUploadComplete } from '../services/BackupDatabase';
 import { backupWriteTicket } from '../lib/backup-write-ticket';
 import { encryptedMetadataPayloadToBytes } from '../lib/encrypted-metadata';
 import { mapInBatches } from '../lib/async-batch';
+import { createForegroundReturnTracker } from '../lib/drive-freshness';
 import { perfMark } from '../lib/perf-mark';
 import { recordRuntimeTrace } from '../lib/runtime-trace';
 import {
@@ -92,10 +115,14 @@ import {
   getPerformanceStorageSettings,
   type PerformanceStorageProfile,
 } from '../lib/performance-storage-settings';
+import { useToast } from '../lib/toast-context';
+import { moveToTrashWithUndo } from '../lib/trash-with-undo';
 import {
-  getExcludedPhotoFolderIds,
-  filterByExcludedFolders,
-} from '../lib/photo-library-prefs';
+  hideOptimisticallyTrashed,
+  revealOptimisticallyTrashed,
+  useOptimisticallyTrashedIds,
+} from '../lib/trash-optimistic';
+import { adjustTrashCount, notifyTrashChanged } from '../lib/trash-count';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -123,6 +150,45 @@ function parseDecryptedPhotoMetadata(plaintext: string): DecryptedPhotoMetadata 
   }
   const name = plaintext || 'Photo';
   return { name, mimeType: guessMimeType(name) || undefined };
+}
+
+/**
+ * Decrypt the names (and with them the mimes) of the rows that have none yet.
+ * A row that cannot be read stays unset: callers never guess its kind.
+ */
+async function decryptMissingMetadata(
+  photos: FileEntry[],
+  knownNames: Record<string, string>,
+  knownMimeTypes: Record<string, string>,
+  decrypt: (id: string, nonce: Uint8Array, ciphertext: Uint8Array) => Promise<string>,
+): Promise<{ names: Record<string, string> | null; mimeTypes: Record<string, string> | null }> {
+  const names: Record<string, string> = {};
+  const mimeTypes: Record<string, string> = {};
+  const missing = photos.filter((photo) => !knownNames[photo.id] || !knownMimeTypes[photo.id]);
+  await mapInBatches(missing, METADATA_DECRYPT_BATCH_SIZE, async (photo) => {
+    try {
+      const raw = photo.name_encrypted ?? '';
+      if (!raw.startsWith('{')) {
+        if (raw && raw.length < 200) {
+          names[photo.id] = raw;
+          const mimeType = guessMimeType(raw);
+          if (mimeType) mimeTypes[photo.id] = mimeType;
+        }
+        return;
+      }
+      const payload = encryptedMetadataPayloadToBytes(raw);
+      if (!payload) return;
+      const metadata = parseDecryptedPhotoMetadata(await decrypt(photo.id, payload.nonce, payload.ciphertext));
+      names[photo.id] = metadata.name;
+      if (metadata.mimeType) mimeTypes[photo.id] = metadata.mimeType;
+    } catch {
+      // Decryption failure: leave unset.
+    }
+  });
+  return {
+    names: Object.keys(names).length > 0 ? names : null,
+    mimeTypes: Object.keys(mimeTypes).length > 0 ? mimeTypes : null,
+  };
 }
 
 function preparePhotoEntries(entries: FileEntry[]): FileEntry[] {
@@ -242,7 +308,7 @@ interface PhotoRowItem {
 
 type PhotoListItem = PhotoHeaderItem | PhotoRowItem;
 
-function buildPhotoListItems(groups: PhotoGroup[], columns: number, cellSize: number): PhotoListItem[] {
+function buildPhotoListItems(groups: PhotoGroup[], columns: number, cellSize: number, sectionHeaderHeight = SECTION_HEADER_HEIGHT): PhotoListItem[] {
   const items: PhotoListItem[] = [];
   let offset = 0;
   let seedOffset = 0;
@@ -255,9 +321,9 @@ function buildPhotoListItems(groups: PhotoGroup[], columns: number, cellSize: nu
       label: group.label,
       count: group.data.length,
       offset,
-      length: SECTION_HEADER_HEIGHT,
+      length: sectionHeaderHeight,
     });
-    offset += SECTION_HEADER_HEIGHT;
+    offset += sectionHeaderHeight;
 
     for (let i = 0; i < group.data.length; i += columns) {
       const photos = group.data.slice(i, i + columns);
@@ -393,6 +459,23 @@ function extensionForPhoto(entry: FileEntry, displayName: string, mimeType?: str
   return 'jpg';
 }
 
+function samePhotoList(a: FileEntry[], b: FileEntry[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const x = a[i]!;
+    const y = b[i]!;
+    if (
+      x.id !== y.id ||
+      x.has_thumbnail !== y.has_thumbnail ||
+      x.created_at !== y.created_at ||
+      x.is_uploading !== y.is_uploading
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function sameIdSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a.size !== b.size) return false;
   for (const id of a) {
@@ -424,6 +507,8 @@ function findPhotoItemIndex(items: PhotoListItem[], photoId: string): number {
 function DevicePhotosBanner() {
   const { isPhotoBackupEnabled, backupProgress, includeVideos } = useBackup();
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [deviceCounts, setDeviceCounts] = useState<{ photos: number; videos: number } | null>(null);
   const [permissionDenied, setPermissionDenied] = useState(false);
 
@@ -473,9 +558,12 @@ function DevicePhotosBanner() {
   if (!isPhotoBackupEnabled) return null;
   if (permissionDenied) {
     return (
-      <View style={[styles.deviceBanner, { backgroundColor: c.paper2, borderColor: c.line }]}>
+      <View
+        key={`device-photos-${fontScale}`}
+        style={[styles.deviceBanner, accessibilityLayout && styles.deviceBannerAccessibility, { backgroundColor: c.paper2, borderColor: c.line }]}
+      >
         <Ionicons name="lock-closed-outline" size={14} color={c.ink3} />
-        <Text style={[styles.deviceBannerText, { color: c.ink2 }]}>Photo access denied</Text>
+        <Text style={[styles.deviceBannerText, accessibilityLayout && styles.deviceBannerTextAccessibility, { color: c.ink2 }]}>Photo access denied</Text>
         <Text style={[styles.deviceBannerHint, { color: c.ink3 }]}>Enable in iOS Settings</Text>
       </View>
     );
@@ -490,9 +578,12 @@ function DevicePhotosBanner() {
     : `${deviceCounts.photos.toLocaleString()} ${deviceCounts.photos === 1 ? 'photo' : 'photos'}`;
 
   return (
-    <View style={[styles.deviceBanner, { backgroundColor: c.paper2, borderColor: c.line }]}>
+    <View
+      key={`device-photos-${fontScale}`}
+      style={[styles.deviceBanner, accessibilityLayout && styles.deviceBannerAccessibility, { backgroundColor: c.paper2, borderColor: c.line }]}
+    >
       <Ionicons name="phone-portrait-outline" size={14} color={c.ink3} />
-      <Text style={[styles.deviceBannerText, { color: c.ink2 }]}>
+      <Text style={[styles.deviceBannerText, accessibilityLayout && styles.deviceBannerTextAccessibility, { color: c.ink2 }]}>
         {mediaCountText} on device
       </Text>
       <Text style={[styles.deviceBannerHint, { color: c.ink3 }]}>
@@ -508,19 +599,32 @@ function DevicePhotosBanner() {
 
 export default function PhotosScreen() {
   const insets = useSafeAreaInsets();
+  const { width: windowWidth, height: windowHeight, fontScale } = useWindowDimensions();
+  const screenLayoutSignature = `${windowWidth}:${windowHeight}:${fontScale}`;
+  const accessibilityLayout = fontScale >= 1.3;
+  const sectionHeaderHeight = accessibilityLayout
+    ? Math.ceil(SECTION_HEADER_HEIGHT * Math.min(fontScale, 2))
+    : SECTION_HEADER_HEIGHT;
   // 1394 — GlassTabBar is now an absolute overlay; this screen's own root
   // View extends behind it, so the grid's contentInsetBottom and the
   // AutoBackupBanner/selection-bar's own reserved space (they sit in normal
   // flow, at the true bottom of that now-taller container) both need it.
   const tabBarBottomInset = useTabBarBottomInset();
+  const coach = useCoachMarks();
+  const photosSourcesCoachRef = useCoachMarkTarget('photos-sources');
   const { colors: c, resolved: themeScheme } = useTheme();
   const { getFileKeyBytes, getMasterKeyHandleId, isUnlocked, decryptMetadata } = useCrypto();
+  const { showToast } = useToast();
+  const optimisticallyTrashedIds = useOptimisticallyTrashedIds();
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const [isScrolled, setIsScrolled] = useState(false);
   // 1322 — the floating header's measured height. Fed to the native grid as a
   // real contentInset so the grid scrolls UNDER the chrome instead of starting
   // below it. Not constant: the device-photos banner appears and disappears.
   const [headerHeight, setHeaderHeight] = useState(0);
+  useLayoutEffect(() => {
+    setHeaderHeight(0);
+  }, [screenLayoutSignature]);
   // 1394 (Codex P1 fix) — measured height of the bottom overlay stack
   // (AutoBackupBanner, plus the selection bar in select mode). Not a
   // constant for the same reason headerHeight above isn't: the banner's
@@ -603,6 +707,20 @@ export default function PhotosScreen() {
     DEFAULT_PERFORMANCE_STORAGE_SETTINGS.profile,
   );
   const flatPhotosRef = useRef<FileEntry[]>([]);
+
+  // Photo sources: the account preference, the names of the folder sources
+  // (for the chips), which sources each shown photo belongs to, and the chip
+  // that is selected. The sources are read on every fetch (focus, foreground,
+  // a finished backup upload), so a change made on another device lands here.
+  const [sources, setSources] = useState<PhotoSources>(DEFAULT_PHOTO_SOURCES);
+  const sourcesRef = useRef<PhotoSources>(DEFAULT_PHOTO_SOURCES);
+  const [folderNames, setFolderNames] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const [sourceById, setSourceById] = useState<ReadonlyMap<string, string[]>>(() => new Map());
+  const [sourceKey, setSourceKey] = useState<string>(ALL_SOURCES);
+  const decryptMetadataRef = useRef(decryptMetadata);
+  useEffect(() => {
+    decryptMetadataRef.current = decryptMetadata;
+  }, [decryptMetadata]);
 
   useEffect(() => {
     columnsRef.current = columns;
@@ -693,17 +811,58 @@ export default function PhotosScreen() {
     return () => { cancelled = true; };
   }, [activePhotoIds, photos, photosById, isUnlocked, decryptMetadata]);
 
+  // The sources preference. A failed read keeps the last known choice instead
+  // of snapping back to the defaults.
+  const readPhotoSources = useCallback(async (): Promise<PhotoSources> => {
+    try {
+      const loaded = await loadPhotoSources();
+      sourcesRef.current = loaded;
+      setSources(loaded);
+    } catch {
+      // keep the last known sources
+    }
+    return sourcesRef.current;
+  }, []);
+
+  const visibleForSources = useCallback(async (library: PhotoLibrary, active: PhotoSources) => {
+    let backupsRootId = getProtectedBackupsRootId();
+    if (!backupsRootId && library.folders) {
+      try { backupsRootId = await resolveProtectedBackupsRoot(); } catch { backupsRootId = null; }
+    }
+    const decryptName = makeFolderNameDecryptor((id, nonce, ciphertext) => decryptMetadataRef.current(id, nonce, ciphertext));
+    const view = await computeVisiblePhotos({
+      candidates: library.candidates,
+      folders: library.folders,
+      sources: active,
+      backupsRootId,
+      decryptName,
+    });
+    if (library.folders) {
+      const names = await resolveFolderNames(active.folders, library.folders, decryptName);
+      setFolderNames((prev) => {
+        if (prev.size === names.size && [...names].every(([k, v]) => prev.get(k) === v)) return prev;
+        return names;
+      });
+    }
+    return view;
+  }, []);
+
   // Task 1959: `force` asks the server even inside the file-index loader's
   // revalidation window (pull-to-refresh; a bulk action that found rows
   // already gone). A plain focus does not: it reuses the request in flight or
   // the cache the sync client keeps current (src/lib/file-index-loader.ts).
-  const fetchPhotos = useCallback(async (isRefresh = false, force = isRefresh) => {
+  // `rereadSources` is false for the timer that follows a running backup: the
+  // sources preference does not change when an upload lands, so it is read on
+  // focus, foreground and pull-to-refresh only (it is a network GET).
+  const fetchPhotos = useCallback(async (isRefresh = false, force = isRefresh, rereadSources = true, silent = false) => {
     const hasVisiblePhotos = photosCountRef.current > 0;
     recordRuntimeTrace('photos.fetch.request', {
       refresh: isRefresh,
       hasVisiblePhotos,
     });
-    if (isRefresh || hasVisiblePhotos) {
+    if (silent && hasVisiblePhotos) {
+      // A background refresh never pops the pull spinner.
+    } else if (isRefresh || hasVisiblePhotos) {
       setRefreshing(true);
     } else {
       setLoading(true);
@@ -711,43 +870,54 @@ export default function PhotosScreen() {
     setError(null);
     const endPerf = perfMark.start('photos.fetch', { refresh: isRefresh });
     let renderedCachedIndex = false;
+    const refreshDeadline = createPhotoRefreshDeadline();
+    const waitForRefresh = <T,>(operation: Promise<T>): Promise<T> => refreshDeadline.wait(operation);
 
     try {
-      // Per-device folder-inclusion preference (task 0885). Read fresh on every
-      // fetch so a toggle in PhotoLibrarySettings takes effect on next focus.
-      const excludedFolderIds = new Set(await getExcludedPhotoFolderIds());
-      const cachedIndex = await loadCachedFileIndex();
+      const cachedIndex = await waitForRefresh(loadCachedFileIndex());
+      const activeSources = rereadSources
+        ? await waitForRefresh(readPhotoSources())
+        : sourcesRef.current;
       if (!isRefresh && !hasVisiblePhotos && cachedIndex) {
-        const cachedImages = preparePhotoEntries(
-          filterByExcludedFolders(
-            cachedIndex.files,
-            photoCandidatesFromIndex(cachedIndex.files),
-            excludedFolderIds,
-          ),
-        );
+        const cachedView = await waitForRefresh(visibleForSources(
+          {
+            candidates: photoCandidatesFromIndex(cachedIndex.files),
+            folders: cachedIndex.files.filter((f) => f.is_folder),
+          },
+          activeSources,
+        ));
+        const cachedImages = preparePhotoEntries(cachedView.photos);
         if (cachedImages.length > 0) {
           renderedCachedIndex = true;
           photosCacheRef.current = cachedImages;
           setPhotos(cachedImages);
+          setSourceById(cachedView.sourceById);
           setLoading(false);
-          setRefreshing(true);
+          if (!silent) setRefreshing(true);
           recordRuntimeTrace('photos.fetch.cached_index_rendered', {
             count: cachedImages.length,
           });
         }
       }
 
-      const allImages = await getPhotoCandidates(cachedIndex, excludedFolderIds, { force });
+      const library = await waitForRefresh(getPhotoLibrary(cachedIndex, { force }));
+      const view = await waitForRefresh(visibleForSources(library, activeSources));
       setPhotosFolderId(null);
       // Server usually returns image/media rows sorted newest first, but defend
       // against future changes by re-applying both invariants here.
-      const images = preparePhotoEntries(allImages);
-      const shouldPruneLocalMediaCache = images.length > 0 || photosCacheRef.current.length === 0;
-      const remotePhotoIds = new Set(images.map((entry) => entry.id));
+      const images = preparePhotoEntries(view.photos);
+      // Sources decide what is SHOWN; the local caches are pruned against every
+      // media row the vault has, so a source that is switched off and on again
+      // does not lose its thumbnails.
+      const shouldPruneLocalMediaCache = library.candidates.length > 0 || photosCacheRef.current.length === 0;
+      const remotePhotoIds = new Set(library.candidates.map((entry) => entry.id));
+      setSourceById(view.sourceById);
       if (images.length > 0) {
         photosCacheRef.current = images;
-        setPhotos(images);
-      } else if (!isRefresh && photosCacheRef.current.length > 0) {
+        // A re-read that found nothing new keeps the same list, so the grid
+        // does not re-render under the user's finger every few seconds.
+        setPhotos((prev) => (samePhotoList(prev, images) ? prev : images));
+      } else if (!isRefresh && library.candidates.length === 0 && photosCacheRef.current.length > 0) {
         setPhotos(photosCacheRef.current);
       } else {
         photosCacheRef.current = [];
@@ -801,16 +971,19 @@ export default function PhotosScreen() {
       }
       recordRuntimeTrace('photos.fetch.failed', {
         renderedCachedIndex,
+        timedOut: err instanceof PhotoRefreshTimeoutError,
         error: err instanceof Error ? err.message : String(err),
       });
-      if (!renderedCachedIndex) {
-        setError(friendlyError(err));
+      if (!renderedCachedIndex && !silent) {
+        setError(err instanceof PhotoRefreshTimeoutError
+          ? 'Photos could not refresh in time. Try again.'
+          : friendlyError(err));
       }
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [readPhotoSources, visibleForSources]);
 
   useFocusEffect(
     useCallback(() => {
@@ -878,6 +1051,49 @@ export default function PhotosScreen() {
     };
   }, [isUnlocked]);
 
+  // New backups appear without a manual refresh: re-read when the number of
+  // backed-up items goes up (at most every few seconds while uploads keep
+  // landing), and when the app comes back to the foreground. The index loader
+  // answers from the cache the sync client keeps current when it can, so this
+  // is cheap; it only asks the server when a new row cannot be classified.
+  const { backupProgress: liveBackupProgress } = useBackup();
+  const lastBackupCompletedRef = useRef<number | undefined>(undefined);
+  const backupRefreshRef = useRef<ReturnType<typeof createRefreshScheduler> | null>(null);
+  if (!backupRefreshRef.current) {
+    backupRefreshRef.current = createRefreshScheduler(() => {
+      if (isPhotosFocusedRef.current) void fetchPhotosRef.current(false, false, false, true);
+    }, BACKUP_REFRESH_INTERVAL_MS);
+  }
+  const fetchPhotosRef = useRef(fetchPhotos);
+  useEffect(() => {
+    fetchPhotosRef.current = fetchPhotos;
+  }, [fetchPhotos]);
+
+  useEffect(() => {
+    const completed = liveBackupProgress.completed;
+    if (backupCompletedAdvanced(lastBackupCompletedRef.current, completed)) {
+      recordRuntimeTrace('photos.refresh.backup_progress', { completed });
+      backupRefreshRef.current?.schedule();
+    }
+    lastBackupCompletedRef.current = completed;
+  }, [liveBackupProgress.completed]);
+
+  useEffect(() => {
+    // Only a return from a real background period of at least 30 s; an
+    // 'inactive' blip (Face ID, Control Center) refreshes nothing.
+    const returnedFromBackground = createForegroundReturnTracker();
+    const sub = AppState.addEventListener('change', (next) => {
+      if (returnedFromBackground(next) && isPhotosFocusedRef.current) {
+        recordRuntimeTrace('photos.refresh.foreground');
+        void fetchPhotosRef.current(false, false, true, true);
+      }
+    });
+    return () => {
+      sub.remove();
+      backupRefreshRef.current?.cancel();
+    };
+  }, []);
+
   const handleRefresh = useCallback(() => {
     recordRuntimeTrace('photos.refresh.request');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -891,15 +1107,21 @@ export default function PhotosScreen() {
     )));
   }, []);
 
+  const sourceChips = useMemo(() => buildSourceChips(sources, folderNames), [folderNames, sources]);
+  // A chip that is no longer offered (a source was removed) counts as All.
+  const activeSourceKey = sourceChips.some((chip) => chip.key === sourceKey) ? sourceKey : ALL_SOURCES;
+
   const visiblePhotos = useMemo(
     () => photos
+      .filter((photo) => !optimisticallyTrashedIds.has(photo.id))
+      .filter((photo) => activeSourceKey === ALL_SOURCES || (sourceById.get(photo.id)?.includes(activeSourceKey) ?? false))
       .filter((photo) => isVisibleMediaFile(photo, decryptedMimeTypes))
       .map((photo) => {
         const createdAt = localCreatedAtMap[photo.id];
         return createdAt && createdAt !== photo.created_at ? { ...photo, created_at: createdAt } : photo;
       })
       .sort((a, b) => (parseCreatedAt(b.created_at)?.getTime() ?? 0) - (parseCreatedAt(a.created_at)?.getTime() ?? 0)),
-    [decryptedMimeTypes, localCreatedAtMap, photos],
+    [activeSourceKey, decryptedMimeTypes, localCreatedAtMap, optimisticallyTrashedIds, photos, sourceById],
   );
 
   const photoKitAssetMap = useMemo(() => {
@@ -932,7 +1154,10 @@ export default function PhotosScreen() {
 
   // Build a flat list of all photos in display order (newest first, grouped by month)
   const flatPhotos = useMemo(() => groups.flatMap((g) => g.data), [groups]);
-  const listItems = useMemo(() => buildPhotoListItems(groups, columns, cellSize), [cellSize, columns, groups]);
+  const listItems = useMemo(
+    () => buildPhotoListItems(groups, columns, cellSize, sectionHeaderHeight),
+    [cellSize, columns, groups, sectionHeaderHeight],
+  );
   const initialThumbnailIds = useMemo(() => collectInitialPhotoIds(listItems), [listItems]);
 
   useEffect(() => {
@@ -1031,13 +1256,27 @@ export default function PhotosScreen() {
       const windowEnd = Math.min(flatPhotos.length, selectedIndex + PHOTO_PREVIEW_WINDOW_RADIUS + 1);
       const previewPhotos = flatPhotos.slice(windowStart, windowEnd);
       const initialPhotoIndex = Math.max(0, selectedIndex - windowStart);
+      // The pager decides image vs video from the mime it is handed. Rows
+      // outside the grid's viewport have not been decrypted yet, and the index
+      // row alone cannot say which kind a photo is, so read the names of the
+      // whole window first instead of letting the pager guess.
+      const fresh = await decryptMissingMetadata(
+        previewPhotos,
+        decryptedNames,
+        decryptedMimeTypes,
+        (id, nonce, ciphertext) => decryptMetadata(id, nonce, ciphertext),
+      );
+      const namesForPreview = fresh.names ? { ...decryptedNames, ...fresh.names } : decryptedNames;
+      const mimesForPreview = fresh.mimeTypes ? { ...decryptedMimeTypes, ...fresh.mimeTypes } : decryptedMimeTypes;
+      if (fresh.names) setDecryptedNames((prev) => ({ ...prev, ...fresh.names }));
+      if (fresh.mimeTypes) setDecryptedMimeTypes((prev) => ({ ...prev, ...fresh.mimeTypes }));
       // Serialize a bounded media window for swipe navigation — only the fields PreviewScreen needs.
       const photoListJson = JSON.stringify(
         previewPhotos.map((p) => ({
           id: p.id,
           name_encrypted: p.name_encrypted,
-          display_name: safeDisplayName(p, decryptedNames),
-          mime_type: decryptedMimeTypes[p.id] ?? mediaMimeType(p) ?? p.mime_type,
+          display_name: safeDisplayName(p, namesForPreview),
+          mime_type: previewMimeType(p, mimesForPreview) ?? p.mime_type,
           size_bytes: p.size_bytes,
           created_at: p.created_at,
           chunk_count: p.chunk_count,
@@ -1056,8 +1295,8 @@ export default function PhotosScreen() {
       );
       navigation.navigate('Preview', {
         fileId: entry.id,
-        fileName: safeDisplayName(entry, decryptedNames),
-        mimeType: decryptedMimeTypes[entry.id] ?? mediaMimeType(entry) ?? undefined,
+        fileName: safeDisplayName(entry, namesForPreview),
+        mimeType: previewMimeType(entry, mimesForPreview),
         sizeBytes: entry.size_bytes ?? undefined,
         createdAt: entry.created_at,
         chunkCount: entry.chunk_count,
@@ -1076,7 +1315,7 @@ export default function PhotosScreen() {
         previewBytes: entry.preview_bytes ?? null,
       });
     },
-    [navigation, decryptedMimeTypes, decryptedNames, flatPhotos, performanceStorageProfile, photoKitAssetMap, thumbnailUris],
+    [navigation, decryptMetadata, decryptedMimeTypes, decryptedNames, flatPhotos, performanceStorageProfile, photoKitAssetMap, thumbnailUris],
   );
 
   const clearSelection = useCallback(() => {
@@ -1084,6 +1323,10 @@ export default function PhotosScreen() {
     setSelectedIds(new Set());
     setBulkStatus(null);
   }, []);
+
+  useEffect(() => {
+    if (coach.state.status === 'active' && coach.state.step === 'photos') clearSelection();
+  }, [clearSelection, coach.state.status, coach.state.step]);
 
   const toggleSelectedPhoto = useCallback((entry: FileEntry) => {
     Haptics.selectionAsync();
@@ -1119,56 +1362,78 @@ export default function PhotosScreen() {
         {
           text: 'Delete',
           style: 'destructive',
-          onPress: async () => {
-            setBulkAction('delete');
-            setBulkStatus('Deleting from Beebeeb...');
-            // Task 1667 round 8: the backup manifest update below runs only
-            // if no sign-out or storage purge happened since this delete began.
+          onPress: () => {
+            const selectedIds = selectedPhotos.map((photo) => photo.id);
+            const selectedById = new Map(selectedPhotos.map((photo) => [photo.id, photo]));
+            const localAssetsBeforeTrash = new Map(localAssetMap);
             const writeTicket = backupWriteTicket();
-            try {
-              const selectedIds = selectedPhotos.map((photo) => photo.id);
-              const result = await trashFiles(selectedIds);
-              const deletedIds = new Set([...result.trashed, ...result.already_trashed]);
-              await Promise.all(selectedPhotos.map(async (photo) => {
-                if (!deletedIds.has(photo.id)) return;
-                const localAssetId = localAssetMap.get(photo.id);
-                if (localAssetId) await markRemoteDeleted(localAssetId, writeTicket);
-              }));
-
-              setPhotos((prev) => prev.filter((photo) => !deletedIds.has(photo.id)));
-              photosCacheRef.current = photosCacheRef.current.filter((photo) => !deletedIds.has(photo.id));
+            const removeConfirmedPhotos = async (ids: string[]) => {
+              const removed = new Set(ids);
+              setPhotos((prev) => prev.filter((photo) => !removed.has(photo.id)));
+              photosCacheRef.current = photosCacheRef.current.filter((photo) => !removed.has(photo.id));
               setLocalAssetMap((prev) => {
                 const next = new Map(prev);
-                for (const photoId of deletedIds) next.delete(photoId);
+                for (const id of ids) next.delete(id);
                 return next;
               });
-              if (deletedIds.size > 0) {
-                const retainedIds = new Set(photosCacheRef.current.map((photo) => photo.id));
-                void pruneThumbnailsForRemoteFiles(retainedIds);
-                void prunePhotoCacheForRemoteFiles(retainedIds);
-                void onFilesDeleted(Array.from(deletedIds));
-                void removeFromFileProviderCache(Array.from(deletedIds));
-              }
-              clearSelection();
-              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              if (result.missing.length > 0 || deletedIds.size < selectedIds.length) {
-                Alert.alert(
-                  'Some photos were not moved',
-                  'Beebeeb refreshed the photo list because a few selected items were already gone or unavailable.',
-                );
-                void fetchPhotos(false, true);
-              }
-            } catch (err) {
-              Alert.alert('Delete failed', friendlyError(err));
-              setBulkStatus(null);
-            } finally {
-              setBulkAction(null);
-            }
+              const retainedIds = new Set(photosCacheRef.current.map((photo) => photo.id));
+              void pruneThumbnailsForRemoteFiles(retainedIds);
+              void prunePhotoCacheForRemoteFiles(retainedIds);
+              await onFilesDeleted(ids, { kind: 'trash' });
+              revealOptimisticallyTrashed(ids);
+            };
+
+            clearSelection();
+            void moveToTrashWithUndo(selectedIds, {
+              trashFiles: trashFilesApi,
+              restoreFile,
+              removeFromFileProviderCache,
+              restoreFileProviderCache: async (restoredIds) => {
+                const restored = restoredIds.map((id) => selectedById.get(id)).filter((photo): photo is FileEntry => !!photo);
+                const names: Record<string, string> = {};
+                for (const id of restoredIds) {
+                  const name = decryptedNames[id];
+                  if (name) names[id] = name;
+                }
+                await syncDecryptedEntriesToFileProvider(restored, names);
+              },
+              showToast,
+              openTrash: () => navigation.navigate('Trash'),
+              hide: hideOptimisticallyTrashed,
+              unhide: revealOptimisticallyTrashed,
+              onTrashed: removeConfirmedPhotos,
+              onMissing: removeConfirmedPhotos,
+              onRestored: (restoredIds) => {
+                const restored = restoredIds.map((id) => selectedById.get(id)).filter((photo): photo is FileEntry => !!photo);
+                void Promise.allSettled(restoredIds.map(async (id) => {
+                  const localAssetId = localAssetsBeforeTrash.get(id);
+                  if (localAssetId) await markUploadComplete(localAssetId, id, writeTicket);
+                }));
+                if (restored.length > 0) {
+                  setPhotos((prev) => preparePhotoEntries([...restored, ...prev]));
+                  photosCacheRef.current = preparePhotoEntries([...restored, ...photosCacheRef.current]);
+                  setLocalAssetMap((prev) => {
+                    const next = new Map(prev);
+                    for (const id of restoredIds) {
+                      const localId = localAssetsBeforeTrash.get(id);
+                      if (localId) next.set(id, localId);
+                    }
+                    return next;
+                  });
+                }
+                revealOptimisticallyTrashed(restoredIds);
+              },
+              refreshAfterRestore: () => { void fetchPhotos(false, true, false, true); },
+              changeTrashCount: adjustTrashCount,
+              notifyTrashChanged,
+              singleName: selectedPhotos.length === 1 ? decryptedNames[selectedPhotos[0].id] : undefined,
+              trace: recordRuntimeTrace,
+            });
           },
         },
       ],
     );
-  }, [bulkAction, clearSelection, fetchPhotos, localAssetMap, selectedPhotos]);
+  }, [bulkAction, clearSelection, decryptedNames, fetchPhotos, localAssetMap, navigation, selectedPhotos, showToast]);
 
   const shareSelectedPhotos = useCallback(async () => {
     if (selectedPhotos.length === 0 || bulkAction) return;
@@ -1692,7 +1957,7 @@ export default function PhotosScreen() {
   const renderItem = useCallback(({ item }: { item: PhotoListItem }) => {
     if (item.type === 'header') {
       return (
-        <View style={styles.sectionHeader}>
+        <View style={[styles.sectionHeader, { height: sectionHeaderHeight }, accessibilityLayout && styles.sectionHeaderAccessibility]}>
           <Text style={[styles.sectionLabel, { color: c.ink }]}>{item.label}</Text>
           <Text style={[styles.sectionCount, { color: c.ink3 }]}>
             {item.count} {item.count === 1 ? 'item' : 'items'}
@@ -1724,6 +1989,7 @@ export default function PhotosScreen() {
       />
     );
   }, [
+    accessibilityLayout,
     activeThumbnailIds,
     lockStateReady,
     lockedFileIds,
@@ -1741,6 +2007,7 @@ export default function PhotosScreen() {
     photosFolderId,
     selectMode,
     selectedIds,
+    sectionHeaderHeight,
     toggleSelectedPhoto,
   ]);
 
@@ -1850,17 +2117,34 @@ export default function PhotosScreen() {
     console.info('[BeebeebPerf] photos.native', JSON.stringify(event.nativeEvent));
   }, []);
 
+  const openSources = useCallback(() => {
+    navigation.navigate('PhotoSources');
+  }, [navigation]);
+
   const renderEmpty = () => {
     if (loading) return null;
+    const nothingChosen = !sources.cameraRoll.enabled && sources.folders.length === 0;
     return (
-      <View style={styles.emptyContainer}>
+      <View style={styles.emptyContainer} testID="photos-empty">
         <View style={styles.emptyIconWrap}>
           <Ionicons name="images-outline" size={48} color={c.amberDeep} />
         </View>
-        <Text style={[styles.emptyTitle, { color: c.ink2 }]}>No photos yet</Text>
-        <Text style={[styles.emptySubtitle, { color: c.ink3 }]}>
-          Photos and videos you upload — or back up automatically — will appear here. Encrypted on your device, never visible to us.
+        <Text style={[styles.emptyTitle, { color: c.ink2 }]}>
+          {nothingChosen ? 'No photo sources chosen' : 'No photos yet'}
         </Text>
+        <Text style={[styles.emptySubtitle, { color: c.ink3 }]}>
+          {nothingChosen
+            ? 'Choose what shows here: camera roll backups, or folders from your Drive.'
+            : 'Camera roll backups and the folders you choose appear here. Encrypted on your device, never visible to us.'}
+        </Text>
+        <TouchableOpacity
+          style={[styles.chooseSourcesButton, { backgroundColor: c.amber }]}
+          onPress={openSources}
+          accessibilityRole="button"
+          testID="photos-choose-sources"
+        >
+          <Text style={[styles.chooseSourcesText, { color: c.ink }]}>Choose sources</Text>
+        </TouchableOpacity>
       </View>
     );
   };
@@ -1869,7 +2153,7 @@ export default function PhotosScreen() {
     <View style={styles.errorContainer}>
       <Ionicons name="cloud-offline-outline" size={48} color={c.ink3} />
       <Text style={[styles.errorText, { color: c.ink2 }]}>{error}</Text>
-      <TouchableOpacity style={[styles.retryButton, { backgroundColor: c.amber }]} onPress={() => fetchPhotos()}>
+      <TouchableOpacity style={[styles.retryButton, { backgroundColor: c.amber }]} onPress={() => fetchPhotos(true)}>
         <Text style={[styles.retryButtonText, { color: c.ink }]}>Retry</Text>
       </TouchableOpacity>
     </View>
@@ -1908,17 +2192,34 @@ export default function PhotosScreen() {
           thumbnail prefetch. */}
       {Platform.OS === 'android' || isScrolled ? <ScrollEdgeBlur height={headerHeight || SCROLL_EDGE.chromeFallback} /> : null}
       <View
+        key={`photos-header-${screenLayoutSignature}`}
         style={[styles.floatingHeader, { paddingTop: insets.top }]}
         onLayout={(e) => {
           const h = Math.round(e.nativeEvent.layout.height);
           setHeaderHeight((prev) => (Math.abs(prev - h) > 1 ? h : prev));
         }}
       >
-        <View style={styles.header}>
-          <Text style={[styles.title, { color: c.ink }]}>
+        <View style={[styles.header, accessibilityLayout && { alignItems: 'flex-start', minHeight: Math.ceil(38 * Math.min(fontScale, 2)) }]}>
+          <Text style={[styles.title, { color: c.ink }]} numberOfLines={accessibilityLayout ? 2 : 1}>
             {selectMode ? `${selectedIds.size} selected` : 'Photos'}
           </Text>
           <View style={{ flex: 1 }} />
+          {!selectMode ? (
+            <TouchableOpacity
+              activeOpacity={0.7}
+              onPress={openSources}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityRole="button"
+              accessibilityLabel="Photo sources"
+              testID="photos-sources-button"
+            >
+              <View ref={photosSourcesCoachRef} collapsable={false}>
+                <GlassCircle scheme={themeScheme} size={34}>
+                  <Ionicons name="options-outline" size={18} color={chromeMaterial.label} />
+                </GlassCircle>
+              </View>
+            </TouchableOpacity>
+          ) : null}
           {selectMode ? (
             // 1342 — was a flat borderColor: c.line / backgroundColor: c.paper2
             // circle (the same off-recipe shape FilesScreen's header
@@ -1943,6 +2244,40 @@ export default function PhotosScreen() {
         </View>
 
         <DevicePhotosBanner />
+
+        {sourceChips.length > 0 && !selectMode ? (
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={styles.chipsScroll}
+            contentContainerStyle={styles.chipsRow}
+            testID="photos-source-chips"
+          >
+            {sourceChips.map((chip) => {
+              const selected = chip.key === activeSourceKey;
+              return (
+                <TouchableOpacity
+                  key={chip.key}
+                  onPress={() => setSourceKey(chip.key)}
+                  style={[
+                    styles.chip,
+                    selected
+                      ? { backgroundColor: c.amber, borderColor: c.amber }
+                      : { backgroundColor: c.paper2, borderColor: c.line },
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected }}
+                  accessibilityLabel={chip.label}
+                  testID={`photos-source-chip-${chip.key}`}
+                >
+                  <Text style={[styles.chipText, { color: selected ? c.ink : c.ink2 }]} numberOfLines={accessibilityLayout ? 2 : 1}>
+                    {chip.label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+        ) : null}
       </View>
 
       {/* Content — wrapped in PinchGestureHandler for zoom-to-change-grid */}
@@ -2032,7 +2367,7 @@ export default function PhotosScreen() {
                 { backgroundColor: c.ink, opacity: columnIndicatorOpacity },
               ]}
             >
-              <Text style={[styles.columnIndicatorText, { color: c.paper }]}>
+              <Text maxFontSizeMultiplier={1.3} style={[styles.columnIndicatorText, { color: c.paper }]}>
                 {columns} columns
               </Text>
             </Animated.View>
@@ -2076,9 +2411,9 @@ export default function PhotosScreen() {
             scheme={themeScheme}
             radius={0}
             elevated={false}
-            contentStyle={styles.selectionBarRow}
+            contentStyle={[styles.selectionBarRow, accessibilityLayout && { flexWrap: 'wrap', alignItems: 'flex-start' }]}
           >
-            <Text style={[styles.selectionStatus, { color: chromeMaterial.label }]} numberOfLines={1}>
+            <Text style={[styles.selectionStatus, { color: chromeMaterial.label }]} numberOfLines={accessibilityLayout ? undefined : 1}>
               {bulkStatus ?? `${selectedIds.size} selected`}
             </Text>
             <TouchableOpacity
@@ -2148,6 +2483,7 @@ const styles = StyleSheet.create({
 
   // Section rows
   sectionHeader: { height: SECTION_HEADER_HEIGHT, flexDirection: 'row', alignItems: 'flex-end', paddingHorizontal: spacing.lg, paddingBottom: 6, gap: 8 },
+  sectionHeaderAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap', paddingTop: 6 },
   sectionLabel: { fontSize: 13, fontWeight: '600' },
   sectionCount: { fontSize: 10 },
 
@@ -2216,6 +2552,12 @@ const styles = StyleSheet.create({
   emptyContainer: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: spacing.xl, gap: 8 },
   emptyIconWrap: { marginBottom: 8, opacity: 0.85 },
   emptyTitle: { fontSize: 16, fontWeight: '600' },
+  chooseSourcesButton: { marginTop: 12, paddingHorizontal: 20, minHeight: 44, paddingVertical: 10, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  chooseSourcesText: { fontSize: 15, fontWeight: '700' },
+  chipsScroll: { flexGrow: 0 },
+  chipsRow: { paddingHorizontal: spacing.lg, paddingTop: 6, paddingBottom: 6, gap: 8 },
+  chip: { paddingHorizontal: 14, minHeight: 32, paddingVertical: 6, borderRadius: 16, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  chipText: { fontSize: 13, fontWeight: '600', maxWidth: 160 },
   emptySubtitle: { fontSize: 13, textAlign: 'center', lineHeight: 18 },
 
   // Error state
@@ -2248,4 +2590,6 @@ const styles = StyleSheet.create({
   },
   deviceBannerText: { fontSize: 12, flex: 1, fontWeight: '500' },
   deviceBannerHint: { fontSize: 11, fontWeight: '600' },
+  deviceBannerAccessibility: { flexDirection: 'column', alignItems: 'flex-start' },
+  deviceBannerTextAccessibility: { flex: 0 },
 });

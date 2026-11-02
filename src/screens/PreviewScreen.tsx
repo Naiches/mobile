@@ -17,6 +17,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import type { GestureResponderEvent, ImageStyle, StyleProp, ViewStyle } from 'react-native';
@@ -49,11 +50,14 @@ import { useTheme } from '../lib/theme-context';
 import { GLASS_CIRCLE_SIZES, GlassCapsule, GlassCircle, PREVIEW_CHROME_MATERIAL, SCROLL_EDGE, ScrollEdgeBlur, glassMaterial } from '../components/glass';
 import { bandColors, type Stop } from '../components/glass/gradient';
 import { useToast } from '../lib/toast-context';
-import { getToken, friendlyError, trustLocation, trashFiles, getFile, getFileCurrentVersion, listAllFiles, moveFile, type UploadProgress } from '../lib/api';
+import { useDuplicateFile } from '../lib/use-duplicate-file';
+import { getToken, friendlyError, trustLocation, restoreFile, trashFiles as trashFilesApi, getFile, getFileCurrentVersion, listAllFiles, moveFile, type UploadProgress } from '../lib/api';
 import { useCrypto } from '../lib/crypto-context';
 import { generateFileId } from '../lib/encrypted-upload';
 import { encryptedMetadataToJson, encryptedMetadataPayloadToBytes, fileMetadataPlaintext } from '../lib/encrypted-metadata';
-import { collectAllFolders, movePickerFolderFallbackName, type MovePickerFolderNode } from '../lib/move-picker-folders';
+import { loadFileIndex } from '../lib/file-index-loader';
+import { mapInBatches } from '../lib/async-batch';
+import { collectAllFolders, folderNodesFromIndex, MOVE_PICKER_MAX_FOLDERS, movePickerFolderFallbackName, type MovePickerFolderNode } from '../lib/move-picker-folders';
 import FolderPickerModal, { type PickerFolder } from '../components/FolderPickerModal';
 import { evaluateTextEditGate } from '../lib/text-edit-gate';
 import {
@@ -86,6 +90,7 @@ import {
 } from '../lib/photo-cache';
 import { getCachedThumbnail } from '../lib/thumbnail-cache';
 import {
+  displayedPhotoPreviewInfo,
   forgetStoredPreviewIfGone,
   loadStoredPreview,
   prepareGenerateFromOpenedOriginal,
@@ -146,6 +151,19 @@ import { RawRenderer } from '../components/preview/RawRenderer';
 import { ZoomableImage } from '../components/preview/ZoomableImage';
 import { PhotoPageVideo } from '../components/preview/PhotoPageVideo';
 import { previewSurfaceIsDark, statusBarStyleFor } from '../lib/status-bar-style';
+import { removeFromFileProviderCache, syncDecryptedEntriesToFileProvider } from '../lib/file-provider-mount';
+import { onFilesDeleted } from '../lib/delete-cascade';
+import { moveToTrashWithUndo } from '../lib/trash-with-undo';
+import {
+  confirmOptimisticallyTrashed,
+  hideOptimisticallyTrashed,
+  revealOptimisticallyTrashed,
+} from '../lib/trash-optimistic';
+import { adjustTrashCount, notifyTrashChanged } from '../lib/trash-count';
+import {
+  previewDocumentGestureAction,
+  shouldDismissPreview,
+} from '../lib/preview-dismiss';
 
 // Preview renderers are lazy-loaded so that the libraries each one depends on
 // (jszip, xlsx, mammoth, pako, react-native-pdf, highlight.js) only enter
@@ -197,6 +215,8 @@ const TextEditorView = React.lazy(async () => {
 // inside the VideoView bounds, so the view itself needs this extra bottom
 // clearance or the playhead lands behind Beebeeb's bottom chrome.
 const PREVIEW_VIDEO_CONTROLS_BOTTOM_CLEARANCE = 84;
+/** Folder names decrypted at once when the Move picker opens. */
+const MOVE_PICKER_DECRYPT_BATCH = 16;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -215,6 +235,13 @@ type PreviewOptionAction = {
 type ExportUriResult = { uri: string; reusedPreview: boolean; release?: () => Promise<void> | void };
 
 type StreamExportMaterializer = (fileId: string, extension: string) => Promise<string>;
+
+type DocumentTouch = {
+  startX: number;
+  startY: number;
+  startedAt: number;
+  scrollOffsetAtStart: number;
+};
 
 export interface PreviewExportUriResolverInput {
   isImage: boolean;
@@ -1407,7 +1434,18 @@ function holdOpenedOriginalForPreview(
  * Visible switch from the stored photo preview to the full original. Highlighted
  * once the zoom goes past the preview's resolution (the original has more detail).
  */
-function ViewOriginalPill({ onPress, bottom, highlight = false }: { onPress: () => void; bottom: number; highlight?: boolean }) {
+function ViewOriginalPill({
+  onPress,
+  bottom,
+  previewPx,
+  highlight = false,
+}: {
+  onPress: () => void;
+  bottom: number;
+  previewPx?: number | null;
+  highlight?: boolean;
+}) {
+  const preview = displayedPhotoPreviewInfo('preview', { preview_px: previewPx }, null).detail;
   return (
     <Pressable
       style={[styles.viewOriginalPill, highlight ? styles.viewOriginalPillHighlight : null, { bottom }]}
@@ -1417,7 +1455,8 @@ function ViewOriginalPill({ onPress, bottom, highlight = false }: { onPress: () 
       accessibilityHint={highlight ? 'Zoomed past the preview. The original has more detail.' : undefined}
       testID="preview-view-original"
     >
-      <Text style={[styles.viewOriginalPillText, highlight ? styles.viewOriginalPillTextHighlight : null]}>Original</Text>
+      <Text style={[styles.viewOriginalPillStatus, highlight ? styles.viewOriginalPillTextHighlight : null]}>{preview}</Text>
+      <Text style={[styles.viewOriginalPillText, highlight ? styles.viewOriginalPillTextHighlight : null]}>View original</Text>
     </Pressable>
   );
 }
@@ -1436,6 +1475,7 @@ export const PhotoPage = React.memo(function PhotoPage({
   onZoomChange,
   onSingleTap,
   onViewOriginal,
+  onDisplayedKind,
   videoControlsBottomInset,
   stageInsets,
 }: {
@@ -1475,6 +1515,8 @@ export const PhotoPage = React.memo(function PhotoPage({
   onSingleTap?: () => void;
   /** Loads the full original over the stored preview (the "Original" control). */
   onViewOriginal?: () => void;
+  /** Reports the source actually rendered so shared chrome never labels preview bytes as original bytes. */
+  onDisplayedKind?: (fileId: string, kind: ImagePreviewKind | null) => void;
   videoControlsBottomInset: number;
   /**
    * The page fills the whole screen. Video pages keep clear of the floating
@@ -1496,6 +1538,10 @@ export const PhotoPage = React.memo(function PhotoPage({
   const isRawEntry = fileCategory(entry.mime_type ?? undefined, entryFileName) === 'raw';
   const [uri, setUri] = useState<string | null>(null);
   const [uriKind, setUriKind] = useState<ImagePreviewKind | null>(null);
+  useEffect(() => {
+    onDisplayedKind?.(entry.id, uriKind);
+  }, [entry.id, onDisplayedKind, uriKind]);
+  useEffect(() => () => onDisplayedKind?.(entry.id, null), [entry.id, onDisplayedKind]);
   const [thumbnailUri, setThumbnailUri] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [stage, setStage] = useState<PhotoLoadStage | null>(null);
@@ -2184,7 +2230,12 @@ export const PhotoPage = React.memo(function PhotoPage({
             </View>
           )}
           {isCurrent && uri && uriKind === 'preview' && !originalActive && !error && onViewOriginal ? (
-            <ViewOriginalPill onPress={onViewOriginal} bottom={videoControlsBottomInset + 8 + (stageInsets?.bottom ?? 0)} highlight={zoomPastPreview} />
+            <ViewOriginalPill
+              onPress={onViewOriginal}
+              bottom={videoControlsBottomInset + 8 + (stageInsets?.bottom ?? 0)}
+              previewPx={entry.preview_px}
+              highlight={zoomPastPreview}
+            />
           ) : null}
           </>
         );
@@ -2271,6 +2322,8 @@ export default function PreviewScreen() {
   const navigation = useNavigation<Nav>();
   const route = useRoute<PreviewRoute>();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const largeText = fontScale >= 1.35;
   const previewBottomInset = bottomAnchorInset(insets.bottom, Math.max(insets.bottom, 16));
   const { colors: c, resolved } = useTheme();
   const { showToast } = useToast();
@@ -2466,6 +2519,18 @@ export default function PreviewScreen() {
   // Image inline preview state
   const [imageUri, setImageUri] = useState<string | null>(null);
   const [imagePreviewKind, setImagePreviewKind] = useState<ImagePreviewKind | null>(null);
+  const [photoPageKinds, setPhotoPageKinds] = useState<Record<string, ImagePreviewKind>>({});
+  const handlePhotoPageDisplayedKind = useCallback((pageFileId: string, kind: ImagePreviewKind | null) => {
+    setPhotoPageKinds((previous) => {
+      if (kind === null) {
+        if (!(pageFileId in previous)) return previous;
+        const next = { ...previous };
+        delete next[pageFileId];
+        return next;
+      }
+      return previous[pageFileId] === kind ? previous : { ...previous, [pageFileId]: kind };
+    });
+  }, []);
   const [imageLoading, setImageLoading] = useState(false);
   const [imageError, setImageError] = useState<string | null>(null);
   // Task 0885 (FIX #3): track whether the mounted <Image> has actually decoded,
@@ -2779,9 +2844,33 @@ export default function PreviewScreen() {
   // the pager stops paging and the header's swipe-down-to-close is off, so
   // a drag pans the zoomed image instead. Reset on every page change.
   const [mediaZoomed, setMediaZoomed] = useState(false);
+  const previewZoomScaleRef = useRef(1);
+  const [documentZoomed, setDocumentZoomed] = useState(false);
+  const documentScrollOffsetRef = useRef(0);
+  const documentTouchRef = useRef<DocumentTouch | null>(null);
+  const [documentAtTop, setDocumentAtTop] = useState(true);
+  const handleMediaZoomChange = useCallback((zoomed: boolean) => {
+    previewZoomScaleRef.current = zoomed ? 2 : 1;
+    setMediaZoomed(zoomed);
+  }, []);
+  const handleDocumentScaleChange = useCallback((scale: number) => {
+    previewZoomScaleRef.current = scale;
+    setDocumentZoomed(scale > 1.01);
+  }, []);
+  const handleDocumentScrollOffset = useCallback((offset: number) => {
+    const next = Math.max(0, offset);
+    documentScrollOffsetRef.current = next;
+    const atTop = next <= 1;
+    setDocumentAtTop((previous) => previous === atTop ? previous : atTop);
+  }, []);
   useEffect(() => {
     setMediaZoomed(false);
-  }, [currentPhotoIndex, currentFileId]);
+    setDocumentZoomed(false);
+    setDocumentAtTop(true);
+    previewZoomScaleRef.current = 1;
+    documentScrollOffsetRef.current = 0;
+    documentTouchRef.current = null;
+  }, [currentPhotoIndex, currentFileId, htmlShowSource]);
   const [infoVisible, setInfoVisible] = useState(false);
   // Task 1583 — the bottom bar's "Versions" opens the sheet AT the Versions
   // section, "Info" at the top: one home for versions (the sheet's own
@@ -2795,6 +2884,9 @@ export default function PreviewScreen() {
   // (design section 02, "Show source" — Guus's 18:50 ruling put Edit in
   // this same menu; this is the sibling read-only view it also asked for).
   const [showSource, setShowSource] = useState(false);
+  useEffect(() => {
+    handleDocumentScrollOffset(0);
+  }, [showSource, handleDocumentScrollOffset]);
   // Task 1591 bug 1 — the status bar's content style follows the surface it
   // sits on (media stage / code + editor surfaces are dark in BOTH themes),
   // not only the app theme the root <StatusBar> in App.tsx uses. See
@@ -2810,6 +2902,13 @@ export default function PreviewScreen() {
   });
   const statusBarStyle = statusBarStyleFor(surfaceIsDark);
   const [pdfPageInfo, setPdfPageInfo] = useState<{ current: number; total: number } | null>(null);
+  const handlePdfPageInfo = useCallback((info: { current: number; total: number }) => {
+    setPdfPageInfo(info);
+    // react-native-pdf exposes pages and scale but not its internal FlatList
+    // offset. Page 2+ is an unambiguous scrolled state and must never hand a
+    // downward drag to modal dismissal.
+    handleDocumentScrollOffset(info.current > 1 ? 2 : 0);
+  }, [handleDocumentScrollOffset]);
   const barsOpacity = useRef(new Animated.Value(1)).current;
 
   // Round 5 (lead review of round 4's own screenshots): round 4 fixed the
@@ -2827,6 +2926,7 @@ export default function PreviewScreen() {
   // "measured, not eyeballed" rule. `null` until the first layout pass
   // fires; `computePreviewContentInset` has a documented, derived fallback
   // for that one frame so content never flashes at y=0.
+  const [mediaHeaderHeight, setMediaHeaderHeight] = useState<number | null>(null);
   const [docHeaderHeight, setDocHeaderHeight] = useState<number | null>(null);
   const [docBottomBarHeight, setDocBottomBarHeight] = useState<number | null>(null);
   // The ">2MB / lossy-decode" read-only notice (`readOnlyBanner` below) is
@@ -2845,6 +2945,13 @@ export default function PreviewScreen() {
       }),
     [insets.top, insets.bottom, docHeaderHeight, docBottomBarHeight],
   );
+  const mediaChromeBottom = largeText
+    ? (mediaHeaderHeight ?? insets.top + 62) + 4
+    : insets.top + 62;
+  const docChromeBottom = largeText
+    ? (docHeaderHeight ?? insets.top + 58) + 4
+    : insets.top + 58;
+  const readOnlyBannerFallbackHeight = 44 * Math.max(1, fontScale);
 
   const handleContentTap = useCallback(() => {
     setBarsVisible((prev) => nextBarsVisible(prev, { editMode, infoVisible, optionsVisible }));
@@ -3279,20 +3386,73 @@ export default function PreviewScreen() {
   // `UIModalPresentationFullScreen`. Unlike `modal`/`pageSheet`, that
   // presentation style has NO built-in interactive dismiss gesture, so the
   // swipe-down-to-close the old `modal` sheet gave for free has to be
-  // rebuilt in JS. Scoped to the glass header row only (not the whole
-  // screen): the doc/media content below is a mix of vertical ScrollViews
-  // (markdown/code/HTML source), a horizontal FlatList (photo pager) and a
-  // native PdfRenderer — a PanGestureHandler wrapping ALL of that would
-  // race each of their own pan recognizers for every scroll-up gesture, not
-  // just a dismiss swipe (there is no cheap way to ask an arbitrary nested
-  // scrollable "are you at the top?" across that many renderer types). The
-  // header has no competing gesture of its own, so grabbing it and dragging
-  // down is unambiguous — same idiom as BBActionSheet's own grabber drag.
+  // rebuilt in JS. The header rows and media stage use native pan handlers.
+  // Text, Markdown and code each own a vertical scroller. Raw-touch observers
+  // live on those scrollers themselves, so no ancestor joins responder
+  // negotiation; release only classifies dismiss vs tap.
   // `handleClose` (above) already routes through the `beforeRemove`
   // unsaved-changes guard via `navigation.goBack()`, so a swipe-dismiss
   // while editing gets the same discard confirmation as every other close
   // path — nothing extra to wire here.
   const closeTranslateY = useRef(new Animated.Value(0)).current;
+  const resetCloseTranslation = useCallback(() => {
+    Animated.spring(closeTranslateY, {
+      toValue: 0,
+      useNativeDriver: true,
+      bounciness: 4,
+    }).start();
+  }, [closeTranslateY]);
+
+  // Text renderers observe raw start/end events on their OWN ScrollViews,
+  // never on an ancestor. The scroll view therefore keeps its native pan;
+  // release dismisses only when the drag began at offset zero, toggles chrome
+  // only for a short stationary touch, and ignores every other drag.
+  const handleDocumentTouchStart = useCallback((event: GestureResponderEvent) => {
+    if (editMode || event.nativeEvent.touches.length !== 1) {
+      documentTouchRef.current = null;
+      return;
+    }
+    const { pageX, pageY } = event.nativeEvent;
+    documentTouchRef.current = {
+      startX: pageX,
+      startY: pageY,
+      startedAt: Date.now(),
+      scrollOffsetAtStart: documentScrollOffsetRef.current,
+    };
+  }, [editMode]);
+
+  const finishDocumentTouchAt = useCallback((endX: number, endY: number) => {
+    const touch = documentTouchRef.current;
+    if (!touch) return;
+    documentTouchRef.current = null;
+    const action = previewDocumentGestureAction({
+      startX: touch.startX,
+      startY: touch.startY,
+      endX,
+      endY,
+      durationMs: Date.now() - touch.startedAt,
+      zoomScale: previewZoomScaleRef.current,
+      documentScrollOffsetAtStart: touch.scrollOffsetAtStart,
+    });
+    if (action === 'dismiss') {
+      handleClose();
+      return;
+    }
+    if (action === 'toggle-chrome') {
+      handleContentTap();
+    }
+    resetCloseTranslation();
+  }, [handleClose, handleContentTap, resetCloseTranslation]);
+
+  const handleDocumentTouchEnd = useCallback((event: GestureResponderEvent) => {
+    finishDocumentTouchAt(event.nativeEvent.pageX, event.nativeEvent.pageY);
+  }, [finishDocumentTouchAt]);
+
+  const handleDocumentTouchCancel = useCallback(() => {
+    documentTouchRef.current = null;
+    resetCloseTranslation();
+  }, [resetCloseTranslation]);
+
   const onCloseGestureEvent = useMemo(
     () => Animated.event(
       [{ nativeEvent: { translationY: closeTranslateY } }],
@@ -3302,21 +3462,32 @@ export default function PreviewScreen() {
   );
   const onCloseHandlerStateChange = useCallback((event: PanGestureHandlerStateChangeEvent) => {
     if (event.nativeEvent.oldState !== State.ACTIVE) return;
-    const { translationY, velocityY } = event.nativeEvent;
-    if (translationY > 120 || velocityY > 800) {
+    const { translationX, translationY, velocityX, velocityY } = event.nativeEvent;
+    if (shouldDismissPreview({
+      zoomScale: previewZoomScaleRef.current,
+      translationX,
+      translationY,
+      velocityX,
+      velocityY,
+      documentScrollOffset: isMediaPreview ? 0 : documentScrollOffsetRef.current,
+    })) {
       handleClose();
       return;
     }
-    Animated.spring(closeTranslateY, {
-      toValue: 0,
-      useNativeDriver: true,
-      bounciness: 4,
-    }).start();
-  }, [closeTranslateY, handleClose]);
+    resetCloseTranslation();
+  }, [handleClose, isMediaPreview, resetCloseTranslation]);
   const closeTranslateYClamped = useMemo(
     () => closeTranslateY.interpolate({
       inputRange: [-1, 0, 4000],
       outputRange: [0, 0, 4000],
+      extrapolate: 'clamp',
+    }),
+    [closeTranslateY],
+  );
+  const closeBackdropOpacity = useMemo(
+    () => closeTranslateY.interpolate({
+      inputRange: [0, 320],
+      outputRange: [1, 0.35],
       extrapolate: 'clamp',
     }),
     [closeTranslateY],
@@ -3662,6 +3833,17 @@ export default function PreviewScreen() {
     currentStoragePoolId,
     currentVersionNumber,
   ]);
+
+  const displayedImageKind = hasSwipe ? photoPageKinds[currentFileId] ?? null : imagePreviewKind;
+  const displayedImageInfo = displayedPhotoPreviewInfo(
+    displayedImageKind,
+    currentPhotoPageEntry,
+    shownSizeBytes,
+  ) ?? { detail: 'Image', sizeBytes: shownSizeBytes };
+  const mediaDisplayedDetail = isImage
+    ? displayedImageInfo.detail
+    : category === 'raw' ? rawFormatLabelValue : CATEGORY_LABELS[category];
+  const mediaDisplayedSizeBytes = isImage ? displayedImageInfo.sizeBytes : shownSizeBytes;
 
   // Auto-load image previews inline. Data saver/Balanced use the normal
   // thumbnail only; Smooth may upgrade to the large thumbnail. Originals are
@@ -4515,12 +4697,40 @@ export default function PreviewScreen() {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, [previewFileName]);
 
-  const handleDuplicate = useCallback(() => {
-    Alert.alert(
-      'Duplicate is not ready yet',
-      'Duplicating encrypted files needs a server-side copy operation so the file key, metadata, and chunks stay consistent.',
-    );
-  }, []);
+  // The copy is made on the phone (lib/duplicate-file.ts); the progress sheet
+  // and result toast come from the shared hook.
+  const { duplicate: duplicateFileOnPhone, progressSheet: duplicateProgressSheet } = useDuplicateFile({
+    onShow: (parentId) => {
+      // The toast can outlive this screen's foreground position. Open Files
+      // explicitly; goBack could pop an unrelated screen visited meanwhile.
+      (navigation.navigate as any)('Tabs', {
+        screen: 'Files',
+        params: {
+          action: parentId ? 'folder' : 'root',
+          folderId: parentId,
+        },
+      });
+    },
+  });
+  const handleDuplicate = useCallback(async () => {
+    try {
+      const fresh = await getFile(currentFileId);
+      void duplicateFileOnPhone({
+        id: currentFileId,
+        name: previewFileName,
+        mimeType: currentMimeType ?? null,
+        sizeBytes: shownSizeBytes ?? null,
+        chunkCount: currentChunkCount ?? null,
+        parentId: fresh.parent_id ?? null,
+        isFolder: false,
+        requestKey: requestFileFields && currentFileId === fileId
+          ? () => getRequestContentKey(requestFileFields)
+          : undefined,
+      });
+    } catch (err) {
+      showToast({ type: 'error', message: `Couldn't duplicate: ${friendlyError(err)}` });
+    }
+  }, [currentFileId, previewFileName, currentMimeType, shownSizeBytes, currentChunkCount, requestFileFields, fileId, getRequestContentKey, duplicateFileOnPhone, showToast]);
 
   // Preview redesign item 4 — "Move to…" (design section 02's ⋯ menu).
   // FilesScreen already ships a "Move" flow for possibly-FOLDER items
@@ -4540,16 +4750,31 @@ export default function PreviewScreen() {
   const [movePicker, setMovePicker] = useState<{ folders: PickerFolder[]; currentParentId: string | null } | null>(null);
   const [moveBusy, setMoveBusy] = useState(false);
 
+  // The folder tree comes from the file index (one cached read, root included),
+  // so it is the same whichever screen opened the viewer and never depends on
+  // walking the Backups tree. The folder-by-folder walk is the fallback.
+  const loadMovePickerFolderNodes = useCallback(async (): Promise<MovePickerFolderNode[]> => {
+    try {
+      const { files } = await loadFileIndex();
+      if (files) return folderNodesFromIndex(files, MOVE_PICKER_MAX_FOLDERS);
+    } catch {
+      // fall through to the walk
+    }
+    return collectAllFolders((parentId) => listAllFiles(parentId ?? undefined));
+  }, []);
+
   const handleOpenMovePicker = useCallback(async () => {
     setOptionsVisible(false);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     try {
       const [fresh, folderNodes] = await Promise.all([
         getFile(currentFileId),
-        collectAllFolders((parentId) => listAllFiles(parentId ?? undefined)),
+        loadMovePickerFolderNodes(),
       ]);
-      const folders: PickerFolder[] = await Promise.all(
-        folderNodes.map(async (node: MovePickerFolderNode) => {
+      const folders: PickerFolder[] = await mapInBatches(
+        folderNodes,
+        MOVE_PICKER_DECRYPT_BATCH,
+        async (node: MovePickerFolderNode) => {
           let name = movePickerFolderFallbackName(node);
           try {
             const payload = encryptedMetadataPayloadToBytes(node.name_encrypted);
@@ -4565,13 +4790,13 @@ export default function PreviewScreen() {
             // reason to block the whole picker from opening.
           }
           return { id: node.id, name, parentId: node.parent_id };
-        }),
+        },
       );
       setMovePicker({ folders, currentParentId: fresh.parent_id ?? null });
     } catch (err) {
       Alert.alert('Error', friendlyError(err));
     }
-  }, [currentFileId, decryptMetadata]);
+  }, [currentFileId, decryptMetadata, loadMovePickerFolderNodes]);
 
   const handleConfirmMove = useCallback(async (targetId: string | null) => {
     if (moveBusy) return;
@@ -4603,23 +4828,45 @@ export default function PreviewScreen() {
         {
           text: 'Move to Trash',
           style: 'destructive',
-          onPress: async () => {
-            setTrashing(true);
-            try {
-              await trashFiles([currentFileId]);
-              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              navigation.goBack();
-            } catch (err) {
-              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-              Alert.alert('Delete failed', friendlyError(err));
-            } finally {
-              setTrashing(false);
-            }
+          onPress: () => {
+            void moveToTrashWithUndo([currentFileId], {
+              trashFiles: trashFilesApi,
+              restoreFile,
+              removeFromFileProviderCache,
+              restoreFileProviderCache: async (restoredIds) => {
+                const restored = (await Promise.all(restoredIds.map((id) => getFile(id).catch(() => null))))
+                  .filter((entry) => entry !== null);
+                await syncDecryptedEntriesToFileProvider(restored, { [currentFileId]: previewFileName });
+              },
+              showToast,
+              openTrash: () => navigation.navigate('Trash'),
+              hide: (ids) => {
+                setTrashing(true);
+                hideOptimisticallyTrashed(ids);
+                navigation.goBack();
+              },
+              unhide: revealOptimisticallyTrashed,
+              onTrashed: async (ids) => {
+                await onFilesDeleted(ids, { kind: 'trash' });
+                // Keep the Drive/Photos row hidden until the sync tree applies
+                // the matching trash event behind this popped preview.
+                confirmOptimisticallyTrashed(ids);
+              },
+              onMissing: async (ids) => {
+                await onFilesDeleted(ids);
+                confirmOptimisticallyTrashed(ids);
+              },
+              onRestored: revealOptimisticallyTrashed,
+              changeTrashCount: adjustTrashCount,
+              notifyTrashChanged,
+              singleName: previewFileName,
+              trace: recordRuntimeTrace,
+            });
           },
         },
       ],
     );
-  }, [currentFileId, navigation, previewFileName, trashing, isImage, isVideo]);
+  }, [currentFileId, navigation, previewFileName, showToast, trashing, isImage, isVideo]);
 
   // Task 1563 — Guus's ruling (2026-09-26 18:50) overrides the mockup's
   // Edit/Preview segmented control: Edit is reached from THIS existing ⋯
@@ -4738,9 +4985,10 @@ export default function PreviewScreen() {
         // keyed by file id (round 3) — see `PhotoPage`'s own `onExifInfo` prop
         // doc comment.
         onExifInfo={publishRawExif}
-        onZoomChange={setMediaZoomed}
+        onZoomChange={handleMediaZoomChange}
         onSingleTap={handleContentTap}
         onViewOriginal={handleViewOriginal}
+        onDisplayedKind={handlePhotoPageDisplayedKind}
         videoControlsBottomInset={previewVideoControlsBottomInset}
         stageInsets={pagerStageInsets}
       />
@@ -4751,8 +4999,10 @@ export default function PreviewScreen() {
       authenticatedFileIds,
       currentPhotoIndex,
       handleContentTap,
+      handleMediaZoomChange,
       handleUnlockCurrent,
       handleViewOriginal,
+      handlePhotoPageDisplayedKind,
       lockCheckReady,
       lockedFileIds,
       originalPhotoRequest,
@@ -4883,7 +5133,10 @@ export default function PreviewScreen() {
     const mediaMaterial = PREVIEW_CHROME_MATERIAL;
 
     return (
-      <Animated.View style={[styles.mediaRoot, { transform: [{ translateY: closeTranslateYClamped }] }]}>
+      <Animated.View style={[
+        styles.mediaRoot,
+        { opacity: closeBackdropOpacity, transform: [{ translateY: closeTranslateYClamped }] },
+      ]}>
         {/* 1314 — the canvas floats Preview's chrome as glass over the media
             instead of a flat black bar. The scrim becomes a progressive blur
             so the title stays legible over bright images, and the controls
@@ -4910,10 +5163,9 @@ export default function PreviewScreen() {
             ancestor ate every swipe) does not apply. `enabled={!mediaZoomed}`
             matches the pager's own scrollEnabled gate (1579): while a
             ZoomableImage is zoomed its ScrollView owns the vertical pan, so
-            the dismiss gesture stands down. The doc branch is deliberately
-            NOT wrapped: its content (PDF/WebView/text) scrolls vertically —
-            a content pan there would fight scrolling; the doc header
-            already carries the same swipe (see its PanGestureHandler).
+            the dismiss gesture stands down. The document branch uses the
+            same gesture only at scroll offset zero; once content scrolls,
+            its renderer owns the vertical pan instead.
             Taps still reach the content: the header proves the tap/pan
             coexistence (its TouchableOpacities work inside the same pan). */}
         <PanGestureHandler
@@ -5042,7 +5294,7 @@ export default function PreviewScreen() {
                 <>
                 <ZoomableImage
                   resetSignal={currentFileId}
-                  onZoomChange={setMediaZoomed}
+                  onZoomChange={handleMediaZoomChange}
                   onSingleTap={handleContentTap}
                   testID="preview-zoomable"
                 >
@@ -5074,7 +5326,11 @@ export default function PreviewScreen() {
                   )}
                 </ZoomableImage>
                 {imagePreviewKind === 'preview' && !originalImageActive ? (
-                  <ViewOriginalPill onPress={handleViewOriginal} bottom={previewVideoControlsBottomInset + 8 + pagerStageInsets.bottom} />
+                  <ViewOriginalPill
+                    onPress={handleViewOriginal}
+                    bottom={previewVideoControlsBottomInset + 8 + pagerStageInsets.bottom}
+                    previewPx={currentPhotoPageEntry.preview_px}
+                  />
                 ) : null}
                 </>
               ) : (
@@ -5093,7 +5349,7 @@ export default function PreviewScreen() {
                 // Task 1579 — pinch/double-tap zoom (single-file RAW preview).
                 <ZoomableImage
                   resetSignal={currentFileId}
-                  onZoomChange={setMediaZoomed}
+                  onZoomChange={handleMediaZoomChange}
                   onSingleTap={handleContentTap}
                   testID="preview-zoomable"
                 >
@@ -5173,7 +5429,13 @@ export default function PreviewScreen() {
           // Task 1579 — swipe-down-to-close only at 1x.
           enabled={!mediaZoomed}
         >
-        <View style={[styles.mediaHeader, { paddingTop: insets.top + 8 }]}>
+        <View
+          style={[styles.mediaHeader, { paddingTop: insets.top + 8 }]}
+          onLayout={(event) => {
+            const height = event.nativeEvent.layout.height;
+            setMediaHeaderHeight((previous) => (previous === height ? previous : height));
+          }}
+        >
           {/* 1343 — outer TouchableOpacity wraps the fixed-size GlassCircle so
               hitSlop is not clipped to the disc (RN clips hitSlop to the
               parent's bounds — the lesson FilesScreen's back-button needed a
@@ -5215,14 +5477,17 @@ export default function PreviewScreen() {
             >
               <Text
                 style={[styles.mediaHeaderTitle, { color: mediaMaterial.label }]}
-                numberOfLines={1}
+                numberOfLines={largeText ? undefined : 1}
               >
                 {previewFileName}
               </Text>
-              <View style={styles.encSubRow}>
+              <View style={[styles.encSubRow, largeText && styles.encSubRowLargeText]}>
                 <Ionicons name="lock-closed" size={10} color={colors.amber} />
-                <Text style={[styles.mediaHeaderSubtitle, styles.mono, { color: mediaMaterial.labelMuted }]} numberOfLines={1}>
-                  {`Encrypted · ${category === 'raw' ? rawFormatLabelValue : CATEGORY_LABELS[category]}${shownSizeBytes != null ? ` · ${formatSize(shownSizeBytes)}` : ''}`}
+                <Text
+                  style={[styles.mediaHeaderSubtitle, styles.mono, { color: mediaMaterial.labelMuted }]}
+                  numberOfLines={largeText ? undefined : 1}
+                >
+                  {`Encrypted · ${mediaDisplayedDetail}${mediaDisplayedSizeBytes != null ? ` · ${formatSize(mediaDisplayedSizeBytes)}` : ''}`}
                 </Text>
               </View>
             </GlassCapsule>
@@ -5263,7 +5528,7 @@ export default function PreviewScreen() {
             own already-established "just under the bar" anchor, not a new
             magic number. */}
         {pageCounterLabel && (
-          <View style={[styles.pageCounterWrap, { top: insets.top + 62 }]} pointerEvents="none">
+          <View style={[styles.pageCounterWrap, { top: mediaChromeBottom }]} pointerEvents="none">
             <GlassCapsule scheme="dark" materialOverride={mediaMaterial} contentStyle={styles.pageCounterBody}>
               <Text style={[styles.pageCounterText, styles.mono, { color: mediaMaterial.label }]}>{pageCounterLabel}</Text>
             </GlassCapsule>
@@ -5309,8 +5574,9 @@ export default function PreviewScreen() {
           filename={previewFileName}
           actions={previewActions}
           onClose={() => setOptionsVisible(false)}
-          top={insets.top + 62}
+          top={mediaChromeBottom}
         />
+        {duplicateProgressSheet}
         {/* Preview redesign item 4 — "Move to…", reusing FilesScreen's own
             FolderPickerModal (see the `handleOpenMovePicker` comment). */}
         <FolderPickerModal
@@ -5371,7 +5637,11 @@ export default function PreviewScreen() {
   const docMaterial = PREVIEW_CHROME_MATERIAL;
 
   return (
-    <Animated.View style={[styles.root, { backgroundColor: c.paper }, { transform: [{ translateY: closeTranslateYClamped }] }]}>
+    <Animated.View style={[
+      styles.root,
+      { backgroundColor: c.paper, opacity: closeBackdropOpacity },
+      { transform: [{ translateY: closeTranslateYClamped }] },
+    ]}>
       <StatusBar style={statusBarStyle} hidden={!chromeVisible} animated />
       {/* Round 4 fix — see `header`'s own style comment for the two bugs
           this exact shape fixes (a stacking bug, then an accessibility-tree
@@ -5424,6 +5694,7 @@ export default function PreviewScreen() {
         onHandlerStateChange={onCloseHandlerStateChange}
         activeOffsetY={[-1000, 8]}
         failOffsetX={[-20, 20]}
+        enabled={!documentZoomed && documentAtTop}
       >
       {editMode ? (
         <View style={[styles.header, { paddingTop: insets.top + 8 }]} testID="preview-edit-topbar">
@@ -5445,12 +5716,18 @@ export default function PreviewScreen() {
               style={styles.docHeaderCapsule}
               contentStyle={styles.docHeaderCapsuleBody}
             >
-              <Text style={[styles.docHeaderTitle, { color: docMaterial.label }]} numberOfLines={1}>
+              <Text
+                style={[styles.docHeaderTitle, { color: docMaterial.label }]}
+                numberOfLines={largeText ? undefined : 1}
+              >
                 {previewFileName}
               </Text>
               <View style={styles.headerSubRow}>
                 <View style={[styles.editDirtyDot, { backgroundColor: docMaterial.label }]} />
-                <Text style={[styles.docHeaderSubtitle, styles.mono, { color: docMaterial.labelMuted }]} numberOfLines={1}>
+                <Text
+                  style={[styles.docHeaderSubtitle, styles.mono, { color: docMaterial.labelMuted }]}
+                  numberOfLines={largeText ? undefined : 1}
+                >
                   {isDirty ? 'Edited · not saved' : (statusLine ?? 'Editing')}
                 </Text>
               </View>
@@ -5518,7 +5795,7 @@ export default function PreviewScreen() {
             >
               <Text
                 style={[styles.docHeaderTitle, { color: docMaterial.label }]}
-                numberOfLines={1}
+                numberOfLines={largeText ? undefined : 1}
               >
                 {previewFileName}
               </Text>
@@ -5526,7 +5803,7 @@ export default function PreviewScreen() {
                 <Ionicons name="lock-closed" size={10} color={colors.amber} />
                 <Text
                   style={[styles.docHeaderSubtitle, styles.mono, { color: docMaterial.labelMuted }]}
-                  numberOfLines={1}
+                  numberOfLines={largeText ? undefined : 1}
                 >
                   {/* Preview redesign item 2 — the separate "MARKDOWN"-style
                       lang badge (removed below) truncated the size on the
@@ -5579,8 +5856,9 @@ export default function PreviewScreen() {
         filename={previewFileName}
         actions={previewActions}
         onClose={() => setOptionsVisible(false)}
-        top={insets.top + 58}
+        top={docChromeBottom}
       />
+      {duplicateProgressSheet}
       {/* Preview redesign item 4 — "Move to…", reusing FilesScreen's own
           FolderPickerModal (see the `handleOpenMovePicker` comment). */}
       <FolderPickerModal
@@ -5613,7 +5891,10 @@ export default function PreviewScreen() {
           silently "fixed": they never render, so there is nothing to
           regress, and touching unreachable code isn't part of this
           decision. */}
-      <View style={styles.previewArea}>
+      <View
+        style={styles.previewArea}
+        testID="preview-dismiss-gesture"
+      >
         {contentLocked ? (
           // Task 1539 (finding 1, P0): the doc branch (pdf/docx/spreadsheet/
           // html/zip/archive/text/pptx/svg) — every content-loading effect
@@ -5713,6 +5994,8 @@ export default function PreviewScreen() {
                   scalesPageToFit
                   showsHorizontalScrollIndicator={false}
                   showsVerticalScrollIndicator={false}
+                  scrollEventThrottle={16}
+                  onScroll={(event) => handleDocumentScrollOffset(event.nativeEvent.contentOffset.y)}
                 />
               </View>
             </Pressable>
@@ -5738,7 +6021,8 @@ export default function PreviewScreen() {
               <Suspense fallback={<View style={styles.imageStatus}>{renderSharedProgress(false)}</View>}>
                 <PdfRenderer
                   filePath={pdfUri}
-                  onPageInfo={setPdfPageInfo}
+                  onPageInfo={handlePdfPageInfo}
+                  onScaleChange={handleDocumentScaleChange}
                   topInset={docContentInset.top}
                   bottomInset={docContentInset.bottom}
                 />
@@ -5831,7 +6115,7 @@ export default function PreviewScreen() {
               </Suspense>
             </View>
           ) : textContent != null ? (
-            <Pressable style={styles.fullBleedFill} onPress={handleContentTap} testID="preview-content-tap">
+            <View style={styles.fullBleedFill} testID="preview-content-tap">
               {/* Task 1563 limit (item 6): an honest notice, no Edit button,
                   when the file loaded fine for READING but fails the edit
                   gate (over 2 MB, or content that looks like a lossy UTF-8
@@ -5864,6 +6148,11 @@ export default function PreviewScreen() {
                 <ScrollView
                   style={styles.markdownScroll}
                   showsVerticalScrollIndicator
+                  onTouchStart={handleDocumentTouchStart}
+                  onTouchEnd={handleDocumentTouchEnd}
+                  onTouchCancel={handleDocumentTouchCancel}
+                  scrollEventThrottle={16}
+                  onScroll={(event) => handleDocumentScrollOffset(event.nativeEvent.contentOffset.y)}
                   // Round 5 — on `contentContainerStyle` (not a prop into
                   // MarkdownRenderer itself), same reasoning as
                   // CodeRenderer's own ScrollView: the viewport stays full-
@@ -5871,7 +6160,7 @@ export default function PreviewScreen() {
                   // scrolling moves the rendered markdown UNDER the
                   // translucent bars instead of clipping at a shrunk edge.
                   contentContainerStyle={{
-                    paddingTop: docContentInset.top + (editGate.reason ? (readOnlyBannerHeight ?? 44) : 0),
+                    paddingTop: docContentInset.top + (editGate.reason ? (readOnlyBannerHeight ?? readOnlyBannerFallbackHeight) : 0),
                     paddingBottom: docContentInset.bottom,
                   }}
                 >
@@ -5884,12 +6173,16 @@ export default function PreviewScreen() {
                   <CodeRenderer
                     code={textContent}
                     language={codeLanguage}
-                    topInset={docContentInset.top + (editGate.reason ? (readOnlyBannerHeight ?? 44) : 0)}
+                    topInset={docContentInset.top + (editGate.reason ? (readOnlyBannerHeight ?? readOnlyBannerFallbackHeight) : 0)}
                     bottomInset={docContentInset.bottom}
+                    onScrollOffsetChange={handleDocumentScrollOffset}
+                    onTouchStart={handleDocumentTouchStart}
+                    onTouchEnd={handleDocumentTouchEnd}
+                    onTouchCancel={handleDocumentTouchCancel}
                   />
                 </Suspense>
               )}
-            </Pressable>
+            </View>
           ) : textError ? (
             renderLoadError("Couldn't load file", textError)
           ) : (
@@ -5912,6 +6205,7 @@ export default function PreviewScreen() {
                   isDark={resolved === 'dark'}
                   topInset={docContentInset.top}
                   bottomInset={docContentInset.bottom}
+                  onScrollOffsetChange={handleDocumentScrollOffset}
                 />
               </Suspense>
             </Pressable>
@@ -5933,6 +6227,7 @@ export default function PreviewScreen() {
                   colors={c}
                   topInset={docContentInset.top}
                   bottomInset={docContentInset.bottom}
+                  onScrollOffsetChange={handleDocumentScrollOffset}
                 />
               </Suspense>
             </Pressable>
@@ -6009,12 +6304,24 @@ export default function PreviewScreen() {
                 <ScrollView
                   style={[styles.codeScroll, { backgroundColor: c.paper, borderRadius: 0 }]}
                   contentContainerStyle={styles.codeScrollContent}
+                  scrollEventThrottle={16}
+                  onScroll={(event) => handleDocumentScrollOffset(event.nativeEvent.contentOffset.y)}
                 >
                   <ScrollView horizontal contentContainerStyle={styles.codeHorizontal}>
                     <View style={styles.codeBlock}>
                       {htmlContent.split('\n').map((line, i) => (
                         <View key={i} style={styles.codeLine}>
-                          <Text style={[styles.codeLineNumber, { color: c.ink3 }]} selectable={false}>
+                          <Text
+                            style={[
+                              styles.codeLineNumber,
+                              {
+                                color: c.ink3,
+                                minWidth: 36 * Math.max(1, fontScale),
+                                paddingRight: 12 * Math.max(1, fontScale),
+                              },
+                            ]}
+                            selectable={false}
+                          >
                             {String(i + 1).padStart(4, ' ')}
                           </Text>
                           <Text style={[styles.codeLineText, { color: c.ink }]} selectable>
@@ -6030,6 +6337,8 @@ export default function PreviewScreen() {
                   {...staticPreviewWebViewProps}
                   source={{ html: isolatePreviewHtml(htmlContent) }}
                   style={[styles.htmlWebView, { backgroundColor: c.paper }]}
+                  scrollEventThrottle={16}
+                  onScroll={(event) => handleDocumentScrollOffset(event.nativeEvent.contentOffset.y)}
                 />
               )}
             </View>
@@ -6054,6 +6363,7 @@ export default function PreviewScreen() {
                   colors={c}
                   topInset={docContentInset.top}
                   bottomInset={docContentInset.bottom}
+                  onScrollOffsetChange={handleDocumentScrollOffset}
                 />
               </Suspense>
             </Pressable>
@@ -6096,6 +6406,7 @@ export default function PreviewScreen() {
                   colors={c}
                   topInset={docContentInset.top}
                   bottomInset={docContentInset.bottom}
+                  onScrollOffsetChange={handleDocumentScrollOffset}
                 />
               </Suspense>
             </Pressable>
@@ -6183,7 +6494,7 @@ export default function PreviewScreen() {
           position the bottom bar below already uses successfully (proven
           visible over the very same PDF in every screenshot this pass). */}
       {!editMode && pageCounterLabel && (
-        <View style={[styles.pageCounterWrap, { top: insets.top + 58 }]} pointerEvents="none">
+        <View style={[styles.pageCounterWrap, { top: docChromeBottom }]} pointerEvents="none">
           <GlassCapsule scheme="dark" materialOverride={docMaterial} contentStyle={styles.pageCounterBody}>
             <Text style={[styles.pageCounterText, styles.mono, { color: docMaterial.label }]}>{pageCounterLabel}</Text>
           </GlassCapsule>
@@ -6266,6 +6577,11 @@ function PreviewOptionsPopover({
   onClose,
   top,
 }: PreviewOptionsPopoverProps) {
+  const { fontScale, height: windowHeight, width: windowWidth } = useWindowDimensions();
+  const largeText = fontScale >= 1.35;
+  const panelWidth = largeText ? Math.min(340, windowWidth - 32) : 282;
+  const panelMaxHeight = Math.max(160, windowHeight - top - 16);
+
   if (Platform.OS === 'android') {
     return (
       <BBActionSheet
@@ -6298,43 +6614,45 @@ function PreviewOptionsPopover({
         accessibilityRole="button"
         accessibilityLabel="Close file options"
       />
-      <View style={[styles.optionsPanel, { top }]}>
-        <Text style={styles.optionsTitle} numberOfLines={1}>
-          {filename}
-        </Text>
-        {actions.map((action, index) => {
-          const showDivider = index > 0 && (action.destructive || actions[index - 1]?.destructive);
-          return (
-            <View key={action.label}>
-              {showDivider ? <View style={styles.optionsDivider} /> : null}
-              <Pressable
-                onPress={() => runAction(action)}
-                style={({ pressed }) => [
-                  styles.optionsRow,
-                  pressed && styles.optionsRowPressed,
-                ]}
-                accessibilityRole="button"
-                accessibilityLabel={action.label}
-              >
-                <Ionicons
-                  name={action.icon}
-                  size={21}
-                  color={action.destructive ? '#FF6961' : 'rgba(255,255,255,0.92)'}
-                  style={styles.optionsIcon}
-                />
-                <Text
-                  style={[
-                    styles.optionsLabel,
-                    action.destructive && styles.optionsLabelDestructive,
+      <View style={[styles.optionsPanel, { top, width: panelWidth, maxHeight: panelMaxHeight }]}>
+        <ScrollView style={styles.optionsScroll} showsVerticalScrollIndicator={largeText}>
+          <Text style={styles.optionsTitle} numberOfLines={largeText ? undefined : 1}>
+            {filename}
+          </Text>
+          {actions.map((action, index) => {
+            const showDivider = index > 0 && (action.destructive || actions[index - 1]?.destructive);
+            return (
+              <View key={action.label}>
+                {showDivider ? <View style={styles.optionsDivider} /> : null}
+                <Pressable
+                  onPress={() => runAction(action)}
+                  style={({ pressed }) => [
+                    styles.optionsRow,
+                    pressed && styles.optionsRowPressed,
                   ]}
-                  numberOfLines={1}
+                  accessibilityRole="button"
+                  accessibilityLabel={action.label}
                 >
-                  {action.label}
-                </Text>
-              </Pressable>
-            </View>
-          );
-        })}
+                  <Ionicons
+                    name={action.icon}
+                    size={21}
+                    color={action.destructive ? '#FF6961' : 'rgba(255,255,255,0.92)'}
+                    style={styles.optionsIcon}
+                  />
+                  <Text
+                    style={[
+                      styles.optionsLabel,
+                      action.destructive && styles.optionsLabelDestructive,
+                    ]}
+                    numberOfLines={largeText ? undefined : 1}
+                  >
+                    {action.label}
+                  </Text>
+                </Pressable>
+              </View>
+            );
+          })}
+        </ScrollView>
       </View>
     </View>
   );
@@ -6473,6 +6791,8 @@ const styles = StyleSheet.create({
     color: 'rgba(240,238,233,0.40)',
     fontSize: 10,
     lineHeight: 13,
+    flexShrink: 1,
+    minWidth: 0,
   },
   // e2eBadgeWrap/e2eBadgeBody/e2eBadgeText: removed (preview redesign item
   // 3 — the "e2e" pill is retired; see the JSX removal notes in both
@@ -6484,6 +6804,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 4,
     marginTop: 2,
+  },
+  encSubRowLargeText: {
+    width: '100%',
+    justifyContent: 'center',
   },
   // Preview redesign item 6 — the floating page-counter pill. Position
   // DERIVED (top-right, under the bar) from the design's `.pgind` (right:
@@ -6543,6 +6867,7 @@ const styles = StyleSheet.create({
   viewOriginalPill: {
     position: 'absolute',
     alignSelf: 'center',
+    alignItems: 'center',
     paddingHorizontal: 14,
     paddingVertical: 8,
     borderRadius: 16,
@@ -6554,6 +6879,12 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 13,
     fontWeight: '600',
+  },
+  viewOriginalPillStatus: {
+    color: 'rgba(255,255,255,0.72)',
+    fontSize: 11,
+    fontWeight: '600',
+    marginBottom: 2,
   },
   // Forced colours: the pill only renders on the photo pager's dark ground.
   viewOriginalPillHighlight: {
@@ -6640,6 +6971,9 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 14 },
     elevation: 18,
   },
+  optionsScroll: {
+    flexGrow: 0,
+  },
   optionsTitle: {
     paddingHorizontal: 16,
     paddingTop: 7,
@@ -6654,6 +6988,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 16,
+    paddingVertical: 10,
     gap: 12,
   },
   optionsRowPressed: {

@@ -29,6 +29,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -85,6 +86,8 @@ function bytesToBase64(bytes: Uint8Array): string {
 export default function EncryptionProof({ file, fileName, mimeType, visible, onClose }: Props) {
   const { colors: c } = useTheme();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [cipher, setCipher] = useState<CipherPrefixState>(CLOSED_CIPHER_STATE);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
@@ -186,14 +189,27 @@ export default function EncryptionProof({ file, fileName, mimeType, visible, onC
       onRequestClose={onClose}
     >
       <View style={[styles.root, { backgroundColor: c.paper }]}>
-        <View style={[styles.header, { borderBottomColor: c.line }]}>
+        <View
+          style={[
+            styles.header,
+            accessibilityLayout && styles.headerAccessibility,
+            { borderBottomColor: c.line },
+          ]}
+        >
           <View style={{ flex: 1 }}>
             <Text style={[styles.title, { color: c.ink }]}>Prove it</Text>
-            <Text style={[styles.subtitle, { color: c.ink3 }]} numberOfLines={1}>
+            <Text
+              style={[styles.subtitle, { color: c.ink3 }]}
+              numberOfLines={accessibilityLayout ? undefined : 1}
+            >
               {fileName}
             </Text>
           </View>
-          <TouchableOpacity onPress={onClose} accessibilityLabel="Close" style={styles.closeBtn}>
+          <TouchableOpacity
+            onPress={onClose}
+            accessibilityLabel="Close"
+            style={[styles.closeBtn, accessibilityLayout && styles.closeBtnAccessibility]}
+          >
             <Ionicons name="close" size={22} color={c.ink2} />
           </TouchableOpacity>
         </View>
@@ -222,7 +238,7 @@ export default function EncryptionProof({ file, fileName, mimeType, visible, onC
           {bytes && !loading && (
             <>
               <View style={[styles.pane, { borderColor: c.line, backgroundColor: c.paper2 }]}>
-                <View style={styles.paneHeader}>
+                <View style={[styles.paneHeader, accessibilityLayout && styles.paneHeaderAccessibility]}>
                   <Ionicons name="eye-outline" size={14} color={c.ink2} />
                   <Text style={[styles.paneLabel, { color: c.ink2 }]}>What you see</Text>
                 </View>
@@ -246,7 +262,7 @@ export default function EncryptionProof({ file, fileName, mimeType, visible, onC
               </View>
 
               <View style={[styles.pane, { borderColor: c.amberDeep, backgroundColor: c.amberBg }]}>
-                <View style={styles.paneHeader}>
+                <View style={[styles.paneHeader, accessibilityLayout && styles.paneHeaderAccessibility]}>
                   <Ionicons name="server-outline" size={14} color={c.amberDeep} />
                   <Text style={[styles.paneLabel, { color: c.amberDeep }]}>What our server stores</Text>
                 </View>
@@ -268,7 +284,11 @@ export default function EncryptionProof({ file, fileName, mimeType, visible, onC
 
         <View style={[styles.footer, { backgroundColor: c.paper, borderTopColor: c.line, paddingBottom: bottomAnchorInset(insets.bottom, insets.bottom || spacing.md) }]}>
           <TouchableOpacity
-            style={[styles.downloadBtn, { backgroundColor: c.amber, opacity: downloading ? 0.6 : 1 }]}
+            style={[
+              styles.downloadBtn,
+              accessibilityLayout && styles.downloadBtnAccessibility,
+              { backgroundColor: c.amber, opacity: downloading ? 0.6 : 1 },
+            ]}
             onPress={handleDownload}
             disabled={downloading}
             accessibilityRole="button"
@@ -300,9 +320,11 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     gap: 8,
   },
+  headerAccessibility: { alignItems: 'flex-start' },
   title: { fontSize: 20, fontWeight: '700' },
   subtitle: { fontSize: 12, marginTop: 2 },
   closeBtn: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
+  closeBtnAccessibility: { width: 44, height: 44, borderRadius: 22 },
   scroll: { flex: 1 },
   scrollContent: { padding: spacing.lg, gap: spacing.md },
   lead: { fontSize: 13, lineHeight: 19 },
@@ -316,6 +338,7 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   paneHeader: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  paneHeaderAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   paneLabel: { fontSize: 11, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5 },
   paneNote: { fontSize: 11, lineHeight: 15 },
   paneSpinner: { alignSelf: 'flex-start', marginTop: 4 },
@@ -346,5 +369,6 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     gap: 8,
   },
+  downloadBtnAccessibility: { minHeight: 48, flexWrap: 'wrap', paddingHorizontal: spacing.sm },
   downloadBtnText: { fontSize: 14, fontWeight: '600' },
 });

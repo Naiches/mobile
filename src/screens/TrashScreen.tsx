@@ -7,6 +7,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Swipeable } from 'react-native-gesture-handler';
@@ -21,20 +22,43 @@ import { GlassCapsule, GlassCircle, SCROLL_EDGE, ScrollEdgeBlur, glassMaterial }
 import { useToast } from '../lib/toast-context';
 import { onFilesDeleted } from '../lib/delete-cascade';
 import {
-  listAllFiles,
+  listFilesPage,
   restoreFile,
   permanentDeleteFile,
+  permanentDeleteFiles,
   confirmDeviceOwnerAction,
   friendlyError,
 } from '../lib/api';
 import type { FileEntry } from '../lib/api';
-import { deleteTrashItems, trashDeleteError, trashDeletionMessage } from '../lib/trash-delete';
+import {
+  deleteTrashItems,
+  deleteTrashItemsInBatches,
+  emptyTrashProgressLabel,
+  goneTrashIds,
+  trashDeleteError,
+  trashDeletionMessage,
+  type EmptyTrashProgress,
+} from '../lib/trash-delete';
 import { requestDeviceOwnerAuth } from '../lib/device-owner-auth';
-import { removeFromFileProviderCache } from '../lib/file-provider-mount';
+import { removeFromFileProviderCache, syncDecryptedEntriesToFileProvider } from '../lib/file-provider-mount';
 import { useCrypto } from '../lib/crypto-context';
-import { encryptedMetadataPayloadToBytes } from '../lib/encrypted-metadata';
+import { useProtectedBackupsRootId } from '../lib/use-protected-backups-root';
 import { formatBytes as formatSize } from '../lib/format';
 import type { RootStackParamList } from '../App';
+import {
+  adjustTrashCount,
+  knownTrashParentMap,
+  notifyTrashChanged,
+  projectTopLevelTrashItems,
+  projectVisibleTopLevelTrashItems,
+  setTrashCount,
+} from '../lib/trash-count';
+import { paginateTrashInBackground } from '../lib/trash-pagination';
+import { revealOptimisticallyTrashed } from '../lib/trash-optimistic';
+import { useSync } from '../lib/sync-context';
+import { loadCachedFileIndex } from '../lib/file-index-cache';
+import { decryptNamesInBackground } from '../lib/background-name-decrypt';
+import { recordRuntimeTrace } from '../lib/runtime-trace';
 
 type Nav = NativeStackNavigationProp<RootStackParamList>;
 
@@ -76,19 +100,6 @@ function displayName(entry: FileEntry): string {
   return raw;
 }
 
-function parseDecryptedMetadata(plaintext: string): string {
-  try {
-    const metadata = JSON.parse(plaintext) as { name?: unknown };
-    if (metadata && typeof metadata === 'object' && typeof metadata.name === 'string') {
-      const name = metadata.name.trim();
-      if (name) return name;
-    }
-  } catch {
-    // Legacy metadata format: plaintext is the bare filename.
-  }
-  return plaintext || '';
-}
-
 // ---------------------------------------------------------------------------
 // Trash row (swipeable)
 // ---------------------------------------------------------------------------
@@ -102,6 +113,8 @@ interface TrashRowProps {
 
 const TrashRow = React.memo(function TrashRow({ item, decryptedName, onRestore, onDelete }: TrashRowProps) {
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const swipeableRef = useRef<Swipeable>(null);
   const badge = fileTypeBadge(item);
 
@@ -122,7 +135,7 @@ const TrashRow = React.memo(function TrashRow({ item, decryptedName, onRestore, 
   const renderRightActions = useCallback(() => (
     <View style={styles.swipeActions}>
       <TouchableOpacity
-        style={[styles.swipeAction, { backgroundColor: c.green }]}
+        style={[styles.swipeAction, accessibilityLayout && { width: Math.ceil(80 * Math.min(fontScale, 1.5)) }, { backgroundColor: c.green }]}
         activeOpacity={0.8}
         onPress={() => { swipeableRef.current?.close(); onRestore(item); }}
       >
@@ -130,7 +143,7 @@ const TrashRow = React.memo(function TrashRow({ item, decryptedName, onRestore, 
         <Text style={styles.swipeActionLabel}>Restore</Text>
       </TouchableOpacity>
       <TouchableOpacity
-        style={[styles.swipeAction, { backgroundColor: c.red }]}
+        style={[styles.swipeAction, accessibilityLayout && { width: Math.ceil(80 * Math.min(fontScale, 1.5)) }, { backgroundColor: c.red }]}
         activeOpacity={0.8}
         onPress={() => { swipeableRef.current?.close(); onDelete(item); }}
       >
@@ -138,7 +151,7 @@ const TrashRow = React.memo(function TrashRow({ item, decryptedName, onRestore, 
         <Text style={styles.swipeActionLabel}>Delete</Text>
       </TouchableOpacity>
     </View>
-  ), [c, item, onRestore, onDelete]);
+  ), [accessibilityLayout, c, fontScale, item, onRestore, onDelete]);
 
   return (
     <Swipeable
@@ -149,12 +162,12 @@ const TrashRow = React.memo(function TrashRow({ item, decryptedName, onRestore, 
       overshootRight={false}
       rightThreshold={40}
     >
-      <View style={[styles.row, { borderBottomColor: c.line, backgroundColor: c.paper }]}>
+      <View style={[styles.row, accessibilityLayout && { minHeight: Math.ceil(52 * Math.min(fontScale, 2)) }, { borderBottomColor: c.line, backgroundColor: c.paper }]}>
         <View style={[styles.rowIcon, { backgroundColor: badge.color }]}>
           <Ionicons name={badge.icon} size={16} color="#FFFFFF" />
         </View>
         <View style={styles.rowInfo}>
-          <Text style={[styles.rowName, { color: c.ink }]} numberOfLines={1}>
+          <Text style={[styles.rowName, { color: c.ink }]} numberOfLines={accessibilityLayout ? 3 : 1}>
             {decryptedName ?? displayName(item)}
           </Text>
           <Text style={[styles.rowMeta, { color: c.ink3 }]}>
@@ -181,68 +194,142 @@ export default function TrashScreen() {
   const { colors: c, resolved: themeScheme } = useTheme();
   const { showToast } = useToast();
 
-  const { isUnlocked, decryptMetadata } = useCrypto();
+  const { isUnlocked, decryptNames } = useCrypto();
+  const sync = useSync();
 
   const [files, setFiles] = useState<FileEntry[]>([]);
+  const [allTrashEntries, setAllTrashEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [listingComplete, setListingComplete] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
   const [decryptedNames, setDecryptedNames] = useState<Record<string, string>>({});
+  const [hiddenIds, setHiddenIds] = useState<string[]>([]);
+  const [emptyProgress, setEmptyProgress] = useState<EmptyTrashProgress | null>(null);
+  const fetchGeneration = useRef(0);
+  const backupsRootId = useProtectedBackupsRootId();
+  const cachedParentsRef = useRef(new Map<string, string | null>());
+  const [localParentVersion, setLocalParentVersion] = useState(0);
+  const getNodeById = sync.getNode;
+  const localParentOf = useCallback((id: string): string | null | undefined => {
+    const node = getNodeById(id);
+    if (node) return node.parent_id;
+    return cachedParentsRef.current.get(id);
+  }, [getNodeById]);
 
-  // Decrypt filenames once both the file list and the vault key are ready.
-  // Mirrors the FilesScreen pattern so trash rows show real names instead of
-  // the "Encrypted file" placeholder.
+  useEffect(() => {
+    let cancelled = false;
+    void loadCachedFileIndex().then((cached) => {
+      if (cancelled || !cached) return;
+      cachedParentsRef.current = knownTrashParentMap(cached.files);
+      setLocalParentVersion((version) => version + 1);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  // Rows paint first. Encrypted names then resolve in bounded batches, with a
+  // yield between batches so a large Trash cannot monopolize the JS thread.
   useEffect(() => {
     if (!isUnlocked) {
       setDecryptedNames({});
       return;
     }
     let cancelled = false;
-    (async () => {
+    void (async () => {
       const results: Record<string, string> = {};
-      await Promise.all(
-        files.map(async (file) => {
-          try {
-            const raw = file.name_encrypted ?? '';
-            if (!raw.startsWith('{')) return;
-            const payload = encryptedMetadataPayloadToBytes(raw);
-            if (!payload) return;
-            const plaintext = await decryptMetadata(file.id, payload.nonce, payload.ciphertext);
-            const name = parseDecryptedMetadata(plaintext);
-            if (name) results[file.id] = name;
-          } catch {
-            // Leave unset so displayName() renders the "Encrypted file" fallback.
-          }
-        }),
+      await decryptNamesInBackground(
+        allTrashEntries
+          .filter((file) => (file.name_encrypted ?? '').startsWith('{'))
+          .map((file) => ({ fileId: file.id, nameEncrypted: file.name_encrypted ?? '' })),
+        decryptNames,
+        (item, result) => { if (result.name) results[item.fileId] = result.name; },
+        () => cancelled,
       );
       if (!cancelled) setDecryptedNames(results);
     })();
     return () => { cancelled = true; };
-  }, [files, isUnlocked, decryptMetadata]);
+  }, [allTrashEntries, isUnlocked, decryptNames]);
 
   const nameFor = useCallback(
     (item: FileEntry) => decryptedNames[item.id] ?? displayName(item),
     [decryptedNames],
   );
 
+  const localTrashName = useCallback((entry: FileEntry): string | null => {
+    const raw = entry.name_encrypted ?? '';
+    if (!raw.startsWith('{')) return raw || null;
+    return decryptedNames[entry.id] ?? null;
+  }, [decryptedNames]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void backupsRootId;
+    void localParentVersion;
+    void sync.treeVersion;
+    void projectVisibleTopLevelTrashItems(allTrashEntries, localParentOf, localTrashName)
+      .then((projection) => {
+        if (cancelled) return;
+        const visible = [...projection.visible].sort(
+          (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+        );
+        setFiles(visible);
+        setHiddenIds(projection.hidden.map((entry) => entry.id));
+        setTrashCount(listingComplete ? projection.count : null);
+      });
+    return () => { cancelled = true; };
+  }, [allTrashEntries, backupsRootId, listingComplete, localParentOf, localParentVersion, localTrashName, sync.treeVersion]);
+
   const fetchTrash = useCallback(async (isRefresh = false) => {
+    const mine = ++fetchGeneration.current;
+    let paintedFirstPage = false;
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
     setError(null);
+    setPageError(null);
+    setListingComplete(false);
+    setTrashCount(null);
     try {
-      const result = await listAllFiles(undefined, { trashed: true });
-      result.sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
-      setFiles(result);
-    } catch (err) {
-      setError(friendlyError(err));
-    } finally {
+      const firstPage = await listFilesPage({ trashed: true });
+      if (mine !== fetchGeneration.current) return;
+      const firstProjection = projectTopLevelTrashItems(firstPage.files, localParentOf);
+      setAllTrashEntries(firstPage.files);
+      setFiles(firstProjection.topLevel);
+      paintedFirstPage = true;
+      setHiddenIds([]);
       setLoading(false);
       setRefreshing(false);
+      setLoadingMore(firstPage.next_cursor !== null);
+
+      const pagination = await paginateTrashInBackground({
+        initialItems: firstPage.files,
+        initialNextCursor: firstPage.next_cursor,
+        fetchPage: async (cursor) => {
+          const page = await listFilesPage({ trashed: true, cursor });
+          return { items: page.files, nextCursor: page.next_cursor };
+        },
+        onPage: setAllTrashEntries,
+        isCancelled: () => mine !== fetchGeneration.current,
+      });
+      if (!pagination.complete || mine !== fetchGeneration.current) return;
+      setListingComplete(true);
+    } catch (err) {
+      if (mine !== fetchGeneration.current) return;
+      if (paintedFirstPage) setPageError(friendlyError(err));
+      else setError(friendlyError(err));
+    } finally {
+      if (mine === fetchGeneration.current) {
+        setLoading(false);
+        setRefreshing(false);
+        setLoadingMore(false);
+      }
     }
-  }, []);
+  }, [localParentOf]);
 
   useEffect(() => {
-    fetchTrash();
+    void fetchTrash();
+    return () => { fetchGeneration.current += 1; };
   }, [fetchTrash]);
 
   const handleRestore = useCallback((item: FileEntry) => {
@@ -256,9 +343,26 @@ export default function TrashScreen() {
           text: 'Restore',
           onPress: async () => {
             try {
-              await restoreFile(item.id);
+              const result = await restoreFile(item.id);
+              if (!result.complete) {
+                notifyTrashChanged();
+                showToast({
+                  type: 'info',
+                  message: `Restore started for "${name}". It is finishing in the background.`,
+                });
+                void fetchTrash(true);
+                return;
+              }
               Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
               setFiles((prev) => prev.filter((f) => f.id !== item.id));
+              setAllTrashEntries((prev) => prev.filter((f) => f.id !== item.id));
+              revealOptimisticallyTrashed([item.id]);
+              void syncDecryptedEntriesToFileProvider(
+                [item],
+                { [item.id]: decryptedNames[item.id] ?? name },
+              );
+              adjustTrashCount(-1);
+              notifyTrashChanged();
               showToast({ type: 'success', message: `"${name}" restored to Drive` });
             } catch (err) {
               Alert.alert('Error', friendlyError(err));
@@ -267,7 +371,7 @@ export default function TrashScreen() {
         },
       ],
     );
-  }, [showToast, nameFor]);
+  }, [decryptedNames, fetchTrash, showToast, nameFor]);
 
   const handleDelete = useCallback((item: FileEntry) => {
     const name = nameFor(item);
@@ -291,12 +395,19 @@ export default function TrashScreen() {
                 method: auth.method,
               });
               Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-              await permanentDeleteFile(item.id, confirmation_token);
+              const result = await deleteTrashItems(
+                [item.id],
+                id => permanentDeleteFile(id, confirmation_token),
+              );
+              if (result.failedIds.length > 0) throw result.error;
               setFiles((prev) => prev.filter((f) => f.id !== item.id));
+              setAllTrashEntries((prev) => prev.filter((f) => f.id !== item.id));
               void removeFromFileProviderCache([item.id]);
               // 0818 — final cleanup across derived stores (idempotent; descendants
               // were already cascaded at trash time).
-              void onFilesDeleted([item.id]);
+              void onFilesDeleted([item.id], { kind: 'permanent' });
+              adjustTrashCount(-1);
+              notifyTrashChanged();
               showToast({ type: 'info', message: `"${name}" permanently deleted` });
             } catch (err) {
               Alert.alert('Error', trashDeleteError(err));
@@ -308,8 +419,12 @@ export default function TrashScreen() {
   }, [showToast, nameFor]);
 
   const handleEmptyTrash = useCallback(() => {
-    if (files.length === 0) return;
+    if (files.length === 0 || !listingComplete) return;
     const items = files;
+    const visibleIds = new Set(items.map((file) => file.id));
+    // Hidden manifest copies go with it: the user's confirmation below covers them, and they
+    // are internal leftovers nobody could want back.
+    const idsToDelete = [...new Set([...visibleIds, ...hiddenIds])];
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     Alert.alert(
       'Empty Trash',
@@ -327,35 +442,49 @@ export default function TrashScreen() {
             }
             try {
               Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-              const result = await deleteTrashItems(items.map(file => file.id), async id => {
+              setEmptyProgress({ kind: 'indeterminate', total: idsToDelete.length });
+              const result = await deleteTrashItemsInBatches(idsToDelete, async batch => {
                 const { confirmation_token } = await confirmDeviceOwnerAction({
                   platform: auth.platform,
                   method: auth.method,
                 });
-                await permanentDeleteFile(id, confirmation_token);
-              });
-              const deleted = new Set(result.deletedIds);
-              setFiles(prev => prev.filter(file => !deleted.has(file.id)));
-              if (result.deletedIds.length > 0) {
-                void removeFromFileProviderCache(result.deletedIds);
-                void onFilesDeleted(result.deletedIds);
+                return permanentDeleteFiles(batch, confirmation_token);
+              }, progress => {
+                setEmptyProgress(progress);
+                if (progress.kind === 'determinate') {
+                  const goneIds = [...(progress.deletedIds ?? []), ...(progress.missingIds ?? [])];
+                  if (goneIds.length === 0) return;
+                  const gone = new Set(goneIds);
+                  setFiles(prev => prev.filter(file => !gone.has(file.id)));
+                  setAllTrashEntries(prev => prev.filter(file => !gone.has(file.id)));
+                  const visibleGone = goneIds.filter(id => visibleIds.has(id)).length;
+                  if (visibleGone > 0) adjustTrashCount(-visibleGone);
+                }
+              }, recordRuntimeTrace);
+              const goneIds = goneTrashIds(result);
+              if (goneIds.length > 0) {
+                void removeFromFileProviderCache(goneIds);
+                void onFilesDeleted(goneIds, { kind: 'permanent' });
               }
               showToast({
-                type: result.error ? 'error' : result.liveFolders || result.noLongerTrashed ? 'info' : 'success',
+                type: result.failedIds.length > 0 ? 'error' : 'success',
                 message: trashDeletionMessage(result),
               });
-              if (result.error || result.liveFolders || result.noLongerTrashed) void fetchTrash(true);
+              notifyTrashChanged();
+              if (result.failedIds.length > 0) void fetchTrash(true);
             } catch (err) {
               Alert.alert('Error', friendlyError(err));
               // Mid-loop failure: some rows are already server-deleted but the
               // optimistic removal below never ran — reconcile from the server.
               void fetchTrash(true);
+            } finally {
+              setEmptyProgress(null);
             }
           },
         },
       ],
     );
-  }, [files, showToast, fetchTrash]);
+  }, [files, hiddenIds, listingComplete, showToast, fetchTrash]);
 
   const renderItem = useCallback(({ item }: { item: FileEntry }) => (
     <TrashRow
@@ -367,7 +496,7 @@ export default function TrashScreen() {
   ), [decryptedNames, handleRestore, handleDelete]);
 
   const renderEmpty = () => {
-    if (loading) return null;
+    if (loading || loadingMore || emptyProgress) return null;
     return (
       <View style={styles.emptyContainer}>
         <Ionicons name="trash-outline" size={48} color={c.ink4} style={{ marginBottom: 12, opacity: 0.5 }} />
@@ -411,7 +540,7 @@ export default function TrashScreen() {
         </TouchableOpacity>
         <Text style={[styles.title, { color: c.ink }]}>Trash</Text>
         <View style={{ flex: 1 }} />
-        {files.length > 0 && (
+        {files.length > 0 && listingComplete && (
           // 1342 — LIFTED VERBATIM from Trash.dc.html:82: a glass capsule,
           // height 42, radius 999, padding "0 18px", 15/600 red text — was a
           // bare Text touchable with no fill/border/glass at all. Colour
@@ -419,12 +548,13 @@ export default function TrashScreen() {
           // matching FilesScreen's literal-destructive-red precedent (1341).
           <TouchableOpacity
             onPress={handleEmptyTrash}
+            disabled={emptyProgress !== null || loadingMore}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
             accessibilityRole="button"
             accessibilityLabel="Empty trash"
           >
-            <GlassCapsule scheme={themeScheme} contentStyle={styles.emptyTrashBody}>
-              <Text style={[styles.emptyTrashBtn, { color: c.red }]}>Empty</Text>
+            <GlassCapsule scheme={themeScheme} contentStyle={[styles.emptyTrashBody, emptyProgress ? styles.emptyTrashDisabled : undefined]}>
+              {emptyProgress ? <ActivityIndicator size="small" color={c.red} /> : <Text style={[styles.emptyTrashBtn, { color: c.red }]}>Empty</Text>}
             </GlassCapsule>
           </TouchableOpacity>
         )}
@@ -458,13 +588,42 @@ export default function TrashScreen() {
           // above the header, under the window controls, on an iPad (compat
           // mode, iPadOS 27).
           ListHeaderComponent={
-            files.length > 0 ? (
-              <View style={[styles.hintBanner, { backgroundColor: c.paper2, borderBottomColor: c.line }]}>
-                <Text style={[styles.hintText, { color: c.ink3 }]}>
-                  Swipe left to restore or permanently delete
-                </Text>
-              </View>
-            ) : null
+            <View>
+              {emptyProgress ? (
+                <View
+                  style={[styles.progressBanner, { backgroundColor: c.amberBg, borderBottomColor: c.line }]}
+                  accessibilityLiveRegion="polite"
+                  accessibilityLabel={emptyTrashProgressLabel(emptyProgress)}
+                >
+                  <ActivityIndicator size="small" color={c.amberDeep} />
+                  <Text style={[styles.progressText, { color: c.ink }]}>{emptyTrashProgressLabel(emptyProgress)}</Text>
+                </View>
+              ) : null}
+              {loadingMore ? (
+                <View
+                  style={[styles.progressBanner, { backgroundColor: c.paper2, borderBottomColor: c.line }]}
+                  accessibilityLiveRegion="polite"
+                >
+                  <ActivityIndicator size="small" color={c.amberDeep} />
+                  <Text style={[styles.progressText, { color: c.ink }]}>Loading more items…</Text>
+                </View>
+              ) : null}
+              {pageError ? (
+                <View style={[styles.pageErrorBanner, { backgroundColor: c.paper2, borderBottomColor: c.line }]}>
+                  <Text style={[styles.pageErrorText, { color: c.red }]}>{pageError}</Text>
+                  <TouchableOpacity onPress={() => fetchTrash(true)} accessibilityRole="button">
+                    <Text style={[styles.pageRetryText, { color: c.amberDeep }]}>Retry</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : null}
+              {files.length > 0 ? (
+                <View style={[styles.hintBanner, { backgroundColor: c.paper2, borderBottomColor: c.line }]}>
+                  <Text style={[styles.hintText, { color: c.ink3 }]}>
+                    Swipe left to restore or permanently delete
+                  </Text>
+                </View>
+              ) : null}
+            </View>
           }
           refreshControl={
             <RefreshControl
@@ -511,8 +670,29 @@ const styles = StyleSheet.create({
   // from GLASS_RADII.capsule); this is the fixed 42pt height + "0 18px"
   // padding lifted verbatim from Trash.dc.html:82. fontSize 15/600 also
   // lifted (was 14/600, an app-default size with no canvas backing).
-  emptyTrashBody: { height: 42, paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
+  emptyTrashBody: { minHeight: 42, paddingHorizontal: 18, paddingVertical: 10, alignItems: 'center', justifyContent: 'center' },
+  emptyTrashDisabled: { opacity: 0.65 },
   emptyTrashBtn: { fontSize: 15, fontWeight: '600' },
+
+  progressBanner: {
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: spacing.lg,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  progressText: { fontSize: 13, fontWeight: '600', fontVariant: ['tabular-nums'] },
+  pageErrorBanner: {
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: spacing.lg,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  pageErrorText: { flex: 1, fontSize: 12 },
+  pageRetryText: { fontSize: 13, fontWeight: '700' },
 
   hintBanner: {
     paddingHorizontal: spacing.lg,

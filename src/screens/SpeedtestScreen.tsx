@@ -11,6 +11,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -301,7 +302,7 @@ function MetricPanel({
         </View>
         <View style={meterStyles.titleBlock}>
           <Text style={[meterStyles.title, { color: c.ink }]}>{phaseTitle(phase)}</Text>
-          <Text style={[meterStyles.caption, { color: c.ink2 }]} numberOfLines={2}>
+          <Text style={[meterStyles.caption, { color: c.ink2 }]}>
             {phaseCaption(phase, statusText)}
           </Text>
         </View>
@@ -309,6 +310,7 @@ function MetricPanel({
 
       <View style={meterStyles.readoutRow}>
         <Text
+          maxFontSizeMultiplier={1.5}
           style={[
             meterStyles.value,
             {
@@ -384,6 +386,7 @@ const meterStyles = StyleSheet.create({
   readoutRow: {
     flexDirection: 'row',
     alignItems: 'flex-end',
+    flexWrap: 'wrap',
     marginTop: 22,
   },
   value: {
@@ -409,6 +412,8 @@ const meterStyles = StyleSheet.create({
   },
   scaleRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 4,
     justifyContent: 'space-between',
     marginTop: 8,
   },
@@ -435,6 +440,8 @@ function BenchmarkGrid({
   results: Results | null;
   c: C;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const latencyValue = phase === 'latency' && currentSpeed !== '--'
     ? currentSpeed
     : liveLatencyMs !== null
@@ -498,12 +505,13 @@ function BenchmarkGrid({
   ];
 
   return (
-    <View style={gridStyles.container}>
+    <View style={[gridStyles.container, accessibilityLayout && gridStyles.containerAccessibility]}>
       {items.map((item) => (
         <View
           key={item.label}
           style={[
             gridStyles.tile,
+            accessibilityLayout && gridStyles.tileAccessibility,
             {
               backgroundColor: item.active ? c.amberBg : c.paper,
               borderColor: item.active ? c.amber : c.line,
@@ -514,7 +522,7 @@ function BenchmarkGrid({
             <Ionicons name={item.icon} size={16} color={item.active ? c.amberDeep : c.ink3} />
             <Text style={[gridStyles.tileLabel, { color: c.ink3 }]}>{item.label}</Text>
           </View>
-          <View style={gridStyles.tileValueRow}>
+          <View style={[gridStyles.tileValueRow, accessibilityLayout && gridStyles.tileValueRowAccessibility]}>
             <Text style={[gridStyles.tileValue, { color: c.ink, fontFamily: fonts.mono }]}>
               {item.value}
             </Text>
@@ -535,6 +543,7 @@ const gridStyles = StyleSheet.create({
     gap: 10,
     marginBottom: spacing.md,
   },
+  containerAccessibility: { flexDirection: 'column' },
   tile: {
     width: '48.6%',
     borderWidth: 1,
@@ -542,6 +551,7 @@ const gridStyles = StyleSheet.create({
     padding: 13,
     minHeight: 96,
   },
+  tileAccessibility: { width: '100%' },
   tileHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -556,6 +566,7 @@ const gridStyles = StyleSheet.create({
     alignItems: 'flex-end',
     marginTop: 15,
   },
+  tileValueRowAccessibility: { flexWrap: 'wrap' },
   tileValue: {
     fontSize: 27,
     fontWeight: '800',
@@ -660,6 +671,8 @@ function PhaseStepper({
   currentPhase: Phase;
   c: C;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const getPhaseState = (phase: PhaseInfo): 'pending' | 'active' | 'completed' => {
     if (currentPhase === 'idle') return 'pending';
     if (currentPhase === 'done') return 'completed';
@@ -674,7 +687,7 @@ function PhaseStepper({
   };
 
   return (
-    <View style={stepperStyles.container}>
+    <View style={[stepperStyles.container, accessibilityLayout && stepperStyles.containerAccessibility]}>
       {PHASES.map((phase, index) => {
         const state = getPhaseState(phase);
         const dotColor =
@@ -687,7 +700,7 @@ function PhaseStepper({
           c.ink4;
 
         return (
-          <View key={phase.key} style={stepperStyles.step}>
+          <View key={phase.key} style={[stepperStyles.step, accessibilityLayout && stepperStyles.stepAccessibility]}>
             <View style={[stepperStyles.dot, { backgroundColor: dotColor }]} />
             <Text style={[stepperStyles.label, { color: textColor }]}>
               {phase.label}
@@ -696,6 +709,7 @@ function PhaseStepper({
               <View
                 style={[
                   stepperStyles.connector,
+                  accessibilityLayout && stepperStyles.connectorAccessibility,
                   { backgroundColor: state === 'completed' ? c.green : c.line },
                 ]}
               />
@@ -715,10 +729,12 @@ const stepperStyles = StyleSheet.create({
     paddingHorizontal: spacing.lg,
     marginBottom: spacing.lg,
   },
+  containerAccessibility: { flexDirection: 'column', alignItems: 'stretch' },
   step: {
     flexDirection: 'row',
     alignItems: 'center',
   },
+  stepAccessibility: { width: '100%', paddingVertical: 4 },
   dot: {
     width: 8,
     height: 8,
@@ -734,6 +750,7 @@ const stepperStyles = StyleSheet.create({
     height: 1,
     marginHorizontal: 6,
   },
+  connectorAccessibility: { flex: 1, width: undefined },
 });
 
 // ---------------------------------------------------------------------------
@@ -747,24 +764,26 @@ function ConnectionBreakdown({
   info: ConnectionInfo;
   c: C;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   return (
     <View style={[breakdownStyles.card, { backgroundColor: c.paper, borderColor: c.line }]}>
       <Text style={[breakdownStyles.title, { color: c.ink3 }]}>Connection</Text>
-      <View style={breakdownStyles.row}>
+      <View style={[breakdownStyles.row, accessibilityLayout && breakdownStyles.rowAccessibility]}>
         <Text style={[breakdownStyles.label, { color: c.ink3 }]}>Server</Text>
-        <Text style={[breakdownStyles.value, { color: c.ink }]}>{info.server}</Text>
+        <Text style={[breakdownStyles.value, accessibilityLayout && breakdownStyles.valueAccessibility, { color: c.ink }]}>{info.server}</Text>
       </View>
       <View style={[breakdownStyles.separator, { backgroundColor: c.line }]} />
-      <View style={breakdownStyles.row}>
+      <View style={[breakdownStyles.row, accessibilityLayout && breakdownStyles.rowAccessibility]}>
         <Text style={[breakdownStyles.label, { color: c.ink3 }]}>Latency</Text>
-        <Text style={[breakdownStyles.value, { color: c.ink, fontFamily: fonts.mono }]}>
+        <Text style={[breakdownStyles.value, accessibilityLayout && breakdownStyles.valueAccessibility, { color: c.ink, fontFamily: fonts.mono }]}>
           {formatMs(info.latencyAvg)} ms ({formatMs(info.latencyMin)}-{formatMs(info.latencyMax)})
         </Text>
       </View>
       <View style={[breakdownStyles.separator, { backgroundColor: c.line }]} />
-      <View style={breakdownStyles.row}>
+      <View style={[breakdownStyles.row, accessibilityLayout && breakdownStyles.rowAccessibility]}>
         <Text style={[breakdownStyles.label, { color: c.ink3 }]}>Jitter</Text>
-        <Text style={[breakdownStyles.value, { color: c.ink, fontFamily: fonts.mono }]}>
+        <Text style={[breakdownStyles.value, accessibilityLayout && breakdownStyles.valueAccessibility, { color: c.ink, fontFamily: fonts.mono }]}>
           {formatMs(info.jitter)} ms
         </Text>
       </View>
@@ -792,6 +811,7 @@ const breakdownStyles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: 6,
   },
+  rowAccessibility: { flexDirection: 'column', alignItems: 'flex-start', gap: 4 },
   label: {
     fontSize: 13,
   },
@@ -799,6 +819,7 @@ const breakdownStyles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '500',
   },
+  valueAccessibility: { alignSelf: 'stretch' },
   separator: {
     height: StyleSheet.hairlineWidth,
   },
@@ -815,6 +836,8 @@ function ResultsSummary({
   results: Results;
   c: C;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const items = [
     {
       icon: 'arrow-down' as const,
@@ -838,9 +861,9 @@ function ResultsSummary({
 
   return (
     <View style={[summaryStyles.card, { backgroundColor: c.paper, borderColor: c.line }]}>
-      <View style={summaryStyles.row}>
+      <View style={[summaryStyles.row, accessibilityLayout && summaryStyles.rowAccessibility]}>
         {items.map((item, i) => (
-          <View key={item.label} style={summaryStyles.item}>
+          <View key={item.label} style={[summaryStyles.item, accessibilityLayout && summaryStyles.itemAccessibility]}>
             <View style={summaryStyles.iconRow}>
               <Ionicons name={item.icon} size={14} color={c.amber} />
               <Text
@@ -858,6 +881,7 @@ function ResultsSummary({
               <View
                 style={[
                   summaryStyles.divider,
+                  accessibilityLayout && summaryStyles.dividerAccessibility,
                   { backgroundColor: c.line },
                 ]}
               />
@@ -913,11 +937,13 @@ const summaryStyles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-around',
   },
+  rowAccessibility: { flexDirection: 'column', gap: 8 },
   item: {
     flex: 1,
     alignItems: 'center',
     position: 'relative',
   },
+  itemAccessibility: { flex: 0, width: '100%', paddingVertical: 6 },
   iconRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -943,6 +969,15 @@ const summaryStyles = StyleSheet.create({
     top: 4,
     bottom: 4,
     width: StyleSheet.hairlineWidth,
+  },
+  dividerAccessibility: {
+    position: 'relative',
+    right: undefined,
+    top: undefined,
+    bottom: undefined,
+    width: '100%',
+    height: StyleSheet.hairlineWidth,
+    marginTop: 12,
   },
   note: {
     fontSize: 11,
@@ -981,12 +1016,14 @@ function LatencyDots({
   pings: number[];
   c: C;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   return (
-    <View style={latencyStyles.container}>
+    <View style={[latencyStyles.container, accessibilityLayout && latencyStyles.containerAccessibility]}>
       {Array.from({ length: 5 }).map((_, i) => {
         const hasPing = i < pings.length;
         return (
-          <View key={i} style={latencyStyles.pingItem}>
+          <View key={i} style={[latencyStyles.pingItem, accessibilityLayout && latencyStyles.pingItemAccessibility]}>
             <View
               style={[
                 latencyStyles.dot,
@@ -1014,10 +1051,12 @@ const latencyStyles = StyleSheet.create({
     gap: 16,
     marginBottom: spacing.lg,
   },
+  containerAccessibility: { flexWrap: 'wrap' },
   pingItem: {
     alignItems: 'center',
     gap: 4,
   },
+  pingItemAccessibility: { flexBasis: '25%' },
   dot: {
     width: 10,
     height: 10,
@@ -1628,7 +1667,9 @@ const s = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    height: 48,
+    minHeight: 48,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
     borderRadius: 10,
     marginTop: spacing.lg,
   },
@@ -1640,7 +1681,9 @@ const s = StyleSheet.create({
     alignItems: 'center',
     borderRadius: 10,
     borderWidth: 1,
-    height: 44,
+    minHeight: 44,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
     justifyContent: 'center',
     marginTop: spacing.sm,
   },

@@ -15,6 +15,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -40,6 +41,8 @@ import { useAccountState } from '../lib/account-state-context';
 import { AccountStatusCard } from '../components/onboarding/AccountStatusCard';
 import { useAuth } from '../lib/auth';
 import { photoPreviewStorageLine } from '../lib/photo-preview-copy';
+import { StorageBreakdownCard } from '../components/StorageBreakdownCard';
+import { useStorageBreakdown } from '../lib/use-storage-breakdown';
 
 type C = Colors;
 
@@ -102,6 +105,8 @@ function Divider({ c }: { c: C }) {
 function StorageUsageCard({
   usage, readOnly, chip, c,
 }: { usage: StorageUsage; readOnly: boolean; chip: PlanCardView | null; c: C }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   // plan_limit_bytes <= 0 is the "no fixed cap" sentinel (e.g. enterprise);
   // never render it as a byte value ("-1 B") and don't show a denominator/%.
   // Task 1037: a needs_plan / lapsed account also reports quota 0, but that
@@ -119,7 +124,14 @@ function StorageUsageCard({
   return (
     <View style={{ padding: 14, gap: 10 }}>
       {/* Labels row */}
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' }}>
+      <View
+        style={{
+          flexDirection: accessibilityLayout ? 'column' : 'row',
+          justifyContent: 'space-between',
+          alignItems: accessibilityLayout ? 'flex-start' : 'baseline',
+          gap: accessibilityLayout ? 4 : 0,
+        }}
+      >
         <Text style={{ fontSize: 15, fontWeight: '600', color: c.ink }}>
           {formatBytes(usage.used_bytes)} used
         </Text>
@@ -144,13 +156,13 @@ function StorageUsageCard({
 
       {/* Warning note */}
       {isWarning && (
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+        <View style={{ flexDirection: 'row', alignItems: accessibilityLayout ? 'flex-start' : 'center', gap: 6 }}>
           <Ionicons
             name={isFull ? 'warning' : 'information-circle-outline'}
             size={13}
             color={isFull ? c.red : c.amberDeep}
           />
-          <Text style={{ fontSize: 12, color: isFull ? c.red : c.amberDeep }}>
+          <Text style={{ flex: 1, fontSize: 12, color: isFull ? c.red : c.amberDeep }}>
             {isFull
               ? 'Storage full — uploads are paused'
               : `${Math.round(pct * 100)}% used`}
@@ -159,9 +171,12 @@ function StorageUsageCard({
       )}
 
       {readOnly && (
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }} testID="storage-read-only-note">
+        <View
+          style={{ flexDirection: 'row', alignItems: accessibilityLayout ? 'flex-start' : 'center', gap: 6 }}
+          testID="storage-read-only-note"
+        >
           <Ionicons name="lock-closed-outline" size={13} color={c.amberDeep} />
-          <Text style={{ fontSize: 12, color: c.amberDeep }}>Read-only · uploads are off</Text>
+          <Text style={{ flex: 1, fontSize: 12, color: c.amberDeep }}>Read-only · uploads are off</Text>
         </View>
       )}
 
@@ -228,6 +243,8 @@ export default function StorageScreen() {
   // Storage usage is derived from the subscription payload (used_bytes +
   // quota_bytes are embedded there), so there is no separate usage round-trip.
   const usage = usageFromSubscription(subscription);
+  // What uses the space, worked out on this phone from the decrypted index.
+  const breakdown = useStorageBreakdown(usage?.used_bytes ?? null);
   // Task 1037/1605: needs_plan / lapsed / a never-paid trial cancelled
   // before its first charge. Missing account_state (older server) is ok.
   const readOnly = accountDocument ? uploadsBlocked(accountGate) : uploadsBlocked(accountGateFor(subscription));
@@ -345,6 +362,13 @@ export default function StorageScreen() {
               </Text>
             ) : null}
           </View>
+
+          {breakdown && usage ? (
+            <View style={layout.section}>
+              <SectionHeader title="What uses your storage" c={c} />
+              <StorageBreakdownCard breakdown={breakdown} totalBytes={usage.used_bytes} c={c} />
+            </View>
+          ) : null}
 
           {/* Task 1746: the account's state in words, from the server's onboarding
               document. Status only: nothing here is tappable (task 1400). */}

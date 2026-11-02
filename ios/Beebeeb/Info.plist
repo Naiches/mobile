@@ -88,6 +88,8 @@
 	<string>Beebeeb saves downloaded photos to your library.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Beebeeb backs up your photos with end-to-end encryption.</string>
+	<key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
+	<true/>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>NSUserActivityTypes</key>

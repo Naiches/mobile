@@ -59,6 +59,44 @@ describe('collectPaged — keyset pagination loop (0739/0755)', () => {
     const { fetchPage } = pagedSource([[]]);
     expect(await collectPaged(fetchPage, 1000)).toEqual([]);
   });
+
+  test('stops before fetching a cursor that has already been visited', async () => {
+    const calls: (string | undefined)[] = [];
+    const fetchPage = async (cursor?: string) => {
+      calls.push(cursor);
+      return cursor === undefined
+        ? { items: [1], nextCursor: 'stuck' }
+        : { items: [2], nextCursor: 'stuck' };
+    };
+
+    expect(await collectPaged(fetchPage, 1000)).toEqual([1, 2]);
+    expect(calls).toEqual([undefined, 'stuck']);
+  });
+
+  test('stops when an empty page advertises another cursor but makes no progress', async () => {
+    const calls: (string | undefined)[] = [];
+    const fetchPage = async (cursor?: string) => {
+      calls.push(cursor);
+      if (cursor === undefined) return { items: [1], nextCursor: 'empty' };
+      if (cursor === 'empty') return { items: [], nextCursor: 'later' };
+      return { items: [99], nextCursor: null };
+    };
+
+    expect(await collectPaged(fetchPage, 1000)).toEqual([1]);
+    expect(calls).toEqual([undefined, 'empty']);
+  });
+
+  test('stops at the maximum page count even when cursors stay unique', async () => {
+    const calls: (string | undefined)[] = [];
+    const fetchPage = async (cursor?: string) => {
+      calls.push(cursor);
+      const page = cursor === undefined ? 0 : Number(cursor);
+      return { items: [page], nextCursor: page < 4 ? String(page + 1) : null };
+    };
+
+    expect(await collectPaged(fetchPage, 1000, 'testCollectPaged', 3)).toEqual([0, 1, 2]);
+    expect(calls).toEqual([undefined, '1', '2']);
+  });
 });
 
 describe('findInPages — early-exit lookup across pages (0755)', () => {
@@ -97,5 +135,43 @@ describe('findInPages — early-exit lookup across pages (0755)', () => {
     expect(found).toBeUndefined();
     // 1 item per page × cap of 10 ⇒ stops after scanning 10 items (10 fetches).
     expect(calls).toBe(10);
+  });
+
+  test('stops before fetching a cursor that has already been visited', async () => {
+    const calls: (string | undefined)[] = [];
+    const fetchPage = async (cursor?: string) => {
+      calls.push(cursor);
+      return cursor === undefined
+        ? { items: [1], nextCursor: 'stuck' }
+        : { items: [2], nextCursor: 'stuck' };
+    };
+
+    expect(await findInPages(fetchPage, () => false)).toBeUndefined();
+    expect(calls).toEqual([undefined, 'stuck']);
+  });
+
+  test('stops when an empty page advertises another cursor but makes no progress', async () => {
+    const calls: (string | undefined)[] = [];
+    const fetchPage = async (cursor?: string) => {
+      calls.push(cursor);
+      if (cursor === undefined) return { items: [1], nextCursor: 'empty' };
+      if (cursor === 'empty') return { items: [], nextCursor: 'later' };
+      return { items: [99], nextCursor: null };
+    };
+
+    expect(await findInPages(fetchPage, (item) => item === 99)).toBeUndefined();
+    expect(calls).toEqual([undefined, 'empty']);
+  });
+
+  test('stops at the maximum page count even when cursors stay unique', async () => {
+    const calls: (string | undefined)[] = [];
+    const fetchPage = async (cursor?: string) => {
+      calls.push(cursor);
+      const page = cursor === undefined ? 0 : Number(cursor);
+      return { items: [page], nextCursor: page < 4 ? String(page + 1) : null };
+    };
+
+    expect(await findInPages(fetchPage, (item) => item === 4, 50_000, 3)).toBeUndefined();
+    expect(calls).toEqual([undefined, '1', '2']);
   });
 });

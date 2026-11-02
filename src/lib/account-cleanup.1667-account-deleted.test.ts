@@ -125,13 +125,13 @@ beforeEach(() => {
 });
 
 describe('(c) wiring guards: every account-deletion purge passes mode account-deleted', () => {
-  test('DeleteAccountScreen purges with mode account-deleted and the signed-in account id', () => {
+  test('DeleteAccountScreen only requests the email: it purges and signs out nothing (the deletion happens later, via the emailed link)', () => {
     const src = read('src/screens/DeleteAccountScreen.tsx');
-    expect(src).toMatch(/purgeAllPlaintextCaches\(\{\s*mode:\s*'account-deleted',\s*accountId:\s*deletedAccountId\s*\}\)/);
-    expect(src).toMatch(/const deletedAccountId = user\?\.user_id \?\? null;/);
-    expect(src).toMatch(/const \{ user, signOut \} = useAuth\(\);/);
-    // The purge is a lambda now; passing the bare function runs a sign-out purge.
-    expect(src).not.toMatch(/purge:\s*purgeAllPlaintextCaches\s*[,}]/);
+    // Deletion now starts from an emailed link, so the screen must not wipe
+    // local data or sign out. The deletion purge runs from the account-deleted
+    // handler in App.tsx (next test) when the server reports the account gone.
+    expect(src).not.toMatch(/purgeAllPlaintextCaches|purgeThenSignOut|signOut/);
+    expect(src).toContain('requestAccountDeletion(');
   });
 
   test('App.tsx: deleted elsewhere is a deletion, the next session clears it, no mark flush after one', () => {

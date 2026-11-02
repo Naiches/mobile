@@ -6,7 +6,7 @@
  * a call while one runs joins that run instead of starting a second purge.
  */
 import { describe, expect, test } from 'bun:test';
-import { singleFlight } from './single-flight';
+import { keyedSingleFlight, singleFlight } from './single-flight';
 
 function deferred<T = void>() {
   let resolve!: (v: T) => void;
@@ -62,5 +62,31 @@ describe('singleFlight', () => {
   test('a synchronous throw is a rejected run, not an exception at the call site', async () => {
     const once = singleFlight((() => { throw new Error('sync'); }) as () => Promise<void>);
     await expect(once()).rejects.toThrow('sync');
+  });
+});
+
+describe('keyedSingleFlight', () => {
+  test('two rapid opens of one file navigate once while different files remain independent', async () => {
+    const gates = new Map([
+      ['a', deferred<void>()],
+      ['b', deferred<void>()],
+    ]);
+    const opened: string[] = [];
+    const open = keyedSingleFlight(async (id: string) => {
+      await gates.get(id)!.promise;
+      opened.push(id);
+      return id;
+    });
+
+    const a1 = open('a');
+    const a2 = open('a');
+    const b = open('b');
+    expect(a2).toBe(a1);
+    expect(b).not.toBe(a1);
+
+    gates.get('a')!.resolve();
+    gates.get('b')!.resolve();
+    await Promise.all([a1, a2, b]);
+    expect(opened).toEqual(['a', 'b']);
   });
 });

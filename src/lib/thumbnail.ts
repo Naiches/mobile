@@ -566,6 +566,13 @@ export async function ensureThumbnailForImage(
 const thumbCache = new Map<string, string>();
 const repairInflight = new Map<string, Promise<boolean>>();
 
+/** Drop every in-memory thumbnail-URI entry (the files stay on disk and are found again on demand). */
+export function trimThumbMemoryCache(): number {
+  const dropped = thumbCache.size;
+  thumbCache.clear();
+  return dropped;
+}
+
 /**
  * Drop the in-memory thumbnail-URI cache entry for `fileId`. Used by the
  * thumbnail repair worker and the local-identifier-map refresh path: after

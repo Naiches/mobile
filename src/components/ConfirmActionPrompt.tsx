@@ -33,6 +33,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -53,6 +54,8 @@ interface Pending extends ConfirmPromptRequest {
 
 export default function ConfirmActionPrompt() {
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   const [pending, setPending] = useState<Pending | null>(null);
   const [mounted, setMounted] = useState(false);
@@ -196,10 +199,14 @@ export default function ConfirmActionPrompt() {
               />
             ) : null}
 
-            <View style={styles.actions}>
+            <View style={[styles.actions, accessibilityLayout && styles.actionsAccessibility]}>
               {phase === 'fatal' ? (
                 <TouchableOpacity
-                  style={[styles.primary, { backgroundColor: c.amber }]}
+                  style={[
+                    styles.primary,
+                    accessibilityLayout && styles.actionAccessibility,
+                    { backgroundColor: c.amber },
+                  ]}
                   onPress={cancel}
                   accessibilityRole="button"
                   accessibilityLabel="OK"
@@ -210,7 +217,10 @@ export default function ConfirmActionPrompt() {
               ) : (
                 <>
                   <TouchableOpacity
-                    style={styles.secondary}
+                    style={[
+                      styles.secondary,
+                      accessibilityLayout && styles.secondaryAccessibility,
+                    ]}
                     onPress={cancel}
                     disabled={phase === 'submitting'}
                     accessibilityRole="button"
@@ -220,7 +230,11 @@ export default function ConfirmActionPrompt() {
                     <Text style={[styles.secondaryText, { color: c.ink2 }]}>Cancel</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
-                    style={[styles.primary, { backgroundColor: c.amber, opacity: canSubmit ? 1 : 0.5 }]}
+                    style={[
+                      styles.primary,
+                      accessibilityLayout && styles.actionAccessibility,
+                      { backgroundColor: c.amber, opacity: canSubmit ? 1 : 0.5 },
+                    ]}
                     onPress={() => void submit()}
                     disabled={!canSubmit}
                     accessibilityRole="button"
@@ -259,8 +273,11 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   actions: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 4 },
+  actionsAccessibility: { flexDirection: 'column', alignItems: 'stretch' },
   secondary: { paddingVertical: 14, paddingHorizontal: 12 },
+  secondaryAccessibility: { width: '100%', alignItems: 'center' },
   secondaryText: { fontSize: 15, fontWeight: '500' },
   primary: { flex: 1, paddingVertical: 14, borderRadius: radii.md, alignItems: 'center' },
+  actionAccessibility: { flex: 0, width: '100%', minHeight: 48, justifyContent: 'center' },
   primaryText: { fontSize: 16, fontWeight: '700' },
 });

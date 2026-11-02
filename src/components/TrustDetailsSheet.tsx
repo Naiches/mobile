@@ -15,6 +15,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -68,16 +69,19 @@ interface RowProps {
 }
 
 function DetailRow({ label, value, mono, inkLabel, inkValue, border }: RowProps) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   return (
-    <View style={[styles.row, { borderBottomColor: border }]}>
-      <Text style={[styles.rowLabel, { color: inkLabel }]}>{label}</Text>
+    <View style={[styles.row, accessibilityLayout && styles.rowAccessibility, { borderBottomColor: border }]}>
+      <Text style={[styles.rowLabel, accessibilityLayout && styles.rowLabelAccessibility, { color: inkLabel }]}>{label}</Text>
       <Text
         style={[
           styles.rowValue,
+          accessibilityLayout && styles.rowValueAccessibility,
           { color: inkValue },
           mono && { fontFamily: fonts.mono, fontSize: 12 },
         ]}
-        numberOfLines={2}
+        numberOfLines={accessibilityLayout ? undefined : 2}
       >
         {value}
       </Text>
@@ -87,6 +91,8 @@ function DetailRow({ label, value, mono, inkLabel, inkValue, border }: RowProps)
 
 export default function TrustDetailsSheet({ file: fileProp, fileName: fileNameProp, mimeType: mimeTypeProp, onClose }: Props) {
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [proofOpen, setProofOpen] = useState(false);
   // 1586 — the sheet slides down (shared BottomSheet) before its Modal goes
   // away, so the last file stays rendered through the close animation.
@@ -124,13 +130,13 @@ export default function TrustDetailsSheet({ file: fileProp, fileName: fileNamePr
   const sheetVisible = !!fileProp && !proofOpen;
 
   const header = (
-    <View style={styles.headerRow}>
+    <View style={[styles.headerRow, accessibilityLayout && styles.headerRowAccessibility]}>
       <View style={[styles.lockBadge, { backgroundColor: c.amberBg, borderColor: c.amber }]}>
         <Ionicons name="lock-closed" size={16} color={c.amberDeep} />
       </View>
       <View style={{ flex: 1 }}>
         <Text style={[styles.title, { color: c.ink }]}>Encryption details</Text>
-        <Text style={[styles.subtitle, { color: c.ink3 }]} numberOfLines={1}>
+        <Text style={[styles.subtitle, { color: c.ink3 }]} numberOfLines={accessibilityLayout ? undefined : 1}>
           {fileName}
         </Text>
       </View>
@@ -220,7 +226,7 @@ export default function TrustDetailsSheet({ file: fileProp, fileName: fileNamePr
                 </Text>
               </View>
 
-              <View style={styles.actions}>
+              <View style={[styles.actions, accessibilityLayout && styles.actionsAccessibility]}>
                 <TouchableOpacity
                   style={[styles.proveBtn, { backgroundColor: c.amber }]}
                   onPress={() => setProofOpen(true)}
@@ -272,6 +278,7 @@ const styles = StyleSheet.create({
     paddingTop: spacing.sm,
     paddingBottom: spacing.md,
   },
+  headerRowAccessibility: { alignItems: 'flex-start' },
   lockBadge: {
     width: 36,
     height: 36,
@@ -291,12 +298,16 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     gap: 12,
   },
+  rowAccessibility: { flexDirection: 'column' },
   rowLabel: { fontSize: 12, fontWeight: '500', width: 108 },
+  rowLabelAccessibility: { width: 'auto' },
   rowValue: { flex: 1, fontSize: 13, fontWeight: '500', textAlign: 'right' },
+  rowValueAccessibility: { flex: 0, alignSelf: 'stretch', textAlign: 'left' },
   divider: { height: StyleSheet.hairlineWidth, marginVertical: spacing.md },
   copyBlock: { gap: 4, marginBottom: spacing.md },
   copyLine: { fontSize: 13, lineHeight: 18, fontWeight: '500' },
   actions: { flexDirection: 'row', gap: spacing.sm },
+  actionsAccessibility: { flexDirection: 'column' },
   proveBtn: {
     flex: 1,
     flexDirection: 'row',

@@ -36,6 +36,7 @@ function styleObjectBody(styleName: string): string {
  * swipe-to-close PanGestureHandler (one per branch: media, doc). */
 function headerWrapperTags(): string[] {
   const tags: string[] = [];
+  const seen = new Set<number>();
   let from = 0;
   for (;;) {
     const at = source.indexOf('onGestureEvent={onCloseGestureEvent}', from);
@@ -50,7 +51,10 @@ function headerWrapperTags(): string[] {
     // their open tag, so this preserves what the guard checks.
     const close = source.indexOf('>\n', open);
     const tag = source.slice(open, close + 1);
-    if (tag.includes('styles.chromeLayer')) tags.push(tag);
+    if (tag.includes('styles.chromeLayer') && !seen.has(open)) {
+      seen.add(open);
+      tags.push(tag);
+    }
     from = at + 1;
   }
   return tags;

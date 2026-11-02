@@ -50,9 +50,25 @@ MANIFEST=(
   "backup-execution-gate-test.swift|modules/beebeeb-crypto/ios/BackupExecutionGate.swift"
   "manifest-background-quiesce-test.swift|modules/beebeeb-crypto/ios/BackupExecutionGate.swift modules/beebeeb-crypto/ios/BackupManifestHandle.swift modules/beebeeb-crypto/ios/BackupManifestStore.swift modules/beebeeb-crypto/ios/ManifestRebuildGate.swift modules/beebeeb-crypto/ios/ManifestWriteFence.swift"
   "thumbnail-queue-quiesce-test.swift|modules/beebeeb-crypto/ios/ThumbnailQueueDB.swift modules/beebeeb-crypto/ios/ThumbnailErrorCategory.swift modules/beebeeb-crypto/ios/PlaintextStorageProtection.swift modules/beebeeb-crypto/ios/RuntimeTrace.swift modules/beebeeb-crypto/ios/BackupExecutionGate.swift"
+  "photo-grid-drag-selection-test.swift|modules/beebeeb-crypto/ios/ThumbnailServiceTypes.swift"
+  "backup-export-verification-test.swift|modules/beebeeb-crypto/ios/UploadSessionGone.swift"
 )
 
-LOG_DIR="${SWIFT_CI_LOG_DIR:-$(mktemp -d)}"
+CLEANUP_DIRS=()
+cleanup_temp_dirs() {
+  local dir
+  for dir in ${CLEANUP_DIRS[@]+"${CLEANUP_DIRS[@]}"}; do
+    [ -n "$dir" ] && rm -rf -- "$dir"
+  done
+}
+trap cleanup_temp_dirs EXIT
+
+if [ -n "${SWIFT_CI_LOG_DIR:-}" ]; then
+  LOG_DIR="$SWIFT_CI_LOG_DIR"
+else
+  LOG_DIR="$(mktemp -d)"
+  CLEANUP_DIRS+=("$LOG_DIR")
+fi
 mkdir -p "$LOG_DIR"
 rc=0
 files=0
@@ -82,6 +98,9 @@ done
 MANIFEST_SQLITE_INCLUDE=modules/beebeeb-crypto/ios/ManifestSQLite
 EXPO_SQLITE_SRC=node_modules/expo-sqlite/vendor/sqlite3/sqlite3.c
 SQLITE_BUILD_DIR="$(mktemp -d)"
+CLEANUP_DIRS+=("$SQLITE_BUILD_DIR")
+SQLITE_TOOL_TMP="$SQLITE_BUILD_DIR/tool-tmp"
+mkdir -p "$SQLITE_TOOL_TMP"
 EXPO_SQLITE_DYLIB="$SQLITE_BUILD_DIR/libexpo-sqlite3.dylib"
 VANILLA_SQLITE_OBJ="$SQLITE_BUILD_DIR/vanilla-sqlite3.o"
 expo_sqlite_state=""   # "", "ok" or "failed"
@@ -97,7 +116,7 @@ build_expo_sqlite() {
     echo "MISSING $EXPO_SQLITE_SRC (run bun install first)"
     return 1
   fi
-  if ! xcrun clang -dynamiclib -O1 -w "${EXPO_CFLAGS[@]}" -install_name "$EXPO_SQLITE_DYLIB" \
+  if ! TMPDIR="$SQLITE_TOOL_TMP/" xcrun clang -dynamiclib -O1 -w "${EXPO_CFLAGS[@]}" -install_name "$EXPO_SQLITE_DYLIB" \
     "$EXPO_SQLITE_SRC" -o "$EXPO_SQLITE_DYLIB" >"$LOG_DIR/expo-sqlite.build.log" 2>&1; then
     cat "$LOG_DIR/expo-sqlite.build.log"
     return 1
@@ -118,7 +137,7 @@ build_vanilla_sqlite() {
     src="$SQLITE_BUILD_DIR/vanilla-sqlite3.c"
     sed 's/exsqlite3/sqlite3/g' "$EXPO_SQLITE_SRC" >"$src" || return 1
   fi
-  if ! xcrun clang -c -O1 -w -DSQLITE_THREADSAFE=1 "$src" -o "$VANILLA_SQLITE_OBJ" >"$LOG_DIR/vanilla-sqlite.build.log" 2>&1; then
+  if ! TMPDIR="$SQLITE_TOOL_TMP/" xcrun clang -c -O1 -w -DSQLITE_THREADSAFE=1 "$src" -o "$VANILLA_SQLITE_OBJ" >"$LOG_DIR/vanilla-sqlite.build.log" 2>&1; then
     cat "$LOG_DIR/vanilla-sqlite.build.log"
     return 1
   fi
@@ -131,6 +150,9 @@ for entry in "${MANIFEST[@]}"; do
   driver="scripts/swift-tests/$base"
   [ -f "$driver" ] || { echo "MANIFEST entry has no driver on disk: $driver"; rc=1; continue; }
   tmp="$(mktemp -d)"
+  CLEANUP_DIRS+=("$tmp")
+  compiler_tmp="$tmp/compiler-tmp"
+  mkdir -p "$compiler_tmp"
   cp "$driver" "$tmp/main.swift"
   echo "== $base  (sources: $srcs)"
   if [ "$base" = "native-video-streamer-harness.swift" ]; then
@@ -183,7 +205,7 @@ SWIFT
       ;;
   esac
   # shellcheck disable=SC2086
-  if ! xcrun swiftc "${flags[@]}" $srcs "$tmp/main.swift" ${extra_objs[@]+"${extra_objs[@]}"} -o "$tmp/t" >"$LOG_DIR/$base.build.log" 2>&1; then
+  if ! TMPDIR="$compiler_tmp/" xcrun swiftc "${flags[@]}" $srcs "$tmp/main.swift" ${extra_objs[@]+"${extra_objs[@]}"} -o "$tmp/t" >"$LOG_DIR/$base.build.log" 2>&1; then
     cat "$LOG_DIR/$base.build.log"
     echo "COMPILE FAILED: $base"
     rc=1

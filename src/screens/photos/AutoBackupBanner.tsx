@@ -4,6 +4,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import * as Haptics from 'expo-haptics';
@@ -36,6 +37,8 @@ export function AutoBackupBanner() {
   const { isPhotoBackupEnabled, backupProgress, lastBackupAt, includeVideos } = useBackup();
   const isConnected = useNetworkStatus();
   const { colors: c, resolved: scheme } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const navigation = useNavigation<{ navigate: (name: string) => void }>();
   const material = glassMaterial(scheme);
   // No recipe token for an on-glass progress-track fill (same gap
@@ -49,7 +52,7 @@ export function AutoBackupBanner() {
   if (!isPhoneBackupSupported()) {
     return (
       <View style={styles.bannerWrap}>
-        <GlassSurface scheme={scheme} radius="card" contentStyle={styles.banner}>
+        <GlassSurface scheme={scheme} radius="card" contentStyle={[styles.banner, accessibilityLayout && styles.bannerAccessibility]}>
           <BackupUnavailableStatus color={material.labelMuted} />
         </GlassSurface>
       </View>
@@ -59,7 +62,7 @@ export function AutoBackupBanner() {
   if (!isPhotoBackupEnabled) {
     return (
       <View style={styles.bannerWrap}>
-        <GlassSurface scheme={scheme} radius="card" contentStyle={styles.banner}>
+        <GlassSurface scheme={scheme} radius="card" contentStyle={[styles.banner, accessibilityLayout && styles.bannerAccessibility]}>
           <View style={[styles.bannerDot, { backgroundColor: c.ink4 }]} />
           <Text style={[styles.bannerText, { color: material.labelMuted }]}>Auto-backup off</Text>
           <TouchableOpacity
@@ -83,7 +86,7 @@ export function AutoBackupBanner() {
   if (!isConnected) {
     return (
       <View style={styles.bannerWrap}>
-        <GlassSurface scheme={scheme} radius="card" contentStyle={styles.banner}>
+        <GlassSurface scheme={scheme} radius="card" contentStyle={[styles.banner, accessibilityLayout && styles.bannerAccessibility]}>
           <View style={[styles.bannerDot, { backgroundColor: c.ink4 }]} />
           <Text style={[styles.bannerText, { color: material.labelMuted }]}>Backup paused</Text>
           <Text style={[styles.bannerHint, { color: material.labelMuted }]}>No connection</Text>
@@ -100,7 +103,7 @@ export function AutoBackupBanner() {
     return (
       <View style={styles.bannerWrap}>
         <GlassSurface scheme={scheme} radius="card" contentStyle={styles.bannerWithProgress}>
-          <View style={styles.bannerHeaderRow}>
+          <View style={[styles.bannerHeaderRow, accessibilityLayout && styles.bannerAccessibility]}>
             <ActivityIndicator size="small" color={c.green} style={{ marginRight: 2 }} />
             <Text style={[styles.bannerText, { color: material.label }]}>
               {backupProgress.completed} of {backupProgress.total} {itemLabel} backed up
@@ -118,7 +121,7 @@ export function AutoBackupBanner() {
   const allDone = backupProgress.total > 0 && backupProgress.completed === backupProgress.total;
   return (
     <View style={styles.bannerWrap}>
-      <GlassSurface scheme={scheme} radius="card" contentStyle={styles.banner}>
+      <GlassSurface scheme={scheme} radius="card" contentStyle={[styles.banner, accessibilityLayout && styles.bannerAccessibility]}>
         <View style={[styles.bannerDot, { backgroundColor: c.green }]} />
         <Text style={[styles.bannerText, { color: material.label }]}>
           {allDone ? `All ${includeVideos ? 'items' : 'photos'} backed up` : 'Auto-backup on'}
@@ -139,6 +142,7 @@ export function AutoBackupBanner() {
 const styles = StyleSheet.create({
   bannerWrap: { marginHorizontal: 14 },
   banner: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, gap: 8 },
+  bannerAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   bannerWithProgress: { flexDirection: 'column', alignItems: 'stretch', paddingHorizontal: 16, paddingVertical: 12, gap: 8 },
   bannerHeaderRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   bannerDot: { width: 6, height: 6, borderRadius: 3 },

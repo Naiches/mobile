@@ -95,6 +95,7 @@ export async function registerForPushNotifications(
    * "forget device" cascades it and per-device mute works.
    * Field is optional server-side — registration proceeds without it. */
   clientDeviceId?: string | null,
+  options: { requestPermission?: boolean } = {},
 ): Promise<void> {
   // Skip in simulator / web — push tokens don't exist there.
   if (!Device.isDevice) return;
@@ -116,7 +117,7 @@ export async function registerForPushNotifications(
     const { status: existing } = await Notifications.getPermissionsAsync();
     let final = existing;
 
-    if (existing !== 'granted') {
+    if (existing !== 'granted' && options.requestPermission !== false) {
       const { status } = await Notifications.requestPermissionsAsync();
       final = status;
     }
@@ -142,6 +143,29 @@ export async function registerForPushNotifications(
     });
   } catch {
     // Non-fatal — app works fine without push tokens.
+  }
+}
+
+/**
+ * Explicit opt-in flow used by Settings and first-run setup. The permission
+ * prompt lives here so passive login/startup registration can never surprise
+ * the user before the app has explained notifications.
+ */
+export async function enablePushNotifications(
+  clientDeviceId?: string | null,
+): Promise<boolean> {
+  try {
+    const { status: existing } = await Notifications.getPermissionsAsync();
+    const final = existing === 'granted'
+      ? existing
+      : (await Notifications.requestPermissionsAsync()).status;
+    if (final !== 'granted') return false;
+
+    await SecureStore.setItemAsync(NOTIFICATIONS_OPT_OUT_KEY, 'false').catch(() => {});
+    await registerForPushNotifications(clientDeviceId, { requestPermission: false });
+    return true;
+  } catch {
+    return false;
   }
 }
 

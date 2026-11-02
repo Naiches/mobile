@@ -80,8 +80,10 @@ final class ApiClient {
 
   // MARK: - Endpoints
 
-  /// List the children of `parentId`. Pass `nil` for the root.
-  func listFiles(parentId: String?) async throws -> [FileEntryDto] {
+  /// List the children of `parentId`. Pass `nil` for the root. `trashed` lists what the app's
+  /// Trash holds instead (`GET /api/v1/files?trashed=true`): with no parent, every trashed row.
+  func listFiles(parentId: String?, trashed: Bool = false, maxEntries: Int? = nil) async throws -> [FileEntryDto] {
+    if let maxEntries, maxEntries <= 0 { return [] }
     var entries: [FileEntryDto] = []
     var cursor: String?
     var seenCursors = Set<String>()
@@ -90,13 +92,22 @@ final class ApiClient {
       var components = URLComponents(url: baseUrl.appendingPathComponent("/api/v1/files"), resolvingAgainstBaseURL: false)!
       var query: [URLQueryItem] = []
       if let parentId { query.append(URLQueryItem(name: "parent_id", value: parentId)) }
+      if trashed { query.append(URLQueryItem(name: "trashed", value: "true")) }
       if let cursor { query.append(URLQueryItem(name: "cursor", value: cursor)) }
       components.queryItems = query.isEmpty ? nil : query
       let request = try authedRequest(url: components.url!, method: "GET")
       let (data, response) = try await session.data(for: request)
       try validate(response, data)
       let page = try JSONDecoder().decode(ListResponse.self, from: data)
-      entries.append(contentsOf: page.files)
+      if let maxEntries {
+        entries.append(contentsOf: page.files.prefix(maxEntries - entries.count))
+        if entries.count >= maxEntries {
+          cursor = nil
+          break
+        }
+      } else {
+        entries.append(contentsOf: page.files)
+      }
       cursor = page.next_cursor
       if let cursor, !seenCursors.insert(cursor).inserted {
         // Never publish a partial listing to replaceChildren's prune.
@@ -236,6 +247,26 @@ final class ApiClient {
     }
     request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
 
+    let (data, response) = try await session.data(for: request)
+    try validate(response, data)
+    return try JSONDecoder().decode(FileEntryDto.self, from: data)
+  }
+
+  /// Create a folder (`POST /api/v1/files/folder`). `folderId` is minted by the caller (lowercase):
+  /// the folder's name is sealed under a key derived from it.
+  func createFolder(folderId: String, nameEncrypted: String, parentId: String?, expectedUser: String?) async throws -> FileEntryDto {
+    var request = try authedRequest(
+      url: baseUrl.appendingPathComponent("/api/v1/files/folder"),
+      method: "POST",
+      expectedUser: expectedUser
+    )
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    let body: [String: Any] = [
+      "name_encrypted": nameEncrypted,
+      "parent_id": parentId.map { $0 as Any } ?? NSNull(),
+      "folder_id": folderId,
+    ]
+    request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
     let (data, response) = try await session.data(for: request)
     try validate(response, data)
     return try JSONDecoder().decode(FileEntryDto.self, from: data)

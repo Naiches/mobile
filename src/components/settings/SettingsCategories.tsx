@@ -1,5 +1,5 @@
 import React from 'react';
-import { Text, TouchableOpacity, View } from 'react-native';
+import { Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { type Colors, typeScale } from '../../theme';
 import type { SettingsAttention } from '../../lib/settings-attention';
@@ -36,6 +36,8 @@ export function SettingsCategoryList({ colors: c, backgroundColor, onSelect, att
    */
   attention?: SettingsAttention;
 }) {
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   return (
     <View style={{ borderRadius: 26, overflow: 'hidden', backgroundColor }}>
       {SETTINGS_CATEGORIES.map((category, index) => {
@@ -51,9 +53,18 @@ export function SettingsCategoryList({ colors: c, backgroundColor, onSelect, att
             accessibilityLabel={accessibilityLabel}
             accessibilityHint={category.description}
             onPress={() => onSelect(category.id)}
-            style={{ flexDirection: 'row', alignItems: 'center', minHeight: 64, paddingHorizontal: 16, paddingVertical: 12, gap: 12, borderTopWidth: index === 0 ? 0 : 0.5, borderTopColor: c.line }}
+            style={{
+              flexDirection: 'row',
+              alignItems: accessibilityLayout ? 'flex-start' : 'center',
+              minHeight: accessibilityLayout ? Math.ceil(52 * Math.min(fontScale, 2)) : 64,
+              paddingHorizontal: 16,
+              paddingVertical: 12,
+              gap: 12,
+              borderTopWidth: index === 0 ? 0 : 0.5,
+              borderTopColor: c.line,
+            }}
           >
-            <Ionicons name={category.icon} size={20} color={c.ink3} />
+            <Ionicons name={category.icon} size={20} color={c.ink3} style={accessibilityLayout ? { marginTop: 3 } : undefined} />
             <View style={{ flex: 1 }}>
               <Text style={[typeScale.body, { color: c.ink }]}>{category.title}</Text>
               <Text style={{ fontSize: 12, color: reason ? c.ink2 : c.ink3, marginTop: 3 }}>

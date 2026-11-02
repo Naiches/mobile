@@ -1104,6 +1104,30 @@ enum BackupManifestStore {
     guard !accountId.isEmpty else { return (0, 0) }
     ensurePendingMarksTable(db)
     guard exsqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return nil }
+
+    // Older app builds treated an explicit move to Trash as a permanent user
+    // exclusion: they wrote `remote_deleted` and cleared the remote id. Trash
+    // is no longer a valid backup location, so revive those rows once the
+    // manifest is account-bound. This stays inside the same fenced claim
+    // transaction as every other ownership repair.
+    let reviveRemoteDeletedSQL = """
+    UPDATE backup_assets
+       SET status = 'pending_reupload',
+           remote_file_id = NULL,
+           remote_path = NULL,
+           uploaded_at = NULL,
+           uploaded_account_id = NULL,
+           server_marked_at = NULL,
+           error_message = NULL,
+           retry_count = 0,
+           queued_at = ?
+     WHERE status = 'remote_deleted'
+       AND staged_file_id IS NULL
+    """
+    let revivedRemoteDeleted = run(db, reviveRemoteDeletedSQL) { stmt in
+      exsqlite3_bind_int64(stmt, 1, nowMs)
+    }
+
     let adoptSQL = """
     UPDATE backup_assets
        SET uploaded_account_id = ?
@@ -1157,11 +1181,12 @@ enum BackupManifestStore {
       exsqlite3_bind_int64(stmt, 1, nowMs)
       bindText(stmt, 2, accountId)
     }
-    guard adopted >= 0, keptOthers >= 0, requeued >= 0, exsqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+    guard revivedRemoteDeleted >= 0, adopted >= 0, keptOthers >= 0, requeued >= 0,
+          exsqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
       exsqlite3_exec(db, "ROLLBACK", nil, nil, nil)
       return nil
     }
-    return (adopted, requeued)
+    return (adopted, revivedRemoteDeleted + requeued)
   }
 
   /// Rows this account has uploaded according to the manifest; nil when the
@@ -1301,10 +1326,10 @@ enum BackupManifestStore {
   /// fence test drives. False when a step failed (rolled back).
   @discardableResult
   static func updateSelectionScope(_ db: OpaquePointer, allowedAssetIds: Set<String>, hasAlbumSelection: Bool) -> Bool {
-    guard hasAlbumSelection else {
-      return exsqlite3_exec(db, "UPDATE backup_assets SET selected_for_backup = 1 WHERE COALESCE(selected_for_backup, 1) != 1", nil, nil, nil) == SQLITE_OK
-    }
-
+    // A full-library fetch is an exact scope too. Treating it as "select every
+    // manifest row" kept deleted full-access assets queued forever; limited
+    // access happened to avoid the bug because its selection was already exact.
+    _ = hasAlbumSelection
     let sqlInChunk = 400
     let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     guard exsqlite3_exec(db, "BEGIN", nil, nil, nil) == SQLITE_OK else { return false }
@@ -1340,6 +1365,18 @@ enum BackupManifestStore {
       exsqlite3_finalize(stmt)
       guard stepResult == SQLITE_DONE else { return false }
     }
+
+    // A copy already uploaded to Beebeeb stays uploaded. Only local work that
+    // PhotoKit no longer exposes leaves the queue and the on-device counts.
+    let missingSQL = """
+    UPDATE backup_assets
+       SET status = 'local_missing',
+           retry_count = 0,
+           error_message = 'Photo no longer on this iPhone or no longer shared with Beebeeb'
+     WHERE selected_for_backup = 0
+       AND status != 'uploaded'
+    """
+    guard exsqlite3_exec(db, missingSQL, nil, nil, nil) == SQLITE_OK else { return false }
 
     guard exsqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else { return false }
     didCommit = true
@@ -1454,6 +1491,60 @@ enum BackupManifestStore {
     return false
   }
 
+  /// Apply an incremental PhotoKit removal. Uploaded remote copies are kept;
+  /// pending/staged local work is removed from the queue immediately.
+  static func markLocalAssetsMissing(
+    _ db: OpaquePointer,
+    localAssetIds: Set<String>,
+    nowMs: Int64
+  ) -> Int? {
+    guard !localAssetIds.isEmpty else { return 0 }
+    let ids = Array(localAssetIds)
+    let chunkSize = 400
+    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    guard exsqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return nil }
+    var didCommit = false
+    defer {
+      if !didCommit { exsqlite3_exec(db, "ROLLBACK", nil, nil, nil) }
+    }
+    var changed = 0
+    for start in stride(from: 0, to: ids.count, by: chunkSize) {
+      let batch = ids[start..<min(start + chunkSize, ids.count)]
+      let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+      let sql = """
+      UPDATE backup_assets
+         SET selected_for_backup = 0,
+             status = CASE WHEN status = 'uploaded' THEN status ELSE 'local_missing' END,
+             retry_count = CASE WHEN status = 'uploaded' THEN retry_count ELSE 0 END,
+             error_message = CASE WHEN status = 'uploaded' THEN error_message
+                                  ELSE 'Photo no longer on this iPhone or no longer shared with Beebeeb' END,
+             last_attempt_at = CASE WHEN status = 'uploaded' THEN last_attempt_at ELSE ? END
+       WHERE local_asset_id IN (\(placeholders))
+      """
+      var stmt: OpaquePointer?
+      guard exsqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+      exsqlite3_bind_int64(stmt, 1, nowMs)
+      var bound = true
+      for (index, id) in batch.enumerated() {
+        if exsqlite3_bind_text(stmt, Int32(index + 2), (id as NSString).utf8String, -1, transient) != SQLITE_OK {
+          bound = false
+          break
+        }
+      }
+      guard bound else {
+        exsqlite3_finalize(stmt)
+        return nil
+      }
+      let rc = exsqlite3_step(stmt)
+      changed += Int(exsqlite3_changes(db))
+      exsqlite3_finalize(stmt)
+      guard rc == SQLITE_DONE else { return nil }
+    }
+    guard exsqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else { return nil }
+    didCommit = true
+    return changed
+  }
+
   // MARK: - Upload completion
 
   /// Completed upload: the row now points at `remoteFileId`, owned by
@@ -1489,6 +1580,7 @@ enum BackupManifestStore {
         staged_dir = NULL,
         staged_at = NULL
     WHERE local_asset_id = ?
+      AND status != 'local_missing'
     """
     let changed = run(db, sql) { stmt in
       bindText(stmt, 1, remoteFileId)
@@ -1544,6 +1636,48 @@ enum BackupManifestStore {
       bindText(stmt, 2, assetId)
       bindText(stmt, 3, fileId)
     }
+  }
+
+  enum RemoteGoneRequeue: Equatable {
+    case requeued
+    /// The response was for an old file id or a row already handled by
+    /// another path. This is settled, not a transport/database failure.
+    case alreadySettled
+    case failed
+  }
+
+  /// The exact remote file an uploaded row points at is gone. Requeue only
+  /// while both ids and the uploaded state still match, so a late 404 from an
+  /// old mark request cannot clobber a newer successful re-upload.
+  @discardableResult
+  static func requeueRemoteGone(
+    _ db: OpaquePointer,
+    assetId: String,
+    fileId: String,
+    nowMs: Int64
+  ) -> RemoteGoneRequeue {
+    let changed = run(db, """
+    UPDATE backup_assets
+       SET status = 'pending_reupload',
+           remote_file_id = NULL,
+           remote_path = NULL,
+           uploaded_at = NULL,
+           uploaded_account_id = NULL,
+           server_marked_at = NULL,
+           error_message = NULL,
+           retry_count = 0,
+           queued_at = ?
+     WHERE local_asset_id = ?
+       AND remote_file_id = ?
+       AND status = 'uploaded'
+    """) { stmt in
+      exsqlite3_bind_int64(stmt, 1, nowMs)
+      bindText(stmt, 2, assetId)
+      bindText(stmt, 3, fileId)
+    }
+    if changed == 1 { return .requeued }
+    if changed == 0 { return .alreadySettled }
+    return .failed
   }
 
   /// Parses `GET /api/v1/files/photo-backup/identifiers`

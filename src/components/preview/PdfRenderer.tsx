@@ -24,6 +24,7 @@ interface PdfRendererProps {
    * total page count. PreviewScreen owns the visible pill; this component
    * renders none of its own. */
   onPageInfo?: (info: { current: number; total: number }) => void;
+  onScaleChange?: (scale: number) => void;
   /**
    * Round 5 (task 1563, PR #123) — space to leave clear at the top/bottom so
    * page 1 doesn't start under the floating header/bottom bar. Applied as
@@ -46,7 +47,7 @@ interface PdfRendererProps {
   bottomInset?: number;
 }
 
-export function PdfRenderer({ filePath, onPageInfo, topInset = 0, bottomInset = 0 }: PdfRendererProps) {
+export function PdfRenderer({ filePath, onPageInfo, onScaleChange, topInset = 0, bottomInset = 0 }: PdfRendererProps) {
   const [hasError, setHasError] = useState(false);
   const { colors } = useTheme();
 
@@ -85,6 +86,7 @@ export function PdfRenderer({ filePath, onPageInfo, topInset = 0, bottomInset = 
         onPageChanged={(page, numberOfPages) => {
           onPageInfo?.({ current: page, total: numberOfPages });
         }}
+        onScaleChanged={(scale) => onScaleChange?.(scale)}
         onError={(error) => {
           console.error('PDF render error:', error);
           setHasError(true);

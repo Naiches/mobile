@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const source = readFileSync(join(import.meta.dir, 'FilesScreen.tsx'), 'utf-8');
+const sharedState = readFileSync(join(import.meta.dir, '..', 'lib', 'files-shared-state.tsx'), 'utf-8');
 
 function callbackBody(startMarker: string, endMarker: string): string {
   const start = source.indexOf(startMarker);
@@ -23,9 +24,11 @@ function callbackBody(startMarker: string, endMarker: string): string {
 }
 
 describe('should-fix 1 — one upload loop at a time', () => {
-  test('the screen owns a serialized upload gate', () => {
+  test('the Files stack owns one serialized upload gate shared by every folder screen', () => {
     expect(source).toContain('uploadGateRef');
-    expect(source).toContain('createUploadGate()');
+    expect(source).toContain('useFilesSharedState()');
+    expect(sharedState).toContain('createUploadGate()');
+    expect(sharedState).toContain('uploadGateRef');
   });
 
   test('the photo batch runs THROUGH the gate', () => {

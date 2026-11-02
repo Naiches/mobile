@@ -1,5 +1,46 @@
 /** Pure math used by the Photo previews settings screen. */
 
+import type { PreviewFormat, PreviewPx } from './photo-preview-settings';
+
+export interface KnownPreviewSize {
+  preview_format?: string | null;
+  preview_px?: number | null;
+  preview_bytes?: number | null;
+}
+
+export interface ImmediatePreviewEstimate {
+  avgBytes: number;
+  sampled: number;
+  basis: 'known-previews' | 'typical';
+}
+
+// Conservative typical encoded sizes from the variants the app offers. These
+// make the setting responsive before a PhotoKit/iCloud sample has finished.
+const TYPICAL_BYTES: Record<PreviewFormat, Record<PreviewPx, number>> = {
+  heic: { 1280: 220_000, 1920: 420_000, 2560: 700_000, 3840: 1_250_000 },
+  jpeg: { 1280: 420_000, 1920: 760_000, 2560: 1_250_000, 3840: 2_200_000 },
+};
+
+/** Immediate local estimate, refined by matching sizes already present in the index. */
+export function immediatePreviewEstimate(
+  format: PreviewFormat,
+  px: PreviewPx,
+  known: KnownPreviewSize[],
+): ImmediatePreviewEstimate {
+  const sizes = known
+    .filter((item) => item.preview_format === format && item.preview_px === px)
+    .map((item) => item.preview_bytes)
+    .filter((bytes): bytes is number => typeof bytes === 'number' && Number.isFinite(bytes) && bytes > 0);
+  if (sizes.length > 0) {
+    return {
+      avgBytes: Math.round(sizes.reduce((sum, bytes) => sum + bytes, 0) / sizes.length),
+      sampled: sizes.length,
+      basis: 'known-previews',
+    };
+  }
+  return { avgBytes: TYPICAL_BYTES[format][px], sampled: 0, basis: 'typical' };
+}
+
 /** Up to n distinct ids drawn at random (partial Fisher-Yates); the input is not modified. */
 export function pickSampleIds(allLocalIds: string[], n = 10, rng: () => number = Math.random): string[] {
   const pool = Array.from(new Set(allLocalIds));

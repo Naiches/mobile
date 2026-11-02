@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../lib/theme-context';
 import { colors, darkColors, fonts } from '../theme';
@@ -153,6 +153,9 @@ interface UploadActivityCardProps {
 
 export const UploadActivityCard = React.memo(function UploadActivityCard({ upload, bottom, scheme }: UploadActivityCardProps) {
   const { resolved: liveScheme } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
+  const accessorySize = accessibilityLayout ? Math.ceil(44 * fontScale) : 44;
   const resolvedScheme = scheme ?? liveScheme;
   const dark = resolvedScheme === 'dark';
   // 1340 — the card's own hand-rolled blur/fill/border/shadow are gone; the
@@ -222,17 +225,30 @@ export const UploadActivityCard = React.memo(function UploadActivityCard({ uploa
       accessibilityLabel={`Uploading ${upload.fileName}, ${pct} percent`}
       testID="upload-activity-card"
     >
-      <GlassSurface scheme={resolvedScheme} radius="card" contentStyle={styles.row}>
+      <GlassSurface
+        scheme={resolvedScheme}
+        radius="card"
+        contentStyle={[styles.row, accessibilityLayout && styles.rowAccessibility]}
+      >
         {/* Brand mark */}
-        <View style={[styles.mark, { backgroundColor: c.amber }]}>
+        <View
+          style={[
+            styles.mark,
+            accessibilityLayout && styles.markAccessibility,
+            { width: accessorySize, height: accessorySize, backgroundColor: c.amber },
+          ]}
+        >
           <Text style={styles.markGlyph}>b</Text>
         </View>
 
         {/* Name + bar + data line — on-glass ink from glassMaterial(),
             matching the tab bar / FilesScreen / PhotosScreen convention
             (c.ink/c.ink3 were tuned for opaque paper, not this fill). */}
-        <View style={styles.middle}>
-          <Text style={[styles.fileName, { color: material.label }]} numberOfLines={1}>
+        <View style={[styles.middle, accessibilityLayout && styles.middleAccessibility]}>
+          <Text
+            style={[styles.fileName, { color: material.label }]}
+            numberOfLines={accessibilityLayout ? undefined : 1}
+          >
             {upload.fileName}
           </Text>
           <View style={[styles.barTrack, { backgroundColor: track }]}>
@@ -243,19 +259,35 @@ export const UploadActivityCard = React.memo(function UploadActivityCard({ uploa
               ]}
             />
           </View>
-          <Text style={[styles.dataLine, { color: material.labelMuted }]} numberOfLines={1}>
+          <Text
+            style={[styles.dataLine, { color: material.labelMuted }]}
+            numberOfLines={accessibilityLayout ? undefined : 1}
+          >
             {line}
           </Text>
         </View>
 
         {/* Progress ring */}
-        <ProgressRing size={44} stroke={4} progress={progress} color={c.amber} trackColor={track} holeColor={hole}>
-          {done ? (
-            <Ionicons name="checkmark" size={18} color={c.amber} />
-          ) : (
-            <Text style={[styles.ringPct, { color: material.label }]}>{ringEta ?? pct}</Text>
-          )}
-        </ProgressRing>
+        <View style={accessibilityLayout && styles.ringAccessibility}>
+          <ProgressRing
+            size={accessorySize}
+            stroke={accessibilityLayout ? Math.max(4, Math.ceil(4 * fontScale)) : 4}
+            progress={progress}
+            color={c.amber}
+            trackColor={track}
+            holeColor={hole}
+          >
+            {done ? (
+              <Ionicons
+                name="checkmark"
+                size={accessibilityLayout ? Math.ceil(18 * fontScale) : 18}
+                color={c.amber}
+              />
+            ) : (
+              <Text style={[styles.ringPct, { color: material.label }]}>{ringEta ?? pct}</Text>
+            )}
+          </ProgressRing>
+        </View>
       </GlassSurface>
     </View>
   );
@@ -277,6 +309,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 14,
   },
+  rowAccessibility: {
+    flexDirection: 'column',
+    alignItems: 'stretch',
+  },
   mark: {
     width: 44,
     height: 44,
@@ -285,6 +321,9 @@ const styles = StyleSheet.create({
     borderRadius: GLASS_RADII.inner,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  markAccessibility: {
+    alignSelf: 'center',
   },
   markGlyph: {
     fontSize: 24,
@@ -297,6 +336,10 @@ const styles = StyleSheet.create({
     flex: 1,
     minWidth: 0,
     gap: 5,
+  },
+  middleAccessibility: {
+    flex: 0,
+    width: '100%',
   },
   fileName: {
     fontSize: 13.5,
@@ -317,6 +360,9 @@ const styles = StyleSheet.create({
     // 10 (not 10.5): "AES 412 MB/s · 11.8 MB/s → Germany" must fit the
     // middle column on a 390pt device without truncating.
     fontSize: 10,
+  },
+  ringAccessibility: {
+    alignSelf: 'center',
   },
   ringPct: {
     fontFamily: fonts.mono,

@@ -26,12 +26,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Animated,
-  Dimensions,
   PanResponder,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import type { GestureResponderEvent } from 'react-native';
@@ -93,7 +93,8 @@ export function DetailsSheet({
   downloading,
 }: DetailsSheetProps) {
   const insets = useSafeAreaInsets();
-  const { height: windowHeight } = Dimensions.get('window');
+  const { height: windowHeight, fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   const [expanded, setExpanded] = useState(false);
   const animValue = useRef(new Animated.Value(0)).current;
@@ -102,8 +103,11 @@ export function DetailsSheet({
   // Geometry
   const safeBottom = bottomAnchorInset(insets.bottom, Math.max(insets.bottom, 16));
   const expandedHeight = Math.min(
-    Math.max(MIN_EXPANDED_HEIGHT, Math.round(windowHeight * 0.6)),
-    windowHeight - insets.top - 60,
+    Math.max(
+      MIN_EXPANDED_HEIGHT,
+      Math.round(windowHeight * (accessibilityLayout ? 0.82 : 0.6)),
+    ),
+    windowHeight - insets.top - (accessibilityLayout ? 24 : 60),
   );
   const collapsedVisibleHeight = COLLAPSED_VISIBLE_HEIGHT + safeBottom;
 
@@ -210,10 +214,13 @@ export function DetailsSheet({
         accessibilityLabel={expanded ? 'Hide file details' : 'Show file details'}
       >
         <View style={styles.grabber} />
-        <View style={styles.summaryRow}>
+        <View style={[styles.summaryRow, accessibilityLayout && styles.summaryRowAccessibility]}>
           <View style={styles.summaryText}>
             <Text style={styles.title}>Details</Text>
-            <Text style={styles.subtitle} numberOfLines={1}>
+            <Text
+              style={styles.subtitle}
+              numberOfLines={accessibilityLayout ? undefined : 1}
+            >
               {expanded ? filename : 'Swipe up for metadata'}
             </Text>
           </View>
@@ -227,10 +234,10 @@ export function DetailsSheet({
 
       {/* Action buttons */}
       {(onShare || onDownload) && (
-        <View style={styles.actionsRow}>
+        <View style={[styles.actionsRow, accessibilityLayout && styles.actionsRowAccessibility]}>
           {onShare && (
             <TouchableOpacity
-              style={styles.actionButton}
+              style={[styles.actionButton, accessibilityLayout && styles.actionButtonAccessibility]}
               onPress={onShare}
               activeOpacity={0.8}
               accessibilityRole="button"
@@ -242,7 +249,11 @@ export function DetailsSheet({
           )}
           {onDownload && (
             <TouchableOpacity
-              style={[styles.actionButton, downloading && styles.actionButtonDisabled]}
+              style={[
+                styles.actionButton,
+                accessibilityLayout && styles.actionButtonAccessibility,
+                downloading && styles.actionButtonDisabled,
+              ]}
               onPress={onDownload}
               activeOpacity={0.8}
               disabled={downloading}
@@ -269,14 +280,18 @@ export function DetailsSheet({
       >
         <View style={styles.rowsContainer}>
           {rows.map((row, index) => (
-            <View key={`${row.label}-${index}`} style={styles.row}>
+            <View
+              key={`${row.label}-${index}`}
+              style={[styles.row, accessibilityLayout && styles.rowAccessibility]}
+            >
               <Text style={styles.rowLabel}>{row.label}</Text>
               <Text
                 style={[
                   styles.rowValue,
+                  accessibilityLayout && styles.rowValueAccessibility,
                   row.mono && { fontFamily: fonts.mono, fontSize: 11 },
                 ]}
-                numberOfLines={2}
+                numberOfLines={accessibilityLayout ? undefined : 2}
               >
                 {row.value}
               </Text>
@@ -323,6 +338,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 12,
   },
+  summaryRowAccessibility: {
+    alignItems: 'flex-start',
+  },
   summaryText: {
     flex: 1,
     minWidth: 0,
@@ -344,6 +362,9 @@ const styles = StyleSheet.create({
     gap: 10,
     marginTop: 12,
   },
+  actionsRowAccessibility: {
+    flexDirection: 'column',
+  },
   actionButton: {
     flex: 1,
     minHeight: 46,
@@ -353,6 +374,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 8,
     backgroundColor: 'rgba(255,255,255,0.12)',
+  },
+  actionButtonAccessibility: {
+    flex: 0,
+    width: '100%',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
   },
   actionButtonDisabled: {
     opacity: 0.5,
@@ -384,6 +411,10 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: 'rgba(255,255,255,0.08)',
   },
+  rowAccessibility: {
+    flexDirection: 'column',
+    gap: 4,
+  },
   rowLabel: {
     color: 'rgba(255,255,255,0.48)',
     fontSize: 12,
@@ -397,5 +428,9 @@ const styles = StyleSheet.create({
     lineHeight: 16,
     textAlign: 'right',
     fontWeight: '600',
+  },
+  rowValueAccessibility: {
+    width: '100%',
+    textAlign: 'left',
   },
 });

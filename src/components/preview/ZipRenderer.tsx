@@ -19,6 +19,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -68,6 +69,7 @@ interface ZipRendererProps {
    */
   topInset?: number;
   bottomInset?: number;
+  onScrollOffsetChange?: (offset: number) => void;
 }
 
 type IoniconName = React.ComponentProps<typeof Ionicons>['name'];
@@ -184,7 +186,10 @@ export function ZipRenderer({
   colors: c,
   topInset = 0,
   bottomInset = 0,
+  onScrollOffsetChange,
 }: ZipRendererProps) {
+  const { fontScale } = useWindowDimensions();
+  const largeText = fontScale >= 1.35;
   // Current folder prefix being browsed ('' = archive root, 'a/b/' = nested).
   const [prefix, setPrefix] = useState('');
   // 1291 — path of the entry currently being extracted (one at a time).
@@ -226,10 +231,16 @@ export function ZipRenderer({
             <Ionicons name="folder" size={16} color="#FFFFFF" />
           </View>
           <View style={styles.zipRowText}>
-            <Text style={[styles.zipRowName, { color: c.ink }]} numberOfLines={1}>
+            <Text
+              style={[styles.zipRowName, { color: c.ink }]}
+              numberOfLines={largeText ? undefined : 1}
+            >
               {item.name}
             </Text>
-            <Text style={[styles.zipRowMeta, { color: c.ink3 }]} numberOfLines={1}>
+            <Text
+              style={[styles.zipRowMeta, { color: c.ink3 }]}
+              numberOfLines={largeText ? undefined : 1}
+            >
               {item.fileCount > 0
                 ? `${item.fileCount} ${item.fileCount === 1 ? 'file' : 'files'}`
                 : 'Folder'}
@@ -296,10 +307,16 @@ export function ZipRenderer({
           <Ionicons name={zipEntryIcon(entry)} size={16} color="#FFFFFF" />
         </View>
         <View style={styles.zipRowText}>
-          <Text style={[styles.zipRowName, { color: c.ink }]} numberOfLines={1}>
+          <Text
+            style={[styles.zipRowName, { color: c.ink }]}
+            numberOfLines={largeText ? undefined : 1}
+          >
             {entry.name}
           </Text>
-          <Text style={[styles.zipRowMeta, { color: c.ink3 }]} numberOfLines={1}>
+          <Text
+            style={[styles.zipRowMeta, { color: c.ink3 }]}
+            numberOfLines={largeText ? undefined : 1}
+          >
             {`${formatBytes(entry.uncompressedSize)}${dateLabel ? `  ·  ${dateLabel}` : ''}`}
           </Text>
         </View>
@@ -315,7 +332,7 @@ export function ZipRenderer({
   return (
     <View style={[styles.zipContainer, { backgroundColor: c.paper, paddingTop: topInset }]}>
       <View style={[styles.zipHeader, { borderBottomColor: c.line }]}>
-        <View style={styles.zipHeaderRow}>
+        <View style={[styles.zipHeaderRow, largeText && styles.zipHeaderRowLargeText]}>
           <Text style={[styles.zipHeaderTitle, { color: c.ink }]}>
             {fileCount} {fileCount === 1 ? 'file' : 'files'}
             {folderCount > 0
@@ -355,8 +372,14 @@ export function ZipRenderer({
                   accessibilityRole="button"
                 >
                   <Text
-                    style={[styles.crumb, { color: isLast ? c.ink : c.amberDeep }]}
-                    numberOfLines={1}
+                    style={[
+                      styles.crumb,
+                      {
+                        color: isLast ? c.ink : c.amberDeep,
+                        maxWidth: 160 * Math.max(1, fontScale),
+                      },
+                    ]}
+                    numberOfLines={largeText ? undefined : 1}
                   >
                     {seg}
                   </Text>
@@ -385,6 +408,8 @@ export function ZipRenderer({
           initialNumToRender={20}
           windowSize={11}
           removeClippedSubviews
+          scrollEventThrottle={16}
+          onScroll={(event) => onScrollOffsetChange?.(event.nativeEvent.contentOffset.y)}
         />
       )}
     </View>
@@ -409,6 +434,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     gap: 12,
+  },
+  zipHeaderRowLargeText: {
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+    gap: 4,
   },
   zipHeaderTitle: { fontSize: 14, fontWeight: '700' },
   zipHeaderSize: { fontSize: 12, fontWeight: '500' },

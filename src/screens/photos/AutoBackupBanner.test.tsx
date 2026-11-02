@@ -22,6 +22,7 @@ mock.module('react-native', () => ({
   ActivityIndicator: host('ActivityIndicator'),
   StyleSheet: { create: (s: any) => s, absoluteFill: {}, hairlineWidth: 1 },
   Platform: platform,
+  useWindowDimensions: () => ({ width: 390, height: 844, scale: 3, fontScale: 1 }),
 }));
 
 mock.module('expo-haptics', () => ({

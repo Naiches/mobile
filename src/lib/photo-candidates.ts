@@ -81,11 +81,24 @@ export function mediaMimeType(entry: PhotoCandidateFileEntry): string | null {
     if (guessed?.startsWith('video/')) return guessed;
   }
 
-  return entry.is_media ? 'image/jpeg' : null;
+  // `is_media` says "photo or video", not which. Guessing image/jpeg here made
+  // the pager open a video row (encrypted name, no thumbnail yet) as an image.
+  return null;
+}
+
+/**
+ * The mime to hand the preview pager: the decrypted one, else what the row
+ * itself proves, else undefined (the kind is not known yet; never a guess).
+ */
+export function previewMimeType(
+  entry: PhotoCandidateFileEntry,
+  decryptedMimeTypes: Record<string, string>,
+): string | undefined {
+  return decryptedMimeTypes[entry.id] || mediaMimeType(entry) || undefined;
 }
 
 export function isMediaFile(entry: PhotoCandidateFileEntry): boolean {
-  return mediaMimeType(entry) !== null;
+  return mediaMimeType(entry) !== null || entry.is_media === true;
 }
 
 export function isEncryptedThumbnailCandidate(entry: PhotoCandidateFileEntry): boolean {

@@ -418,6 +418,66 @@ describe('cache write scope (task 1959 round 3)', () => {
   });
 });
 
+describe('stalled cache operations', () => {
+  const timedOut = Symbol('timed-out');
+
+  async function settleWithin(promise, ms = 50) {
+    let timer;
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(timedOut), ms);
+    });
+    try {
+      return await Promise.race([promise, deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  test('a cache read that never settles cannot block fresh network rows', async () => {
+    let fetches = 0;
+    const l = createFileIndexLoader({
+      fetchIndex: async () => {
+        fetches += 1;
+        return { hash: 'fresh', changed: true, count: 1, files: [row('fresh-row')] };
+      },
+      loadCache: async () => await new Promise(() => {}),
+      saveCache: async () => {},
+      cacheGeneration: () => 0,
+      now: () => 1_000,
+      revalidateMs: WINDOW,
+      cacheOperationDeadlineMs: 5,
+    });
+
+    const out = await settleWithin(l.load());
+    expect(out).not.toBe(timedOut);
+    expect(out.files.map((file) => file.id)).toEqual(['fresh-row']);
+    expect(out.source).toBe('network');
+    expect(fetches).toBe(1);
+  });
+
+  test('a cache save that never settles cannot delay fresh network rows', async () => {
+    let saveStarted = false;
+    const l = createFileIndexLoader({
+      fetchIndex: async () => ({ hash: 'fresh', changed: true, count: 1, files: [row('fresh-row')] }),
+      loadCache: async () => null,
+      saveCache: async () => {
+        saveStarted = true;
+        await new Promise(() => {});
+      },
+      cacheGeneration: () => 0,
+      now: () => 1_000,
+      revalidateMs: WINDOW,
+      cacheOperationDeadlineMs: 5,
+    });
+
+    const out = await settleWithin(l.load());
+    expect(saveStarted).toBe(true);
+    expect(out).not.toBe(timedOut);
+    expect(out.files.map((file) => file.id)).toEqual(['fresh-row']);
+    expect(out.source).toBe('network');
+  });
+});
+
 // Task 1959 round 4 (Codex P1 on PR #181): rows the sync write-through added
 // inside the window have no `is_media`. Own uploads are classified locally;
 // any other new file row makes a `revalidateUnclassified` caller ask once.

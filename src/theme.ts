@@ -186,8 +186,8 @@ export type TypeStyleName =
  * (`design/ios26-canvas`) specifies tracking: +0.2 on the 34pt screen title,
  * −0.2 on 17pt rows and labels. Everything else keeps the platform default.
  *
- * This is a FIXED scale, not Dynamic Type — a screen that must honour the
- * user's text-size setting should scale these by `PixelRatio.getFontScale()`.
+ * React Native applies the system font scale to these sizes and line heights.
+ * Do not multiply them by `PixelRatio.getFontScale()` or they will scale twice.
  */
 export const typeScale = {
   largeTitle: { fontSize: 34, lineHeight: 41, fontWeight: '700', letterSpacing: 0.2 },

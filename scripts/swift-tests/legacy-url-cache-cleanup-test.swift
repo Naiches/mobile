@@ -7,18 +7,30 @@ import SQLite3
 // persisted row behind (measured 5 -> 5 on macOS 26). This harness proves it
 // against a real Cache.db at a temp directory, then runs the shipped helper.
 
+let fm = FileManager.default
+var tempDirs: [URL] = []
+
+func cleanupTempDirs() {
+    for dir in tempDirs { try? fm.removeItem(at: dir) }
+}
+
+defer { cleanupTempDirs() }
+
 var assertions = 0
 func check(_ condition: @autoclosure () -> Bool, _ name: String) {
-    guard condition() else { print("FAIL: \(name)"); exit(1) }
+    guard condition() else {
+        print("FAIL: \(name)")
+        cleanupTempDirs()
+        exit(1)
+    }
     assertions += 1
     print("PASS: \(name)")
 }
 
-let fm = FileManager.default
-
 func makeTempDir() -> URL {
     let dir = fm.temporaryDirectory.appendingPathComponent("bb-legacy-url-cache-\(UUID().uuidString)")
     try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    tempDirs.append(dir)
     return dir
 }
 

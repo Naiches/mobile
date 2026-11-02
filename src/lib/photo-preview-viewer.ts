@@ -11,6 +11,7 @@ import type { PhotoPreviewSetting } from './photo-preview-settings';
 import { getSessionPhotoPreviewSetting } from './photo-preview-sync';
 import { getExpectedUserId } from './expected-user';
 import { sharedMasterHandleId } from './shared-folder-keys';
+import { recordRuntimeTrace } from './runtime-trace';
 
 /** The few fields of a drive file the viewer decisions need (a `FileEntry` fits). */
 export interface ViewerFile {
@@ -68,10 +69,39 @@ export function chooseImageSource(
   serverSupported: boolean,
   offlinePinned = false,
 ): ImageSource {
-  if (!serverSupported || file.has_preview !== true) return 'existing';
+  if (file.has_preview !== true) return 'existing';
   if (cached) return 'cache';
+  if (!serverSupported) return 'existing';
   // A file kept available offline uses on-device data only: never fetch its preview.
   return offlinePinned ? 'existing' : 'download-preview';
+}
+
+const PREVIEW_SIZE_LABELS: Record<number, string> = {
+  1280: '720p',
+  1920: '1080p',
+  2560: '2K',
+  3840: '4K',
+};
+
+/** Copy and size for the image bytes that are actually on screen. */
+export function displayedPhotoPreviewInfo(
+  kind: 'preview' | 'thumbnail' | 'large' | 'original' | null,
+  file: Pick<ViewerFile, 'preview_px' | 'preview_bytes'>,
+  originalBytes: number | null | undefined,
+): { detail: string; sizeBytes: number | null } {
+  if (kind === 'preview') {
+    const size = file.preview_px ? PREVIEW_SIZE_LABELS[file.preview_px] : null;
+    return {
+      detail: size ? `Preview · ${size}` : 'Preview',
+      sizeBytes: typeof file.preview_bytes === 'number' && file.preview_bytes >= 0
+        ? file.preview_bytes
+        : null,
+    };
+  }
+  return {
+    detail: 'Image',
+    sizeBytes: typeof originalBytes === 'number' && originalBytes >= 0 ? originalBytes : null,
+  };
 }
 
 export interface ViewerImage {
@@ -93,14 +123,25 @@ export async function loadStoredPreview(
       forgetStoredPreviewIfGone(file);
       return null;
     }
-    const supported = await serverSupportsPhotoPreviews();
-    if (!supported) return null;
     const expected = { format: file.preview_format ?? null, px: file.preview_px ?? null, bytes: file.preview_bytes ?? null };
     const cached = await getCachedPreview(file.id, expected);
+    recordRuntimeTrace('preview.photo_preview.cache_lookup', {
+      fileId: file.id,
+      hit: cached !== null,
+      expectedFormat: expected.format,
+      expectedPx: expected.px,
+      expectedBytes: expected.bytes,
+    });
+    // A validated local copy is usable without a network capability probe. This
+    // also makes opening an existing preview immediate on a slow connection.
+    if (cached) return { uri: cached, source: 'cache' };
+    const supported = await serverSupportsPhotoPreviews();
+    recordRuntimeTrace('preview.photo_preview.server_support', { fileId: file.id, supported });
+    if (!supported) return null;
     const source = chooseImageSource(file, cached, supported, opts.offlinePinned === true);
-    if (source === 'cache' && cached) return { uri: cached, source };
     if (source === 'download-preview') {
       const uri = await fetchPreviewToCache(file.id, expected);
+      recordRuntimeTrace('preview.photo_preview.server_fetch', { fileId: file.id, found: uri !== null });
       if (!uri) return null;
       // The preview on screen is never trimmed away.
       void getPreviewCacheLimitBytes()
@@ -108,7 +149,11 @@ export async function loadStoredPreview(
         .catch(() => {});
       return { uri, source };
     }
-  } catch {
+  } catch (error) {
+    recordRuntimeTrace('preview.photo_preview.load_failed', {
+      fileId: file.id,
+      errorName: error instanceof Error ? error.name : 'unknown',
+    });
     // fall through to the existing path
   }
   return null;

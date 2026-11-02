@@ -47,7 +47,12 @@ TMPFILES=()
 cleanup_tmp() { local f; for f in ${TMPFILES[@]+"${TMPFILES[@]}"}; do rm -f "$f"; done; }
 trap cleanup_tmp EXIT
 
-new_tmp() { local f; f="$(mktemp)"; TMPFILES+=("$f"); printf '%s' "$f"; }
+new_tmp() {
+  local target="$1" f
+  f="$(mktemp)" || return 1
+  TMPFILES+=("$f")
+  printf -v "$target" '%s' "$f"
+}
 
 report() { printf '%sclaims-guard: %s%s\n' "$RED" "$1" "$NC"; FAIL=1; }
 
@@ -60,7 +65,7 @@ git_grep_or_die() { # git_grep_or_die <outfile> <git-grep-args...>
   # anything but "no match".
   local outfile="$1"; shift
   local errfile rc
-  errfile="$(new_tmp)"
+  new_tmp errfile || exit 2
   git -C "$ROOT" grep "$@" >"$outfile" 2>"$errfile"
   rc=$?
   if [ "$rc" -gt 1 ]; then
@@ -147,7 +152,7 @@ scan() { # scan <label> <ci|cs> <ERE> <origin|claims> <pathspec...>
            ':(exclude,glob)**/marketing/**/*.md')
   fi
   local hit path rest matched outfile
-  outfile="$(new_tmp)"
+  new_tmp outfile || exit 2
   git_grep_or_die "$outfile" $flags -e "$re" -- "$@" "${excl[@]}"
   while IFS= read -r hit; do
     [ -n "$hit" ] || continue
@@ -169,7 +174,7 @@ scan() { # scan <label> <ci|cs> <ERE> <origin|claims> <pathspec...>
 
 check_hosts() {
   local hit path stripped outfile
-  outfile="$(new_tmp)"
+  new_tmp outfile || exit 2
   git_grep_or_die "$outfile" -nEI -i -e "$HOST_URL_RE" -- "${RUNTIME_PATHS[@]}" \
     ':(exclude)*.md' ':(exclude)docs/*' ':(exclude,glob)**/graphify-out/**' \
     ':(exclude,glob)**/node_modules/**' ':(exclude,glob)**/target/**' ':(exclude,glob)**/dist/**' \

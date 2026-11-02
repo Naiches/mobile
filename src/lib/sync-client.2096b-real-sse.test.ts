@@ -112,7 +112,8 @@ const realSetTimeout = globalThis.setTimeout;
 function withCapturedTimers<T>(fn: () => T): T {
   capturedTimers = [];
   globalThis.setTimeout = ((inner: () => void, ms?: number) => {
-    capturedTimers.push({ fn: inner, ms: ms ?? 0 });
+    // The 60 s stream-liveness check is covered by sync-client.liveness.test.ts.
+    if ((ms ?? 0) !== 60_000) capturedTimers.push({ fn: inner, ms: ms ?? 0 });
     return capturedTimers.length as unknown as ReturnType<typeof setTimeout>;
   }) as typeof setTimeout;
   try {
@@ -156,7 +157,8 @@ describe('real react-native-sse: clean server end (task 2096b)', () => {
     const realST = globalThis.setTimeout;
     globalThis.setTimeout = ((fn: () => void, ms?: number) => {
       const id = ++timerId;
-      sseTimers.push({ fn, ms: ms ?? 0, id });
+      // The 60 s stream-liveness check is covered by sync-client.liveness.test.ts.
+      if ((ms ?? 0) !== 60_000) sseTimers.push({ fn, ms: ms ?? 0, id });
       return id as any;
     }) as any;
     globalThis.clearTimeout = ((id: number) => {
@@ -193,7 +195,7 @@ describe('real react-native-sse: clean server end (task 2096b)', () => {
     const realST = globalThis.setTimeout;
     globalThis.setTimeout = ((fn: () => void, ms?: number) => {
       const id = ++timerId;
-      sseTimers.push({ fn, ms: ms ?? 0, id });
+      if ((ms ?? 0) !== 60_000) sseTimers.push({ fn, ms: ms ?? 0, id });
       return id as any;
     }) as any;
     globalThis.clearTimeout = ((id: number) => {

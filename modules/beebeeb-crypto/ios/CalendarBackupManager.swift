@@ -8,9 +8,8 @@ final class CalendarBackupManager {
   private static let lastScanAtKey = "io.beebeeb.calendarBackupLastScanAt"
   private static let lastScanCountKey = "io.beebeeb.calendarBackupLastScanCount"
   private static let lastUploadAtKey = "io.beebeeb.calendarBackupLastUploadAt"
-  /// Task 1531 [P2] round 6 (delta review 3, finding N2): per-calendar dedup
-  /// keys (`stateKeyComponent`) fold the calendar title AND the account id
-  /// into ONE digest, so there is no single "has THIS account ever
+  /// Per-calendar dedup keys fold the stable EventKit calendar identifier AND
+  /// the account id into one digest, so there is no single "has THIS account ever
   /// successfully uploaded" key to check directly — unlike
   /// `ContactsBackupManager.hashKey(for:)`, which IS already scoped to just
   /// the account. Recorded on every successful upload (`recordUploadSuccess`
@@ -19,6 +18,53 @@ final class CalendarBackupManager {
   /// changes since" WITHOUT enumerating every calendar before EventKit
   /// access has even been granted.
   private static let lastUploadedAccountKey = "io.beebeeb.calendarBackupLastUploadedAccount"
+
+  private static let runAccountKey = "io.beebeeb.calendarBackupRunAccount"
+  private static let identityVersionPrefix = "io.beebeeb.calendarBackupIdentityVersion."
+
+  /// Progress of the run in flight, read by `status()`. In memory only: a
+  /// run that dies with the process must not leave "running" behind.
+  private let stateLock = NSLock()
+  private var isRunning = false
+  private var progressDone = 0
+  private var progressTotal = 0
+
+  /// Record of the last runs, scoped to the bound account so an account
+  /// switch never shows the previous account's backup as this one's.
+  private var ledger: CategoryRunLedger {
+    let id = accountId ?? UserDefaults.standard.string(forKey: Self.runAccountKey)
+    return CategoryRunLedger(
+      defaults: .standard,
+      prefix: "io.beebeeb.calendarBackupRun.\(id.map(Self.accountDigest) ?? "unbound")."
+    )
+  }
+
+  private func beginRun() -> Bool {
+    stateLock.lock(); defer { stateLock.unlock() }
+    if isRunning { return false }
+    isRunning = true
+    progressDone = 0
+    progressTotal = 0
+    return true
+  }
+
+  private func setProgress(done: Int, total: Int) {
+    stateLock.lock(); defer { stateLock.unlock() }
+    progressDone = done
+    progressTotal = total
+  }
+
+  private func endRun() {
+    stateLock.lock(); defer { stateLock.unlock() }
+    isRunning = false
+  }
+
+  private static var isPermissionDenied: Bool {
+    let status = EKEventStore.authorizationStatus(for: .event)
+    if status == .denied || status == .restricted { return true }
+    if #available(iOS 17.0, *), status == .writeOnly { return true }
+    return false
+  }
 
   private let store = EKEventStore()
   private var authToken: String?
@@ -56,11 +102,24 @@ final class CalendarBackupManager {
     KeychainManager.loadString(key: "io.beebeeb.serverURL")
   }
 
-  private init() {}
+  private init() {
+    NotificationCenter.default.addObserver(
+      forName: Notification.Name.EKEventStoreChanged,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      guard self?.authToken != nil, self?.accountId != nil else { return }
+      self?.backup()
+    }
+  }
 
-  func enable(authToken: String, userId: String, runNow: Bool = true) {
+  /// Bind the manager and shared native engine to an account without asking
+  /// for permission and without starting an export. Manual UI actions use this
+  /// before `backupNow`, so a forced request cannot race an automatic run.
+  func prepare(authToken: String, userId: String) {
     self.authToken = authToken
     self.accountId = userId
+    UserDefaults.standard.set(userId, forKey: Self.runAccountKey)
     // Task 1531 [P2] round 6 (delta review 3, finding N3): also mirror the
     // token into the ENGINE's own Keychain slot (`io.beebeeb.backupToken`,
     // via `NativeBackupEngine.token`'s setter) — not just this manager's
@@ -83,6 +142,11 @@ final class CalendarBackupManager {
     // triggers via `start()`, now guaranteed regardless of which backup
     // surface is enabled first.
     NativeBackupEngine.shared.bindAccount(userId: userId)
+    RuntimeTrace.event("backup.calendar.prepare")
+  }
+
+  func enable(authToken: String, userId: String, runNow: Bool = true) {
+    prepare(authToken: authToken, userId: userId)
     if runNow { NativeBackupEngine.shared.clearAuxiliaryAccountRefusal(accountId: userId) }
     RuntimeTrace.event("backup.calendar.enable", ["runNow": runNow])
     // Task 1531 [P2] round 6 (finding N2): see the matching comment in
@@ -94,7 +158,8 @@ final class CalendarBackupManager {
     // this account has never recorded a successful calendar upload at all.
     let hasUploadedForThisAccount =
       UserDefaults.standard.string(forKey: Self.lastUploadedAccountKey) == Self.accountDigest(userId)
-    requestAccessAndBackup(runNow: runNow || !hasUploadedForThisAccount)
+    let needsIdentityMigration = Self.identityMigrationRequired(accountId: userId)
+    requestAccessAndBackup(runNow: runNow || !hasUploadedForThisAccount || needsIdentityMigration)
   }
 
   func disable() {
@@ -116,6 +181,10 @@ final class CalendarBackupManager {
     defaults.removeObject(forKey: Self.lastScanAtKey)
     defaults.removeObject(forKey: Self.lastScanCountKey)
     defaults.removeObject(forKey: Self.lastUploadAtKey)
+    if let id = accountId ?? defaults.string(forKey: Self.runAccountKey) {
+      defaults.removeObject(forKey: Self.identityVersionKey(accountId: id))
+    }
+    ledger.reset()
     RuntimeTrace.event("backup.calendar.reset")
   }
 
@@ -126,40 +195,159 @@ final class CalendarBackupManager {
     ])
   }
 
-  func backup() {
-    guard !NativeBackupEngine.shared.accountUploadRefused else { return }
-    guard let token = authToken, let accountId, !accountId.isEmpty else { return }
+  @discardableResult
+  func backup(force: Bool = false) -> CategoryBackupRunAdmission {
+    guard !NativeBackupEngine.shared.accountUploadRefused else { return .accountRefused }
+    guard let token = authToken, let accountId, !accountId.isEmpty else { return .notBound }
+    guard beginRun() else { return .alreadyRunning }
     RuntimeTrace.event("backup.calendar.start")
+    let runLedger = ledger
     DispatchQueue.global(qos: .background).async { [weak self] in
       guard let self else { return }
+      if Self.isPermissionDenied {
+        runLedger.recordFailure(code: "permission_denied")
+        self.endRun()
+        return
+      }
       let calendars = self.store.calendars(for: .event)
       RuntimeTrace.event("backup.calendar.enumerated", ["calendarCount": calendars.count])
       let start = Calendar.current.date(byAdding: .year, value: -5, to: Date())!
       let end = Calendar.current.date(byAdding: .year, value: 2, to: Date())!
-      var scannedEventCount = 0
+      // Read every calendar first so progress can say "120 of 512".
+      var batches: [(cal: EKCalendar, events: [EKEvent])] = []
       for cal in calendars {
         let predicate = self.store.predicateForEvents(withStart: start, end: end, calendars: [cal])
         let events = self.store.events(matching: predicate)
-        scannedEventCount += events.count
-        if events.isEmpty { continue }
-        let ical = self.exportICal(calendar: cal, events: events)
-        guard let data = ical.data(using: .utf8) else { continue }
-        // Task 1531 [P1-B] (round 5 delta review): the per-calendar dedup
-        // key now also folds in `accountId` (see `stateKeyComponent`) — an
-        // account switch (A → B) with an identical calendar must still
-        // upload once for B, not skip because it hash-matches A's last
-        // upload of the SAME calendar title.
-        let stateKey = Self.lastHashPrefix + self.stateKeyComponent(for: cal.title, accountId: accountId)
-        let digest = Self.contentDigest(data: data)
-        guard self.shouldUpload(digest: digest, stateKey: stateKey) else {
-          RuntimeTrace.event("backup.calendar.skipped_unchanged", ["eventCount": events.count])
-          continue
-        }
-        let fileName = self.safeFileName(cal.title) + ".ics"
-        self.upload(data: data, fileName: fileName, token: token, accountId: accountId, stateKey: stateKey, digest: digest)
+        if !events.isEmpty { batches.append((cal, events)) }
       }
-      self.recordScan(count: scannedEventCount)
+      let scannedEventCount = batches.reduce(0) { $0 + $1.events.count }
+      // Zero events, or far fewer than the last verified backup, is more
+      // likely a calendar store that is off or still syncing: keep the backup.
+      // This total check is the coarse guard; each calendar is also checked
+      // against its own baseline below, so one calendar cannot shrink behind
+      // the others.
+      if let reason = BackupExportVerification.incompleteReason(count: scannedEventCount, lastVerified: runLedger.lastVerifiedCount, force: force) {
+        RuntimeTrace.event("backup.calendar.incomplete", ["count": scannedEventCount, "lastVerified": runLedger.lastVerifiedCount ?? -1])
+        runLedger.recordFailure(code: reason, refusedCount: scannedEventCount)
+        self.endRun()
+        return
+      }
+      self.setProgress(done: 0, total: scannedEventCount)
+      var done = 0
+      var failureCode: String?
+      var uploadedAny = false
+      var totalBytes = 0
+      var refusedCode: String?
+      var baselineTotal = 0
+      var fetcher: CategoryBackupBaselineFetcher?
+      AsyncSerialPipeline.forEach(
+        batches,
+        start: { calAndEvents, next in
+          let (cal, events) = calAndEvents
+          let finishBatch = {
+            done += events.count
+            self.setProgress(done: done, total: scannedEventCount)
+            next()
+          }
+          let ical = self.exportICal(calendar: cal, events: events)
+          guard let data = ical.data(using: .utf8) else {
+            failureCode = failureCode ?? "export_failed"
+            finishBatch()
+            return
+          }
+          // Parse the file back before it leaves the device: a mismatch or a
+          // file that does not parse fails this calendar and its previous
+          // backup stays in place.
+          let outcome = BackupExportVerification.verifyICal(data, expected: events.count)
+          guard outcome.ok else {
+            RuntimeTrace.event("backup.calendar.verify_failed", ["reason": outcome.reason ?? "unknown"])
+            failureCode = "verify_failed"
+            finishBatch()
+            return
+          }
+          // Per-calendar baseline: this device's verified count for this
+          // calendar, or, when it has none, the calendar's file on the server.
+          let identity = CalendarBackupIdentity(
+            accountId: accountId,
+            calendarIdentifier: cal.calendarIdentifier
+          )
+          let itemKey = identity.itemKey
+          let localCount = runLedger.itemCount(for: itemKey)
+          let gate = BackupExportVerification.gate(
+            count: events.count,
+            localBaseline: localCount,
+            force: force,
+            serverBaseline: {
+              guard let base = self.serverBaseURL, let folder = self.parentFolderId, !folder.isEmpty else { return .unavailable }
+              if fetcher == nil { fetcher = CategoryBackupBaselineFetcher(apiUrl: base, token: token, parentFolderId: folder) }
+              return fetcher!.baseline(fileName: identity.fileName, count: BackupExportVerification.countICalEvents)
+            })
+          switch gate {
+          case .refuse(let code, _, let stored):
+            if let stored { runLedger.setItemCount(stored, for: itemKey) }
+            baselineTotal += stored ?? localCount ?? events.count
+            RuntimeTrace.event("backup.calendar.refused", ["code": code, "eventCount": events.count])
+            if code == "incomplete_export" { refusedCode = code } else if refusedCode == nil { failureCode = code }
+            finishBatch()
+            return
+          case .proceed(let stored):
+            if let stored { runLedger.setItemCount(stored, for: itemKey) }
+            baselineTotal += stored ?? localCount ?? events.count
+          }
+          totalBytes += data.count
+          // The per-calendar dedup key also folds in `accountId` — an
+          // account switch (A → B) with an identical calendar must still
+          // upload once for B, not skip because it hash-matches A's last
+          // upload of the SAME calendar title.
+          // Version the digest namespace with the filename projection. When
+          // that projection changes, an older digest cannot suppress the
+          // one-time migration upload under the new stable filename.
+          let stateKey = Self.lastHashPrefix
+            + "v\(CalendarBackupIdentity.currentVersion)."
+            + identity.itemKey
+          let digest = Self.contentDigest(data: data)
+          guard self.shouldUpload(digest: digest, stateKey: stateKey) else {
+            RuntimeTrace.event("backup.calendar.skipped_unchanged", ["eventCount": events.count])
+            runLedger.setItemCount(events.count, for: itemKey)
+            finishBatch()
+            return
+          }
+          let fileName = identity.fileName
+          let uploadStarted = BackupExportVerification.uploadIfVerified(outcome) {
+            self.upload(data: data, fileName: fileName, token: token, accountId: accountId, stateKey: stateKey, digest: digest) { ok in
+              if ok { uploadedAny = true; runLedger.setItemCount(events.count, for: itemKey) } else { failureCode = "upload_failed" }
+              finishBatch()
+            }
+          }
+          if !uploadStarted {
+            failureCode = "verify_failed"
+            finishBatch()
+          }
+        },
+        completion: {
+          self.recordScan(count: scannedEventCount)
+          if let refusedCode {
+            // The numbers the "Back up anyway" prompt shows: what the calendars
+            // held before this run against what this run found.
+            runLedger.setVerifiedCount(baselineTotal)
+            runLedger.recordFailure(code: refusedCode, refusedCount: scannedEventCount)
+          } else if let failureCode {
+            runLedger.recordFailure(code: failureCode)
+          } else {
+            runLedger.recordSuccess(count: scannedEventCount, bytes: totalBytes, uploaded: uploadedAny)
+            Self.recordIdentityVersion(accountId: accountId)
+          }
+          self.endRun()
+        }
+      )
     }
+    return .started
+  }
+
+  /// Run now: used by "Back up now" and when access is granted after a denial.
+  @discardableResult
+  func backupNow(force: Bool = false) -> CategoryBackupRunAdmission {
+    backup(force: force)
   }
 
   func status() -> [String: Any] {
@@ -171,7 +359,14 @@ final class CalendarBackupManager {
       hasCalendarHash ||
       defaults.string(forKey: Self.lastScanAtKey) != nil ||
       defaults.string(forKey: Self.lastUploadAtKey) != nil
-    return [
+    stateLock.lock()
+    let running = isRunning, done = progressDone, total = progressTotal
+    stateLock.unlock()
+    var result: [String: Any] = [
+      "running": running,
+      "progressDone": done,
+      "progressTotal": total,
+      "permissionDenied": Self.isPermissionDenied,
       "lastScanAt": defaults.string(forKey: Self.lastScanAtKey) as Any? ?? NSNull(),
       "lastScanCount": defaults.integer(forKey: Self.lastScanCountKey),
       "lastUploadAt": defaults.string(forKey: Self.lastUploadAtKey) as Any? ?? NSNull(),
@@ -181,13 +376,18 @@ final class CalendarBackupManager {
       "parentFolderId": parentFolderId as Any? ?? NSNull(),
       "hasKnownBackupState": hasKnownBackupState
     ]
+    for (key, value) in ledger.fields() { result[key] = value }
+    return result
   }
 
   private func requestAccessAndBackup(runNow: Bool) {
     if #available(iOS 17.0, *) {
       store.requestFullAccessToEvents { [weak self] granted, _ in
         RuntimeTrace.event("backup.calendar.permission", ["granted": granted])
-        guard granted else { return }
+        guard granted else {
+          self?.ledger.recordFailure(code: "permission_denied")
+          return
+        }
         if runNow {
           self?.backup()
         }
@@ -195,7 +395,10 @@ final class CalendarBackupManager {
     } else {
       store.requestAccess(to: .event) { [weak self] granted, _ in
         RuntimeTrace.event("backup.calendar.permission", ["granted": granted])
-        guard granted else { return }
+        guard granted else {
+          self?.ledger.recordFailure(code: "permission_denied")
+          return
+        }
         if runNow {
           self?.backup()
         }
@@ -297,46 +500,38 @@ final class CalendarBackupManager {
     return result
   }
 
-  /// Sanitize a calendar title for use as a filename. The encrypted-name
-  /// envelope ultimately wraps this, but the display name shown when the
-  /// user downloads the .ics needs to be filesystem-safe.
-  private func safeFileName(_ title: String) -> String {
-    let invalid = CharacterSet(charactersIn: "/\\:?*\"<>|")
-    let cleaned = title.components(separatedBy: invalid).joined(separator: "_")
-    return cleaned.isEmpty ? "Calendar" : cleaned
-  }
-
-  /// Hash a calendar title + account id to a stable ASCII-safe component
-  /// for the per-calendar, per-account dedup key in UserDefaults. Calendar
-  /// titles can contain any character; the SHA-256 hex keeps the key
-  /// well-formed regardless. Task 1531 [P1-B] (round 5 delta review): now
-  /// also folds in `accountId` — a NUL separator keeps the two inputs from
-  /// ever colliding (neither a calendar title nor a server-issued account
-  /// id can contain a NUL byte) — so an account switch (A → B) with an
-  /// identical calendar no longer hash-matches A's last upload and gets
-  /// silently skipped for B.
-  private func stateKeyComponent(for title: String, accountId: String) -> String {
-    let digest = SHA256.hash(data: Data("\(accountId)\u{0}\(title)".utf8))
-    return digest.map { String(format: "%02x", $0) }.joined()
-  }
-
   private static func contentDigest(data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
   }
 
   /// Task 1531 [P2] round 6 (finding N2): SHA-256 hex digest of a bare
   /// account id — see `lastUploadedAccountKey`'s doc comment. Deliberately
-  /// a SEPARATE hash from `stateKeyComponent` (which mixes in the calendar
-  /// title too): this one must be reproducible from `userId` ALONE, before
+  /// a SEPARATE hash from `CalendarBackupIdentity.itemKey` (which mixes in the
+  /// stable EventKit identifier too): this must be reproducible from `userId` alone, before
   /// any calendar has even been enumerated.
   private static func accountDigest(_ accountId: String) -> String {
     SHA256.hash(data: Data(accountId.utf8)).map { String(format: "%02x", $0) }.joined()
   }
 
+  private static func identityVersionKey(accountId: String) -> String {
+    identityVersionPrefix + accountDigest(accountId)
+  }
+
+  private static func identityMigrationRequired(accountId: String) -> Bool {
+    let stored = UserDefaults.standard.object(forKey: identityVersionKey(accountId: accountId)) as? Int
+    return CalendarBackupIdentity.requiresMigration(storedVersion: stored)
+  }
+
+  private static func recordIdentityVersion(accountId: String) {
+    UserDefaults.standard.set(
+      CalendarBackupIdentity.currentVersion,
+      forKey: identityVersionKey(accountId: accountId)
+    )
+  }
+
   /// Task 1531 [P1-B] (round 5 delta review): READ-ONLY — reports whether
   /// `digest` differs from the digest last SUCCESSFULLY uploaded for this
-  /// `stateKey` (already scoped by calendar + account — see
-  /// `stateKeyComponent`). The previous version wrote the digest here,
+  /// `stateKey` (already scoped by stable calendar id + account). The previous version wrote the digest here,
   /// BEFORE the upload ran, so a refused/failed upload (network error,
   /// account-mismatch refusal, no cached master key — see
   /// `NativeEncryptedBackupUploader`) was indistinguishable from a
@@ -366,7 +561,7 @@ final class CalendarBackupManager {
   /// via `accountDigest` — under `lastUploadedAccountKey`, so `enable()`'s
   /// warm-up path can tell "this account has uploaded at least one
   /// calendar successfully" without needing to enumerate every calendar's
-  /// own `stateKeyComponent` key first.
+  /// own `CalendarBackupIdentity.itemKey` first.
   private func recordUploadSuccess(digest: String, stateKey: String, accountId: String) {
     let now = ISO8601DateFormatter().string(from: Date())
     let defaults = UserDefaults.standard
@@ -386,15 +581,17 @@ final class CalendarBackupManager {
   // temp files and calling the Rust upload function instead of the Swift HTTP
   // uploader. NativeBackupEngine already demonstrates the pattern. For now this
   // continues using the legacy Swift uploader which still works correctly.
-  private func upload(data: Data, fileName: String, token: String, accountId: String, stateKey: String, digest: String) {
+  private func upload(data: Data, fileName: String, token: String, accountId: String, stateKey: String, digest: String, completion: @escaping (Bool) -> Void) {
     guard let serverBaseURL else {
       RuntimeTrace.event("backup.calendar.upload_aborted", ["reason": "missing_server_url"])
       NSLog("[BeebeebBackup] calendar upload aborted: serverURL not configured in keychain (sign in again to set)")
+      completion(false)
       return
     }
     guard let parentFolderId, !parentFolderId.isEmpty else {
       RuntimeTrace.event("backup.calendar.upload_aborted", ["reason": "missing_parent_folder"])
       NSLog("[BeebeebBackup] calendar upload of \(fileName) aborted: backup destination folder not configured")
+      completion(false)
       return
     }
     let mimeType = "text/calendar"
@@ -412,9 +609,11 @@ final class CalendarBackupManager {
         self.recordUploadSuccess(digest: digest, stateKey: stateKey, accountId: accountId)
         RuntimeTrace.event("backup.calendar.upload_success")
         NSLog("[BeebeebBackup] calendar upload succeeded")
+        completion(true)
       case .failure(let error):
         RuntimeTrace.event("backup.calendar.upload_failed", ["error": error.localizedDescription])
         NSLog("[BeebeebBackup] calendar upload of \(fileName) failed: \(error.localizedDescription)")
+        completion(false)
       }
     }
   }

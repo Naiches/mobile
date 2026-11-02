@@ -38,6 +38,42 @@ export interface MovePickerFolderNode {
 export const MOVE_PICKER_MAX_FOLDERS = 2000;
 
 /**
+ * The whole folder tree from the file index rows (one cached read). The
+ * Photos tab opens "Move to…" from deep inside the Backups tree, where walking
+ * folder by folder means paging through every camera-roll folder just to find
+ * subfolders; the index already has every live folder, root included.
+ */
+export function folderNodesFromIndex(
+  files: Array<Pick<FileEntry, 'id' | 'is_folder' | 'parent_id' | 'name_encrypted'> & { is_trashed?: boolean }>,
+  maxFolders: number = Number.POSITIVE_INFINITY,
+): MovePickerFolderNode[] {
+  const nodes: MovePickerFolderNode[] = [];
+  for (const f of files) {
+    if (!f.is_folder || f.is_trashed) continue;
+    nodes.push({ id: f.id, name_encrypted: f.name_encrypted ?? '', parent_id: f.parent_id ?? null });
+  }
+  if (nodes.length <= maxFolders) return nodes;
+  // Over the cap: keep the shallowest folders so the top of the tree stays reachable.
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const depthOf = (n: MovePickerFolderNode): number => {
+    let depth = 0;
+    let cur: MovePickerFolderNode | undefined = n;
+    const seen = new Set<string>();
+    while (cur && cur.parent_id && byId.has(cur.parent_id) && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      cur = byId.get(cur.parent_id);
+      depth += 1;
+    }
+    return depth;
+  };
+  return nodes
+    .map((n, i) => ({ n, i, d: depthOf(n) }))
+    .sort((a, b) => a.d - b.d || a.i - b.i)
+    .slice(0, Math.max(0, maxFolders))
+    .map((x) => x.n);
+}
+
+/**
  * Breadth-first walk of the vault's folder tree via a caller-supplied
  * lister (one call per level, not one call per folder pair — same shape as
  * `listAllFiles(parentId)`). Returns every folder found (never files),

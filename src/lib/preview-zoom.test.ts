@@ -12,6 +12,8 @@ import {
   isDoubleTap,
   isTapGesture,
   isZoomed,
+  resolveProgrammaticZoomScale,
+  resolveZoomScale,
   shouldBlockPaging,
 } from './preview-zoom';
 
@@ -45,6 +47,36 @@ describe('zoomed -> block paging predicate', () => {
     expect(shouldBlockPaging(2.5)).toBe(true);
     expect(shouldBlockPaging(5)).toBe(true);
     expect(isZoomed(1.2)).toBe(true);
+  });
+});
+
+describe('native zoom event scale', () => {
+  test('keeps the current scale when a programmatic scroll omits zoomScale', () => {
+    expect(resolveZoomScale(undefined, DOUBLE_TAP_ZOOM_SCALE)).toBe(DOUBLE_TAP_ZOOM_SCALE);
+    expect(resolveZoomScale(1.75, DOUBLE_TAP_ZOOM_SCALE)).toBe(1.75);
+  });
+
+  test('ignores stale native scales until a programmatic zoom reaches its side of 1x', () => {
+    expect(resolveProgrammaticZoomScale(1, 1, DOUBLE_TAP_ZOOM_SCALE)).toEqual({
+      scale: DOUBLE_TAP_ZOOM_SCALE,
+      pendingScale: DOUBLE_TAP_ZOOM_SCALE,
+    });
+    expect(resolveProgrammaticZoomScale(undefined, DOUBLE_TAP_ZOOM_SCALE, DOUBLE_TAP_ZOOM_SCALE)).toEqual({
+      scale: DOUBLE_TAP_ZOOM_SCALE,
+      pendingScale: DOUBLE_TAP_ZOOM_SCALE,
+    });
+    expect(resolveProgrammaticZoomScale(1.2, DOUBLE_TAP_ZOOM_SCALE, DOUBLE_TAP_ZOOM_SCALE)).toEqual({
+      scale: 1.2,
+      pendingScale: null,
+    });
+    expect(resolveProgrammaticZoomScale(2.5, 2.5, 1)).toEqual({
+      scale: 1,
+      pendingScale: 1,
+    });
+    expect(resolveProgrammaticZoomScale(1, 1, 1)).toEqual({
+      scale: 1,
+      pendingScale: null,
+    });
   });
 });
 

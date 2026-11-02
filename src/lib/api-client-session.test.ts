@@ -1,5 +1,6 @@
 // @ts-nocheck
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, jest, mock, test } from 'bun:test';
+import { DEFAULT_SCREEN_REQUEST_TIMEOUT_MS } from './fetch-deadline';
 
 const store = new Map<string, string>();
 let secureStoreGetQueue: Array<(key: string) => Promise<string | null>> = [];
@@ -110,7 +111,26 @@ beforeEach(() => {
   secureStoreGetQueue = [];
 });
 
+afterEach(() => {
+  jest.useRealTimers();
+});
+
 describe('session generation guards', () => {
+  test('request header preparation times out before fetch when the token read never settles', async () => {
+    jest.useFakeTimers();
+    secureStoreGetQueue.push(() => new Promise<string | null>(() => {}));
+    const { ApiError, listFilesPage } = await loadFreshApi();
+
+    const pending = listFilesPage({});
+    jest.advanceTimersByTime(DEFAULT_SCREEN_REQUEST_TIMEOUT_MS);
+
+    const error = await pending.catch((caught) => caught);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(0);
+    expect(error.message).toContain('too long to respond');
+    expect(fetchCalls).toHaveLength(0);
+  });
+
   test('stale token read resolving after setToken does not overwrite cached token', async () => {
     store.set(TOKEN_KEY, 'old-token');
     let resolveOldRead!: (value: string | null) => void;
@@ -264,6 +284,7 @@ describe('uploadEncryptedChunked v2 name correction', () => {
       },
     });
 
+    expect(JSON.parse(fetchCalls[0].init.body as string).file_id).toBe('client-file');
     expect(completed.name_encrypted).toBe('final-name');
     expect(fetchCalls.filter((call) => call.init.method === 'PATCH')).toHaveLength(2);
     expect(store.has('beebeeb_upload_resume_retry-success')).toBe(false);

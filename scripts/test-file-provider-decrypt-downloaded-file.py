@@ -14,6 +14,7 @@ real AES-GCM.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -138,7 +139,7 @@ def build_swift(body: str, read_exactly: str) -> str:
           }}
         }}
 
-        let scratch = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("beebeeb-fp-decrypt-\\(UUID().uuidString)", isDirectory: true)
+        let scratch = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try! FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         private var fileCounter = 0
 
@@ -249,6 +250,7 @@ def build_swift(body: str, read_exactly: str) -> str:
           }}
         }}
 
+        try? FileManager.default.removeItem(at: scratch)
         print("RESULT pass=\\(passCount) fail=\\(failCount)")
         if failCount > 0 {{ exit(1) }}
         '''
@@ -282,8 +284,18 @@ def main() -> int:
     program = build_swift(body, read_exactly)
     with tempfile.TemporaryDirectory(prefix='beebeeb-fp-decrypt-') as tmpdir:
         temp = Path(tmpdir) / 'DecryptDownloadedFileHarness.swift'
+        scratch = Path(tmpdir) / 'runtime'
+        tool_tmp = Path(tmpdir) / 'tool-tmp'
+        tool_tmp.mkdir()
         temp.write_text(program)
-        result = subprocess.run(['swift', str(temp)], text=True, capture_output=True)
+        child_env = os.environ.copy()
+        child_env['TMPDIR'] = f'{tool_tmp}{os.sep}'
+        result = subprocess.run(
+            ['swift', str(temp), str(scratch)],
+            text=True,
+            capture_output=True,
+            env=child_env,
+        )
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
         return result.returncode

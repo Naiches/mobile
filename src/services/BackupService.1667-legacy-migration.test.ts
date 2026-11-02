@@ -108,6 +108,7 @@ mock.module('../../modules/beebeeb-crypto', () => ({
   getCalendarBackupStatus: async () => ({ hasKnownBackupState: false }),
   resetContactsBackup: async () => {},
   resetCalendarBackup: async () => {},
+  wakePhotoBackupDrain: async () => {},
 }));
 mock.module('../lib/encrypted-upload', () => ({
   encryptedUpload: async () => ({ id: 'manifest' }),
@@ -128,6 +129,11 @@ mock.module('../lib/thumbnail-cache', () => ({
 mock.module('../lib/name-cache', () => ({ loadNameCache: async () => ({}), pruneNameCache: async () => {} }));
 mock.module('../lib/device-identity', () => ({ getDeviceId: async () => 'device-1' }));
 const traces: Array<{ name: string; fields: Record<string, unknown> }> = [];
+mock.module('../lib/file-provider-mount', () => ({
+  syncDecryptedEntriesToFileProvider: async () => 0,
+  removeFromFileProviderCache: async () => {},
+  setFileProviderProtectedBackupsRoot: async () => {},
+}));
 mock.module('../lib/runtime-trace', () => ({
   recordRuntimeTrace: (name: string, fields: Record<string, unknown> = {}) => { traces.push({ name, fields }); return null; },
 }));

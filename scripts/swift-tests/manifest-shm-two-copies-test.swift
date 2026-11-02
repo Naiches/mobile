@@ -276,13 +276,12 @@ if args.count >= 3, args[1] == "--child" {
   print("child: survived")
   fflush(stdout)
   _ = exClose(js)
-  try? fm.removeItem(at: dir)
+  try? fm.removeItem(at: root)
   exit(0)
 }
 
 try? fm.removeItem(at: root)
 try! fm.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? fm.removeItem(at: root) }
 print("expo copy (JS, dlopen): SQLite \(String(cString: exLibVersion()!)); engine side (import ManifestSQLite): SQLite \(String(cString: exsqlite3_libversion()))")
 
 // MARK: - (e0) one copy: the engine side binds the image JS uses
@@ -469,10 +468,14 @@ do {
          "e3: JS closing while the engine's handle is open leaves -wal/-shm and the engine reads JS's write (open \(rc3), write \(jsWrite), close \(jsClosed), kept \(kept))")
 }
 
+let exitCode: Int32
 if failures.isEmpty {
   print("manifest-shm-two-copies: \(total) assertions, 0 failed")
-  exit(0)
+  exitCode = 0
+} else {
+  for f in failures { print("FAIL: \(f)") }
+  print("manifest-shm-two-copies: \(failures.count) of \(total) assertions FAILED")
+  exitCode = 1
 }
-for f in failures { print("FAIL: \(f)") }
-print("manifest-shm-two-copies: \(failures.count) of \(total) assertions FAILED")
-exit(1)
+try? fm.removeItem(at: root)
+exit(exitCode)

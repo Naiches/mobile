@@ -18,11 +18,13 @@ import {
   ActivityIndicator,
   Alert,
   Keyboard,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
   TouchableWithoutFeedback,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -77,6 +79,8 @@ export function ConstellationScannerScreen() {
   const { user } = useAuth();
   const crypto = useCrypto();
   const { showToast } = useToast();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const [phase, setPhase] = useState<Phase>('idle');
   const [errorText, setErrorText] = useState<string | null>(null);
   const [codeInput, setCodeInput] = useState('');
@@ -355,7 +359,12 @@ export function ConstellationScannerScreen() {
             <Text style={styles.backText}>{phase === 'received' ? 'Done' : 'Cancel'}</Text>
           </TouchableOpacity>
 
-          <View style={styles.body}>
+          <ScrollView
+            style={styles.bodyScroll}
+            contentContainerStyle={styles.body}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
             {phase === 'idle' && (
               <>
                 <Text style={styles.title}>Receive a file</Text>
@@ -403,7 +412,11 @@ export function ConstellationScannerScreen() {
                   accessibilityLabel="Six-digit transfer code"
                 />
                 <TouchableOpacity
-                  style={[styles.primaryButton, codeInput.length !== 6 && styles.primaryButtonDisabled]}
+                  style={[
+                    styles.primaryButton,
+                    accessibilityLayout && styles.buttonAccessibility,
+                    codeInput.length !== 6 && styles.primaryButtonDisabled,
+                  ]}
                   onPress={handleSubmitCode}
                   disabled={codeInput.length !== 6}
                   activeOpacity={0.8}
@@ -452,7 +465,11 @@ export function ConstellationScannerScreen() {
                   Server copy is being deleted.
                 </Text>
                 <TouchableOpacity
-                  style={[styles.primaryButton, savingToVault && styles.primaryButtonDisabled]}
+                  style={[
+                    styles.primaryButton,
+                    accessibilityLayout && styles.buttonAccessibility,
+                    savingToVault && styles.primaryButtonDisabled,
+                  ]}
                   onPress={handleSaveToVault}
                   activeOpacity={0.8}
                   disabled={savingToVault}
@@ -463,7 +480,7 @@ export function ConstellationScannerScreen() {
                   </Text>
                 </TouchableOpacity>
                 <TouchableOpacity
-                  style={styles.outlineButton}
+                  style={[styles.outlineButton, accessibilityLayout && styles.buttonAccessibility]}
                   onPress={handleSave}
                   activeOpacity={0.8}
                   accessibilityRole="button"
@@ -471,7 +488,7 @@ export function ConstellationScannerScreen() {
                   <Text style={styles.outlineButtonText}>Save to device</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
-                  style={styles.outlineButton}
+                  style={[styles.outlineButton, accessibilityLayout && styles.buttonAccessibility]}
                   onPress={handleClose}
                   activeOpacity={0.7}
                   accessibilityRole="button"
@@ -486,7 +503,7 @@ export function ConstellationScannerScreen() {
                 <Text style={styles.title}>Transfer cancelled</Text>
                 <Text style={styles.status}>The other side ended this transfer.</Text>
                 <TouchableOpacity
-                  style={styles.outlineButton}
+                  style={[styles.outlineButton, accessibilityLayout && styles.buttonAccessibility]}
                   onPress={handleClose}
                   activeOpacity={0.7}
                   accessibilityRole="button"
@@ -501,7 +518,7 @@ export function ConstellationScannerScreen() {
                 <Text style={styles.title}>Something went wrong</Text>
                 <Text style={styles.status}>{errorText ?? 'Please try again.'}</Text>
                 <TouchableOpacity
-                  style={styles.outlineButton}
+                  style={[styles.outlineButton, accessibilityLayout && styles.buttonAccessibility]}
                   onPress={handleClose}
                   activeOpacity={0.7}
                   accessibilityRole="button"
@@ -510,7 +527,7 @@ export function ConstellationScannerScreen() {
                 </TouchableOpacity>
               </>
             )}
-          </View>
+          </ScrollView>
         </View>
       </TouchableWithoutFeedback>
     </SafeAreaView>
@@ -575,6 +592,9 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: darkColors.darkBg,
   },
+  bodyScroll: {
+    flex: 1,
+  },
   backRow: {
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
@@ -584,7 +604,7 @@ const styles = StyleSheet.create({
     color: darkColors.ink2,
   },
   body: {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     paddingHorizontal: spacing.xl,
     paddingTop: spacing.xl,
@@ -656,8 +676,10 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
+    maxWidth: '90%',
   },
   scanningText: {
+    flexShrink: 1,
     fontSize: 12,
     color: darkColors.ink,
     fontWeight: '600',
@@ -673,6 +695,7 @@ const styles = StyleSheet.create({
     borderBottomColor: darkColors.line2,
     paddingVertical: spacing.sm,
     minWidth: 220,
+    maxWidth: '100%',
     marginBottom: spacing.lg,
   },
   primaryButton: {
@@ -691,6 +714,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: darkColors.black,
     letterSpacing: 0.5,
+    textAlign: 'center',
   },
   outlineButton: {
     paddingHorizontal: spacing.xl,
@@ -707,6 +731,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: darkColors.ink2,
     letterSpacing: 0.5,
+    textAlign: 'center',
   },
   status: {
     fontSize: 13,
@@ -731,5 +756,9 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginVertical: spacing.md,
     paddingHorizontal: spacing.sm,
+  },
+  buttonAccessibility: {
+    width: '100%',
+    minWidth: 0,
   },
 });

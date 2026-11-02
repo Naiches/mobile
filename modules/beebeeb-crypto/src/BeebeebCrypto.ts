@@ -822,6 +822,17 @@ export async function storeKeyInKeychain(key: Uint8Array, label: string): Promis
 }
 
 /**
+ * Ask iOS Keychain whether an Expo SecureStore item exists without returning
+ * its value over the bridge. A build without the native probe fails closed.
+ */
+export async function secureStoreItemExistsWithoutReadingData(label: string): Promise<boolean> {
+  if (typeof BeebeebCryptoModule.secureStoreItemExistsWithoutReadingData !== 'function') {
+    throw new Error('The SecureStore metadata probe is not available in this build')
+  }
+  return Boolean(await BeebeebCryptoModule.secureStoreItemExistsWithoutReadingData(label))
+}
+
+/**
  * Load a key from the platform secure enclave. Returns null if not found.
  * Triggers a biometric or passcode prompt if the SE access control requires it.
  */
@@ -1136,6 +1147,73 @@ export async function removeFileProviderEntries(ids: string[]): Promise<number> 
   if (ids.length === 0) return 0
   if (typeof BeebeebCryptoModule.removeFileProviderEntries !== 'function') return 0
   return BeebeebCryptoModule.removeFileProviderEntries(ids)
+}
+
+/**
+ * When the Files extension last told Files "Authentication Required" (Unix seconds), or null.
+ * iOS only; null elsewhere or on an older native build.
+ */
+export async function getFileProviderAuthRequiredAt(): Promise<number | null> {
+  if (typeof BeebeebCryptoModule.getFileProviderAuthRequiredAt !== 'function') return null
+  const value = await BeebeebCryptoModule.getFileProviderAuthRequiredAt()
+  return typeof value === 'number' ? value : null
+}
+
+/** Forgets that record once the app has handled it. */
+export async function clearFileProviderAuthRequired(): Promise<boolean> {
+  if (typeof BeebeebCryptoModule.clearFileProviderAuthRequired !== 'function') return false
+  return BeebeebCryptoModule.clearFileProviderAuthRequired()
+}
+
+/** Signals Files to reload the root and the working set. */
+export async function signalFileProviderEnumerators(): Promise<boolean> {
+  if (typeof BeebeebCryptoModule.signalFileProviderEnumerators !== 'function') return false
+  return BeebeebCryptoModule.signalFileProviderEnumerators()
+}
+
+/**
+ * Publish the id of the protected root "Backups" folder to the Files app extension (`null`
+ * clears it), so the extension offers no delete, rename or move for it. iOS only; no-op
+ * (returns false) on Android or builds without the native bridge.
+ */
+export async function setFileProviderProtectedFolder(id: string | null): Promise<boolean> {
+  if (typeof BeebeebCryptoModule.setFileProviderProtectedFolder !== 'function') return false
+  return BeebeebCryptoModule.setFileProviderProtectedFolder(id)
+}
+
+// ─── Run diagnostics ────────────────────────────────────────────────────────
+
+/** What the native side knows about how the previous run ended (plain numbers only). */
+export interface PreviousRunNativeFacts {
+  /** iOS posted willTerminate: the app was closed normally. */
+  cleanExit: boolean
+  /** MetricKit crash diagnostics not yet read (exception type / signal numbers). */
+  crashes: Array<{ exceptionType?: number; signal?: number }>
+}
+
+/** How the previous run ended. Empty facts on builds without the native bridge. */
+export async function consumePreviousRunNative(): Promise<PreviousRunNativeFacts> {
+  try {
+    if (typeof BeebeebCryptoModule.consumePreviousRunNative !== 'function') return { cleanExit: false, crashes: [] }
+    const facts = await BeebeebCryptoModule.consumePreviousRunNative()
+    return {
+      cleanExit: facts?.cleanExit === true,
+      crashes: Array.isArray(facts?.crashes) ? facts.crashes : [],
+    }
+  } catch {
+    return { cleanExit: false, crashes: [] }
+  }
+}
+
+/** This process's memory footprint (phys_footprint) in MB, or null when unavailable. */
+export function memoryFootprintMbNative(): number | null {
+  try {
+    if (typeof BeebeebCryptoModule.memoryFootprintBytesNative !== 'function') return null
+    const bytes = Number(BeebeebCryptoModule.memoryFootprintBytesNative())
+    return Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / (1024 * 1024)) : null
+  } catch {
+    return null
+  }
 }
 
 // ─── Rust upload bridge ────────────────────────────────────────────────────
@@ -1593,6 +1671,26 @@ export interface NativeCategoryBackupStatus {
    *  reconcile checks it against /files/index to detect a server-side deletion. */
   parentFolderId?: string | null
   hasKnownBackupState?: boolean
+  /** A backup run is in flight (in memory only; never left over from a dead process). */
+  running?: boolean
+  progressDone?: number
+  progressTotal?: number
+  /** The OS permission is denied or restricted right now. */
+  permissionDenied?: boolean
+  /** The user shared only some contacts with the app (limited access). */
+  limitedAccess?: boolean
+  /** Outcome of the last run; a failed run leaves the last good backup untouched. */
+  lastRunStatus?: 'ok' | 'failed' | null
+  lastRunAt?: string | null
+  /** `permission_denied`, `limited_access`, `incomplete_export`, `baseline_unavailable`, `nothing_to_back_up`, `verify_failed`, `export_failed` or `upload_failed`. */
+  lastError?: string | null
+  /** Entries counted when the exported file was parsed back, and when. */
+  verifiedCount?: number | null
+  /** Count of the export refused as `incomplete_export`; null otherwise. */
+  refusedCount?: number | null
+  verifiedAt?: string | null
+  /** Uploaded runs, oldest first (capped), used to put counts on the version list. */
+  runs?: { at: string; count: number; bytes: number }[]
 }
 
 const EMPTY_CATEGORY_BACKUP_STATUS: NativeCategoryBackupStatus = {
@@ -1602,6 +1700,46 @@ const EMPTY_CATEGORY_BACKUP_STATUS: NativeCategoryBackupStatus = {
   hasParentFolder: false,
   parentFolderId: null,
   hasKnownBackupState: false,
+  running: false,
+  progressDone: 0,
+  progressTotal: 0,
+  permissionDenied: false,
+  limitedAccess: false,
+  lastRunStatus: null,
+  lastRunAt: null,
+  lastError: null,
+  verifiedCount: null,
+  refusedCount: null,
+  verifiedAt: null,
+  runs: [],
+}
+
+function mapCategoryBackupStatus(status: any): NativeCategoryBackupStatus {
+  const runs = Array.isArray(status?.runs)
+    ? status.runs
+        .filter((r: any) => r && typeof r.at === 'string')
+        .map((r: any) => ({ at: String(r.at), count: Number(r.count ?? 0), bytes: Number(r.bytes ?? 0) }))
+    : []
+  return {
+    lastScanAt: status?.lastScanAt ?? null,
+    lastScanCount: Number(status?.lastScanCount ?? 0),
+    lastUploadAt: status?.lastUploadAt ?? null,
+    hasParentFolder: Boolean(status?.hasParentFolder),
+    parentFolderId: typeof status?.parentFolderId === 'string' ? status.parentFolderId : null,
+    hasKnownBackupState: Boolean(status?.hasKnownBackupState),
+    running: Boolean(status?.running),
+    progressDone: Number(status?.progressDone ?? 0),
+    progressTotal: Number(status?.progressTotal ?? 0),
+    permissionDenied: Boolean(status?.permissionDenied),
+    limitedAccess: Boolean(status?.limitedAccess),
+    lastRunStatus: status?.lastRunStatus === 'ok' || status?.lastRunStatus === 'failed' ? status.lastRunStatus : null,
+    lastRunAt: typeof status?.lastRunAt === 'string' ? status.lastRunAt : null,
+    lastError: typeof status?.lastError === 'string' ? status.lastError : null,
+    verifiedCount: typeof status?.verifiedCount === 'number' ? status.verifiedCount : null,
+    refusedCount: typeof status?.refusedCount === 'number' ? status.refusedCount : null,
+    verifiedAt: typeof status?.verifiedAt === 'string' ? status.verifiedAt : null,
+    runs,
+  }
 }
 
 /** Set the server folder native backup workers should upload new items into. */
@@ -1793,6 +1931,14 @@ export async function resumeContactsBackup(authToken: string, userId: string): P
   return BeebeebCryptoModule.resumeContactsBackup(authToken, userId)
 }
 
+/** Bind Contacts backup and request access without starting an export. */
+export async function prepareContactsBackup(authToken: string, userId: string): Promise<void> {
+  if (typeof BeebeebCryptoModule.prepareContactsBackup !== 'function') {
+    throw new Error('Contacts backup is not available in this build.')
+  }
+  return BeebeebCryptoModule.prepareContactsBackup(authToken, userId)
+}
+
 export async function disableContactsBackup(): Promise<void> {
   return BeebeebCryptoModule.disableContactsBackup()
 }
@@ -1801,15 +1947,50 @@ export async function getContactsBackupStatus(): Promise<NativeCategoryBackupSta
   if (typeof BeebeebCryptoModule.getContactsBackupStatus !== 'function') {
     return EMPTY_CATEGORY_BACKUP_STATUS
   }
-  const status = await BeebeebCryptoModule.getContactsBackupStatus()
-  return {
-    lastScanAt: status?.lastScanAt ?? null,
-    lastScanCount: Number(status?.lastScanCount ?? 0),
-    lastUploadAt: status?.lastUploadAt ?? null,
-    hasParentFolder: Boolean(status?.hasParentFolder),
-    parentFolderId: typeof status?.parentFolderId === 'string' ? status.parentFolderId : null,
-    hasKnownBackupState: Boolean(status?.hasKnownBackupState),
+  return mapCategoryBackupStatus(await BeebeebCryptoModule.getContactsBackupStatus())
+}
+
+export type NativeCategoryBackupRunAdmission =
+  | 'started'
+  | 'already_running'
+  | 'not_bound'
+  | 'account_refused'
+
+function requireCategoryBackupStarted(
+  kind: 'Contacts' | 'Calendar',
+  admission: unknown,
+): 'started' {
+  if (admission === 'started') return admission
+  if (admission === 'already_running') throw new Error(`${kind} backup is already running.`)
+  if (admission === 'not_bound') throw new Error(`${kind} backup is not ready yet. Try again.`)
+  if (admission === 'account_refused') throw new Error(`${kind} backup is paused for this account.`)
+  throw new Error(`${kind} backup could not confirm that it started.`)
+}
+
+/** Run a contacts backup now and reject unless native accepted the run. */
+export async function runContactsBackupNow(options?: { force?: boolean }): Promise<'started'> {
+  if (typeof BeebeebCryptoModule.runContactsBackupNow !== 'function') {
+    throw new Error('Contacts backup is not available in this build.')
   }
+  // `force` skips the incomplete-export rule for this one run; verification still applies.
+  const admission = await BeebeebCryptoModule.runContactsBackupNow(options?.force === true)
+  return requireCategoryBackupStarted('Contacts', admission)
+}
+
+/** Run a calendar backup now and reject unless native accepted the run. */
+export async function runCalendarBackupNow(options?: { force?: boolean }): Promise<'started'> {
+  if (typeof BeebeebCryptoModule.runCalendarBackupNow !== 'function') {
+    throw new Error('Calendar backup is not available in this build.')
+  }
+  // `force` skips the incomplete-export rule for this one run; verification still applies.
+  const admission = await BeebeebCryptoModule.runCalendarBackupNow(options?.force === true)
+  return requireCategoryBackupStarted('Calendar', admission)
+}
+
+/** Wake an already-running camera-roll drain after JS requeues manifest rows. */
+export async function wakePhotoBackupDrain(): Promise<void> {
+  if (typeof BeebeebCryptoModule.wakePhotoBackupDrain !== 'function') return
+  return BeebeebCryptoModule.wakePhotoBackupDrain()
 }
 
 /**
@@ -1843,6 +2024,14 @@ export async function resumeCalendarBackup(authToken: string, userId: string): P
   return BeebeebCryptoModule.resumeCalendarBackup(authToken, userId)
 }
 
+/** Bind Calendar backup and request access without starting an export. */
+export async function prepareCalendarBackup(authToken: string, userId: string): Promise<void> {
+  if (typeof BeebeebCryptoModule.prepareCalendarBackup !== 'function') {
+    throw new Error('Calendar backup is not available in this build.')
+  }
+  return BeebeebCryptoModule.prepareCalendarBackup(authToken, userId)
+}
+
 export async function disableCalendarBackup(): Promise<void> {
   return BeebeebCryptoModule.disableCalendarBackup()
 }
@@ -1851,15 +2040,7 @@ export async function getCalendarBackupStatus(): Promise<NativeCategoryBackupSta
   if (typeof BeebeebCryptoModule.getCalendarBackupStatus !== 'function') {
     return EMPTY_CATEGORY_BACKUP_STATUS
   }
-  const status = await BeebeebCryptoModule.getCalendarBackupStatus()
-  return {
-    lastScanAt: status?.lastScanAt ?? null,
-    lastScanCount: Number(status?.lastScanCount ?? 0),
-    lastUploadAt: status?.lastUploadAt ?? null,
-    hasParentFolder: Boolean(status?.hasParentFolder),
-    parentFolderId: typeof status?.parentFolderId === 'string' ? status.parentFolderId : null,
-    hasKnownBackupState: Boolean(status?.hasKnownBackupState),
-  }
+  return mapCategoryBackupStatus(await BeebeebCryptoModule.getCalendarBackupStatus())
 }
 
 /**
@@ -2206,6 +2387,18 @@ export async function encodePhotoPreviewSample(
   return BeebeebCryptoModule.encodePhotoPreviewSample(localIdentifier, format, px)
 }
 
+/** Encode the readable file copy returned by the system photo picker. */
+export async function encodePhotoPreviewSampleFromSource(
+  sourcePath: string,
+  format: 'heic' | 'jpeg',
+  px: number,
+): Promise<{ path: string; bytes: number; width: number; height: number }> {
+  if (typeof BeebeebCryptoModule.encodePhotoPreviewSampleFromSource !== 'function') {
+    throw new Error('Picker-file photo samples need a newer native build')
+  }
+  return BeebeebCryptoModule.encodePhotoPreviewSampleFromSource(sourcePath, format, px)
+}
+
 /** Average encoded preview size over a few library photos; nothing is written. */
 export async function estimatePhotoPreviewBytes(
   localIdentifiers: string[],
@@ -2225,6 +2418,17 @@ export async function originalPhotoForCompare(
   maxPx: number,
 ): Promise<{ path: string; width: number; height: number; originalBytes?: number }> {
   return BeebeebCryptoModule.originalPhotoForCompare(localIdentifier, maxPx)
+}
+
+/** Downsample the readable file copy returned by the system photo picker. */
+export async function originalPhotoForCompareFromSource(
+  sourcePath: string,
+  maxPx: number,
+): Promise<{ path: string; width: number; height: number; originalBytes?: number }> {
+  if (typeof BeebeebCryptoModule.originalPhotoForCompareFromSource !== 'function') {
+    throw new Error('Picker-file comparison needs a newer native build')
+  }
+  return BeebeebCryptoModule.originalPhotoForCompareFromSource(sourcePath, maxPx)
 }
 
 // ─── Amber Constellation — display side ─────────────────────────────────────
@@ -2369,13 +2573,17 @@ export async function uploadChunksNative(
   let poll: ReturnType<typeof setInterval> | null = null
   let lastKey = ''
 
-  const flush = () => {
-    const ev = BeebeebCryptoModule.getUploadProgressNative?.(requestId) as NativeUploadProgressEvent | null | undefined
-    if (!ev || ev.requestId !== requestId) return
+  const emit = (ev: NativeUploadProgressEvent) => {
     const key = `${ev.stage}:${ev.chunksUploaded}:${ev.bytesUploaded}`
     if (key === lastKey) return
     lastKey = key
     options.onProgress?.(ev)
+  }
+
+  const flush = () => {
+    const ev = BeebeebCryptoModule.getUploadProgressNative?.(requestId) as NativeUploadProgressEvent | null | undefined
+    if (!ev || ev.requestId !== requestId) return
+    emit(ev)
   }
 
   const abortListener = () => {
@@ -2387,12 +2595,25 @@ export async function uploadChunksNative(
 
   try {
     const result = (await BeebeebCryptoModule.uploadChunksNative({ ...params, requestId })) as NativeUploadChunksResult
-    return {
+    const completed = {
       chunksUploaded: Number(result.chunksUploaded),
       bytesUploaded: Number(result.bytesUploaded),
       bytesTotal: Number(result.bytesTotal),
       cryptoBytesPerSec: Number(result.cryptoBytesPerSec),
     }
+    // A tiny upload can finish before the first 150 ms poll. Native removes
+    // its snapshot as the promise settles, so synthesize the same terminal
+    // progress event from the returned counters before handing control back.
+    emit({
+      requestId,
+      stage: 'complete',
+      chunksUploaded: completed.chunksUploaded,
+      chunksTotal: params.chunkCount,
+      bytesUploaded: completed.bytesUploaded,
+      bytesTotal: completed.bytesTotal,
+      cryptoBytesPerSec: completed.cryptoBytesPerSec,
+    })
+    return completed
   } catch (error) {
     if (options.signal?.aborted) throw uploadAbortError()
     throw error

@@ -55,11 +55,22 @@ test('last Android action still closes and invokes its callback', () => {
   act(() => scroll.findByType('Pressable').props.onPress());
   expect(events).toEqual(['close', 'action']);
 });
-test('iOS retains its unconstrained rows and whole-sheet drag layout', () => {
+test('iOS bounds tall actions, scrolls them, and keeps drag handling on the header', () => {
   platform.OS = 'ios';
   render();
-  expect(sheetStyle().maxHeight).toBeUndefined();
-  expect(tree.root.findAllByType('ScrollView')).toHaveLength(0);
-  expect(tree.root.findByType('Pan').findAllByType('Pressable')).toHaveLength(12);
+  expect(sheetStyle().maxHeight).toBe(216);
+  const scroll = tree.root.findByType('ScrollView');
+  expect(scroll.findAllByType('Pressable')).toHaveLength(12);
+  expect(scroll.findAllByType('Pan')).toHaveLength(0);
+  expect(tree.root.findByType('Pan').findAllByType('Pressable')).toHaveLength(0);
   expect(sheetStyle().paddingBottom).toBe(20);
+});
+
+test('action rows grow for wrapped Dynamic Type labels instead of clipping them', () => {
+  render({ rows: [{ key: 'long', label: 'A long action that may wrap at an accessibility text size', icon: 'add', onPress() {} }] });
+  const row = tree.root.findByType('ScrollView').findByType('Pressable');
+  const rowStyle = Object.assign({}, ...row.props.style({ pressed: false }).filter(Boolean));
+  expect(rowStyle.minHeight).toBe(56);
+  expect(rowStyle.height).toBeUndefined();
+  expect(row.findByType('Text').props.numberOfLines).toBeUndefined();
 });

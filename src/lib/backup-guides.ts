@@ -20,7 +20,7 @@ export const guides: BackupGuide[] = [
       'Choose "Include Media" when prompted.',
       'Select "Beebeeb" from the share sheet.',
     ],
-    note: 'Exports one chat at a time. Repeat per chat for a full backup.',
+    note: 'Exports one chat at a time. Repeat per chat for a full backup. Each export is saved in Backups › WhatsApp.',
   },
   {
     id: 'telegram',

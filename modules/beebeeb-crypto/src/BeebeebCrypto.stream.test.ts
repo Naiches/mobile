@@ -201,3 +201,41 @@ describe('streamVideoNative JS wrapper cancellation contract', () => {
     expect(JSON.stringify(tracePayloads)).not.toContain('secret-capability');
   });
 });
+
+describe('native manual upload progress', () => {
+  test('a transfer that finishes before the first poll still emits its final chunk progress', async () => {
+    nativeModule.uploadChunksNative = async () => ({
+      chunksUploaded: 1,
+      bytesUploaded: 10_028,
+      bytesTotal: 10_028,
+      cryptoBytesPerSec: 500_000,
+    });
+    nativeModule.getUploadProgressNative = () => null;
+    const events: unknown[] = [];
+
+    await crypto.uploadChunksNative({
+      handleId: 1,
+      apiUrl: 'https://api.test',
+      token: 'token',
+      fileId: 'file-1',
+      inputUri: 'file:///small.txt',
+      uploadSessionId: 'session-1',
+      chunkSizeBytes: 4 * 1024 * 1024,
+      chunkCount: 1,
+      startChunkIndex: 0,
+    }, {
+      onProgress: (event) => events.push(event),
+      pollIntervalMs: 60_000,
+    });
+
+    expect(events).toEqual([{
+      requestId: expect.stringContaining('upload-file-1-'),
+      stage: 'complete',
+      chunksUploaded: 1,
+      chunksTotal: 1,
+      bytesUploaded: 10_028,
+      bytesTotal: 10_028,
+      cryptoBytesPerSec: 500_000,
+    }]);
+  });
+});

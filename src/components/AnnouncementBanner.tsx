@@ -6,7 +6,7 @@
  */
 
 import React, { useEffect, useRef } from 'react';
-import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Animated, Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../lib/theme-context';
@@ -16,6 +16,8 @@ export default function AnnouncementBanner() {
   const insets = useSafeAreaInsets();
   const { colors: c } = useTheme();
   const { announcement, dismiss } = useAnnouncement();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   const anim = useRef(new Animated.Value(0)).current;
   const isVisible = announcement !== null;
@@ -46,6 +48,7 @@ export default function AnnouncementBanner() {
     <Animated.View
       style={[
         styles.banner,
+        accessibilityLayout && styles.bannerAccessibility,
         {
           top: insets.top + 8,
           backgroundColor: c.amberBg,
@@ -56,16 +59,25 @@ export default function AnnouncementBanner() {
       ]}
       pointerEvents="box-none"
     >
-      <View style={[styles.iconCircle, { backgroundColor: c.line2 }]}>
+      <View
+        style={[
+          styles.iconCircle,
+          accessibilityLayout && styles.iconCircleAccessibility,
+          { backgroundColor: c.line2 },
+        ]}
+      >
         <Ionicons name="megaphone-outline" size={14} color={c.amberDeep} />
       </View>
-      <Text style={[styles.text, { color: c.ink }]} numberOfLines={2}>
+      <Text
+        style={[styles.text, { color: c.ink }]}
+        numberOfLines={accessibilityLayout ? undefined : 2}
+      >
         {announcement}
       </Text>
       <Pressable
         onPress={dismiss}
         hitSlop={12}
-        style={styles.dismiss}
+        style={[styles.dismiss, accessibilityLayout && styles.dismissAccessibility]}
         accessibilityRole="button"
         accessibilityLabel="Dismiss announcement"
       >
@@ -95,12 +107,18 @@ const styles = StyleSheet.create({
     shadowRadius: 6,
     elevation: 4,
   },
+  bannerAccessibility: {
+    alignItems: 'flex-start',
+  },
   iconCircle: {
     width: 28,
     height: 28,
     borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  iconCircleAccessibility: {
+    marginTop: 2,
   },
   text: {
     flex: 1,
@@ -110,5 +128,11 @@ const styles = StyleSheet.create({
   },
   dismiss: {
     padding: 4,
+  },
+  dismissAccessibility: {
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 });

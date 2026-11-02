@@ -19,6 +19,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -71,6 +72,8 @@ export default function CreateFileRequestScreen() {
   const insets = useSafeAreaInsets();
   const { colors: c } = useTheme();
   const { isUnlocked, createRequestKeypair, decryptMetadata } = useCrypto();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -167,11 +170,11 @@ export default function CreateFileRequestScreen() {
 
   return (
     <View style={[styles.root, { backgroundColor: c.paper }]}>
-      <View style={[styles.header, { paddingTop: insets.top + 10, borderBottomColor: c.line }]}>
+      <View style={[styles.header, accessibilityLayout && styles.headerAccessibility, { paddingTop: insets.top + 10, borderBottomColor: c.line }]}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.iconButton}>
           <Ionicons name="chevron-back" size={24} color={c.ink} />
         </TouchableOpacity>
-        <Text style={[styles.title, { color: c.ink }]}>New file request</Text>
+        <Text style={[styles.title, { color: c.ink }]} numberOfLines={accessibilityLayout ? 2 : 1}>New file request</Text>
         <View style={styles.iconButton} />
       </View>
 
@@ -215,12 +218,12 @@ export default function CreateFileRequestScreen() {
                 <View key={`${crumb.id ?? 'root'}-${i}`} style={styles.crumbRow}>
                   {i > 0 && <Ionicons name="chevron-forward" size={11} color={c.ink4} />}
                   {isLast ? (
-                    <Text style={[styles.crumbCurrent, { color: c.ink }]} numberOfLines={1}>
+                    <Text style={[styles.crumbCurrent, { color: c.ink }]} numberOfLines={accessibilityLayout ? undefined : 1}>
                       {crumb.name}
                     </Text>
                   ) : (
                     <TouchableOpacity onPress={() => setFolderPath(folderPath.slice(0, i + 1))}>
-                      <Text style={[styles.crumbLink, { color: c.amberDeep }]} numberOfLines={1}>
+                      <Text style={[styles.crumbLink, { color: c.amberDeep }]} numberOfLines={accessibilityLayout ? undefined : 1}>
                         {crumb.name}
                       </Text>
                     </TouchableOpacity>
@@ -241,7 +244,7 @@ export default function CreateFileRequestScreen() {
                 style={styles.folderRow}
               >
                 <Ionicons name="folder-outline" size={15} color={c.ink3} />
-                <Text style={[styles.folderName, { color: c.ink }]} numberOfLines={1}>
+                <Text style={[styles.folderName, { color: c.ink }]} numberOfLines={accessibilityLayout ? undefined : 1}>
                   {f.name}
                 </Text>
                 <Ionicons name="chevron-forward" size={13} color={c.ink4} />
@@ -332,8 +335,9 @@ const styles = StyleSheet.create({
     paddingBottom: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
+  headerAccessibility: { alignItems: 'flex-start' },
   iconButton: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
-  title: { fontSize: 17, fontWeight: '600' },
+  title: { flex: 1, fontSize: 17, fontWeight: '600', textAlign: 'center' },
   scroll: { flex: 1 },
   intro: { fontSize: 13, lineHeight: 19, marginBottom: 18 },
   label: { fontSize: 12, fontWeight: '600', marginBottom: 6, marginTop: 14 },

@@ -707,16 +707,17 @@ final class NativeBackupEngine: NSObject {
   private let uploadTaskMap = LockedDictionary<Int, String>() // URLSessionTask.taskIdentifier -> localAssetId
 
   private var _drainTask: Task<Void, Never>?
-  private var drainTask: Task<Void, Never>? {
-    get { engineStateLock.lock(); defer { engineStateLock.unlock() }; return _drainTask }
-    set { engineStateLock.lock(); _drainTask = newValue; engineStateLock.unlock() }
+  private var drainTaskActive: Bool {
+    engineStateLock.lock(); defer { engineStateLock.unlock() }
+    return _drainTask != nil
   }
 
   private var _drainLoopGeneration = 0
-  private var drainLoopGeneration: Int {
-    get { engineStateLock.lock(); defer { engineStateLock.unlock() }; return _drainLoopGeneration }
-    set { engineStateLock.lock(); _drainLoopGeneration = newValue; engineStateLock.unlock() }
-  }
+  /// The drain task waits on this child instead of sleeping directly. A wake
+  /// cancels only the child, so it never overlaps the active batch with a new
+  /// drain task merely to interrupt pacing/retry delay.
+  private var _drainSleepTask: Task<Bool, Never>?
+  private var _drainSleepGeneration = 0
 
   /// Task 1531 [P1-3]: bumped every time `currentAccountId` is written (set
   /// to a new account OR cleared to nil) — see that property's setter. A
@@ -731,8 +732,8 @@ final class NativeBackupEngine: NSObject {
 
   private var _pendingDrainWakeReason: String?
   private var pendingDrainWakeReason: String? {
-    get { engineStateLock.lock(); defer { engineStateLock.unlock() }; return _pendingDrainWakeReason }
-    set { engineStateLock.lock(); _pendingDrainWakeReason = newValue; engineStateLock.unlock() }
+    engineStateLock.lock(); defer { engineStateLock.unlock() }
+    return _pendingDrainWakeReason
   }
 
   private let batchProcessingQueue = DispatchQueue(label: "io.beebeeb.backup.engine.batch", qos: .utility)
@@ -1037,8 +1038,15 @@ final class NativeBackupEngine: NSObject {
   var parentFolderId: String? {
     get { UserDefaults.standard.string(forKey: "io.beebeeb.photoBackupParentFolderId") }
     set {
+      let previous = UserDefaults.standard.string(forKey: "io.beebeeb.photoBackupParentFolderId")
       if let newValue, !newValue.isEmpty {
         UserDefaults.standard.set(newValue, forKey: "io.beebeeb.photoBackupParentFolderId")
+        if newValue != previous {
+          // Scan-first startup can queue assets while JS validates/creates the
+          // encrypted Drive folder. Configuration is the event that makes
+          // those assets drain; do not leave them on the 5-second retry tick.
+          wakeDrainLoop(reason: "folder-configured")
+        }
       } else {
         UserDefaults.standard.removeObject(forKey: "io.beebeeb.photoBackupParentFolderId")
       }
@@ -1358,8 +1366,15 @@ final class NativeBackupEngine: NSObject {
     UNUserNotificationCenter.current().removeDeliveredNotifications(
       withIdentifiers: [backupReminderIdentifier]
     )
-    if isRunning, !isPaused, pendingUploadCount() > 0 {
-      wakeDrainLoop(reason: "foreground")
+    if isRunning {
+      // PhotoKit may coalesce or omit change callbacks while the app is in the
+      // background. Reconcile the exact current scope on every foreground so
+      // a vanished queued asset cannot survive indefinitely, and a new asset
+      // is still found even when no incremental callback was delivered.
+      spawnScan(reason: "Camera roll rescanned", wakeReason: "foreground-photo-scan")
+      if !isPaused, pendingUploadCount() > 0 {
+        wakeDrainLoop(reason: "foreground")
+      }
     }
     updateBackupStatusSurfaces(reason: "App opened")
     logDiagnosticSnapshot(reason: "app_foreground")
@@ -1561,7 +1576,7 @@ final class NativeBackupEngine: NSObject {
         "reason": state.reason,
         "isRunning": isRunning,
         "isPaused": isPaused,
-        "drainTaskActive": drainTask != nil,
+        "drainTaskActive": drainTaskActive,
         "backgroundTaskActive": isBackgroundTaskActive,
         "backgroundGraceActive": isBackgroundGraceActive,
         "photoObserverRegistered": photoObserverRegistered,
@@ -2127,7 +2142,7 @@ final class NativeBackupEngine: NSObject {
     // "userId" — the raw account id was landing unredacted in the on-device
     // log (NSLog + os.log, always-on in DEBUG). Hash it, same SHA-256 hex
     // pattern as `ContactsBackupManager.hashKey`/
-    // `CalendarBackupManager.stateKeyComponent`: still useful to correlate
+    // `CalendarBackupIdentity.itemKey`: still useful to correlate
     // repeated binds for the SAME account across trace events, without
     // logging the id itself.
     let hashedUserId = SHA256.hash(data: Data(userId.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -2688,12 +2703,28 @@ final class NativeBackupEngine: NSObject {
     clearServerCheckPause()
 
     guard isRunning else { return }
-    isRunning = false
-    isPaused = false
-
-    drainTask?.cancel()
-    drainTask = nil
-    pendingDrainWakeReason = nil
+    // Stop and detach both tasks in one state transition. Cancellation runs
+    // after the unlock: a task finishing synchronously may take this lock in
+    // its defer/sleep cleanup, so cancelling while holding it would deadlock.
+    let drainToCancel: Task<Void, Never>?
+    let sleepToCancel: Task<Bool, Never>?
+    engineStateLock.lock()
+    guard _isRunning else {
+      engineStateLock.unlock()
+      return
+    }
+    _isRunning = false
+    _isPaused = false
+    drainToCancel = _drainTask
+    sleepToCancel = _drainSleepTask
+    _drainTask = nil
+    _drainSleepTask = nil
+    _pendingDrainWakeReason = nil
+    _drainLoopGeneration &+= 1
+    _drainSleepGeneration &+= 1
+    engineStateLock.unlock()
+    drainToCancel?.cancel()
+    sleepToCancel?.cancel()
 
     uploadTaskMap.removeAll()
     // Task 1605: sibling cleanup for `chunkResponseBodyBuffers` — cancelled
@@ -3563,7 +3594,14 @@ final class NativeBackupEngine: NSObject {
     // LD-0002 (#262 review 1): the drain stops at its next checkpoint instead
     // of running its batch on against a closed gate; foreground or a new
     // assertion wakes it again.
-    if outcome != .foreground { drainTask?.cancel() }
+    if outcome != .foreground {
+      engineStateLock.lock()
+      let drainToCancel = _drainTask
+      let sleepToCancel = _drainSleepTask
+      engineStateLock.unlock()
+      drainToCancel?.cancel()
+      sleepToCancel?.cancel()
+    }
     perfLog("quiesce", [
       "reason": reason,
       "outcome": outcome.rawValue,
@@ -3649,96 +3687,181 @@ final class NativeBackupEngine: NSObject {
   }
 
   private func sleepIfStillRunning(nanoseconds: UInt64) async -> Bool {
-    guard isRunning, !Task.isCancelled else { return false }
-    do {
-      try await Task.sleep(nanoseconds: nanoseconds)
-    } catch {
+    guard !Task.isCancelled else { return false }
+
+    let generation: Int
+    let sleeper: Task<Bool, Never>
+    engineStateLock.lock()
+    // Close the last wake/sleep race: if a wake landed after the loop chose
+    // to sleep but before it installed the sleeper, skip the delay. A later
+    // wake sees `_drainSleepTask` and cancels it instead.
+    guard _isRunning, _pendingDrainWakeReason == nil else {
+      engineStateLock.unlock()
       return false
     }
-    return isRunning && !Task.isCancelled
+    _drainSleepGeneration &+= 1
+    generation = _drainSleepGeneration
+    sleeper = Task {
+      do {
+        try await Task.sleep(nanoseconds: nanoseconds)
+        return true
+      } catch {
+        return false
+      }
+    }
+    _drainSleepTask = sleeper
+    engineStateLock.unlock()
+
+    let completed = await sleeper.value
+    engineStateLock.lock()
+    if _drainSleepGeneration == generation {
+      _drainSleepTask = nil
+    }
+    let stillRunning = _isRunning
+    engineStateLock.unlock()
+    return completed && stillRunning && !Task.isCancelled
   }
 
   private func wakeDrainLoop(reason: String) {
-    guard isRunning else { return }
-    if drainTask != nil {
-      pendingDrainWakeReason = reason
-      return
-    }
     startDrainLoop(reason: reason)
   }
 
   private func startDrainLoop(reason: String) {
-    // Round 11 (review finding 9): every drain start owes a bulk check.
+    // Every wake owes a bulk check. This helper locks and returns before the
+    // state transition below takes the same lock.
     requestBulkServerCheck()
-    drainTask?.cancel()
-    drainLoopGeneration += 1
-    let generation = drainLoopGeneration
-    perfLog("drain.wake", ["reason": reason])
-    drainTask = Task { [weak self] in
-      defer {
-        if let self, self.drainLoopGeneration == generation {
-          self.drainTask = nil
-          if let reason = self.pendingDrainWakeReason, self.isRunning {
-            self.pendingDrainWakeReason = nil
-            self.wakeDrainLoop(reason: reason)
-          }
-        }
+    let sleepToCancel: Task<Bool, Never>?
+    var started = false
+
+    // The task check, pending wake write and replacement install are one
+    // transition. Otherwise the old task can clear itself between a caller's
+    // `drainTask != nil` check and pending-reason write, stranding that wake.
+    engineStateLock.lock()
+    guard _isRunning else {
+      engineStateLock.unlock()
+      return
+    }
+    if _drainTask != nil {
+      _pendingDrainWakeReason = reason
+      sleepToCancel = _drainSleepTask
+    } else {
+      installDrainLoopLocked(reason: reason)
+      sleepToCancel = nil
+      started = true
+    }
+    engineStateLock.unlock()
+
+    // A wake interrupts retry/pacing delay, but never cancels an active batch
+    // or starts a second drain task alongside it.
+    sleepToCancel?.cancel()
+    if started { perfLog("drain.wake", ["reason": reason]) }
+  }
+
+  /// JS changed manifest rows through the one shared SQLite file. Wake an
+  /// idle engine immediately; no PhotoKit change event accompanies a Drive
+  /// trash action, so waiting for one can strand a freshly requeued photo.
+  func wakeForManifestChange() {
+    wakeDrainLoop(reason: "manifest-changed")
+  }
+
+  /// Requires `engineStateLock`. Installs the replacement before the lock is
+  /// released, so a concurrent wake sees either the old task or the new one,
+  /// never a transient nil between them. Does not call a locking accessor.
+  private func installDrainLoopLocked(reason: String) {
+    _bulkServerCheckRequested = true
+    _drainLoopGeneration &+= 1
+    let generation = _drainLoopGeneration
+    _pendingDrainWakeReason = nil
+    _drainTask = Task { [weak self] in
+      guard let self else { return }
+      await self.runDrainLoop(generation: generation)
+    }
+  }
+
+  private func consumePendingDrainWake(generation: Int) {
+    engineStateLock.lock()
+    if _drainLoopGeneration == generation {
+      _pendingDrainWakeReason = nil
+    }
+    engineStateLock.unlock()
+  }
+
+  /// Clears this exact task and, when a wake landed during its final check,
+  /// installs the successor in the same critical section.
+  private func finishDrainLoop(generation: Int) {
+    var restartedFor: String?
+    engineStateLock.lock()
+    if _drainLoopGeneration == generation {
+      _drainTask = nil
+      if _isRunning, let reason = _pendingDrainWakeReason {
+        installDrainLoopLocked(reason: reason)
+        restartedFor = reason
+      }
+    }
+    engineStateLock.unlock()
+    if let restartedFor {
+      perfLog("drain.wake", ["reason": restartedFor])
+    }
+  }
+
+  private func runDrainLoop(generation: Int) async {
+    defer { finishDrainLoop(generation: generation) }
+
+    while isRunning, !Task.isCancelled {
+      consumePendingDrainWake(generation: generation)
+      // LD-0002 rule 3: background time ended. The drain stops (no SQLite);
+      // foreground or a new background assertion wakes it again.
+      guard executionGate.canStartSQLiteWork else {
+        perfLog("drain.stop", ["reason": "background-time-ended"])
+        break
+      }
+      if isPaused {
+        _ = await sleepIfStillRunning(nanoseconds: 2_000_000_000) // 2s
+        continue
       }
 
-      while let self, self.isRunning, !Task.isCancelled {
-        // LD-0002 rule 3: background time ended. The drain stops (no SQLite);
-        // foreground or a new background assertion wakes it again.
-        guard self.executionGate.canStartSQLiteWork else {
-          self.perfLog("drain.stop", ["reason": "background-time-ended"])
-          break
+      let mode = currentPacingMode()
+      perfLog("mode", [
+        "mode": mode.rawValue,
+        "batchLimit": mode.batchLimit,
+        "delayMs": mode.delayNanoseconds / 1_000_000
+      ])
+
+      if let backoff = backoffUntil, Date() < backoff {
+        let remaining = max(0, backoff.timeIntervalSinceNow)
+        let delay = min(mode.delayNanoseconds, UInt64(remaining * 1_000_000_000))
+        _ = await sleepIfStillRunning(nanoseconds: delay)
+        continue
+      }
+
+      do {
+        guard isRunning, !isPaused, !Task.isCancelled else { continue }
+        // This iteration's write ticket. None = signed out (or another
+        // account bound) since the loop started: nothing to drain.
+        guard let iterationTicket = manifestWriteTicket("drain") else { return }
+        dbQueue.sync {
+          guard admitsWrite(iterationTicket, "drain.recover_stuck") else { return }
+          recoverStuckUploads()
         }
-        if self.isPaused {
-          _ = await self.sleepIfStillRunning(nanoseconds: 2_000_000_000) // 2s
-          continue
+        let hasPendingBeforeBatch = dbQueue.sync(execute: { hasPendingUploads() })
+        guard hasPendingBeforeBatch else {
+          return
         }
 
-        let mode = self.currentPacingMode()
-        self.perfLog("mode", [
-          "mode": mode.rawValue,
-          "batchLimit": mode.batchLimit,
-          "delayMs": mode.delayNanoseconds / 1_000_000
-        ])
-
-        if let backoff = self.backoffUntil, Date() < backoff {
-          let remaining = max(0, backoff.timeIntervalSinceNow)
-          let delay = min(mode.delayNanoseconds, UInt64(remaining * 1_000_000_000))
-          _ = await self.sleepIfStillRunning(nanoseconds: delay)
-          continue
+        let uploaded = try await processBatch(limit: mode.batchLimit)
+        // Rows the server check promoted are progress too; a batch of photos
+        // the server already has must not wait 5 s.
+        let progressed = uploaded + self.takeLastBatchServerPromoted()
+        if progressed == 0, !self.dbQueue.sync(execute: { hasPendingUploads() }) {
+          return
+        } else if progressed == 0 {
+          _ = await sleepIfStillRunning(nanoseconds: max(5_000_000_000, mode.delayNanoseconds)) // 5s on retry failures
+        } else {
+          _ = await sleepIfStillRunning(nanoseconds: mode.delayNanoseconds)
         }
-
-        do {
-          guard self.isRunning, !self.isPaused, !Task.isCancelled else { continue }
-          // Round 8: this iteration's write ticket. None = signed out (or
-          // another account bound) since the loop started: nothing to drain.
-          guard let iterationTicket = self.manifestWriteTicket("drain") else { return }
-          self.dbQueue.sync {
-            guard self.admitsWrite(iterationTicket, "drain.recover_stuck") else { return }
-            self.recoverStuckUploads()
-          }
-          guard self.dbQueue.sync(execute: { self.hasPendingUploads() }) else {
-            return
-          }
-
-          let uploaded = try await self.processBatch(limit: mode.batchLimit)
-          // Round 10: rows the server check promoted are progress too; a
-          // batch of photos the server already has must not wait 5 s.
-          let progressed = uploaded + self.takeLastBatchServerPromoted()
-          if progressed == 0, !self.dbQueue.sync(execute: { self.hasPendingUploads() }) {
-            return
-          } else if progressed == 0 {
-            _ = await self.sleepIfStillRunning(nanoseconds: max(5_000_000_000, mode.delayNanoseconds)) // 5s on retry failures
-          } else {
-            _ = await self.sleepIfStillRunning(nanoseconds: mode.delayNanoseconds)
-          }
-        } catch {
-          NSLog("[NativeBackupEngine] Batch error: \(error.localizedDescription)")
-          _ = await self.sleepIfStillRunning(nanoseconds: max(5_000_000_000, mode.delayNanoseconds)) // 5s on error
-        }
+      } catch {
+        NSLog("[NativeBackupEngine] Batch error: \(error.localizedDescription)")
+        _ = await sleepIfStillRunning(nanoseconds: max(5_000_000_000, mode.delayNanoseconds)) // 5s on error
       }
     }
   }
@@ -3979,10 +4102,11 @@ final class NativeBackupEngine: NSObject {
     }
   }
 
-  /// Manual "Back up now" should synchronously refresh the camera-roll index
-  /// before attempting a batch. The normal observer scan is asynchronous, and
-  /// a manual trigger can otherwise race ahead, see zero pending rows, and make
-  /// the UI look active while no upload starts.
+  /// Admit manual backup immediately, then refresh the camera-roll index on a
+  /// tracked task. A PhotoKit walk can take tens of seconds on a large library;
+  /// the action must not keep its user-facing "Starting" state for that walk.
+  /// Existing pending rows are woken before the scan, and newly discovered rows
+  /// are woken by `spawnScan` when the scan finishes.
   func triggerManualBackup(limit: Int = 50) async throws -> [String: Any] {
     fileLimitStopReason = nil
     if !isRunning {
@@ -4000,10 +4124,11 @@ final class NativeBackupEngine: NSObject {
     }
 
     resetRetryExhaustedUploadsForManualRun()
-    let hasPending = await scanPhotoLibraryForPendingUploads(reason: "Manual backup scan")
-    if hasPending || dbQueue.sync(execute: { hasPendingUploads() }) {
-      wakeDrainLoop(reason: "manual-watch")
+    let hasExistingPending = dbQueue.sync { hasPendingUploads() }
+    if hasExistingPending {
+      wakeDrainLoop(reason: "manual-existing")
     }
+    spawnScan(reason: "Manual backup scan", wakeReason: "manual-watch")
     var progress = currentProgress()
     progress["batchUploaded"] = 0
     progress["manualTrigger"] = true
@@ -4050,6 +4175,23 @@ final class NativeBackupEngine: NSObject {
         "liveAccount": currentAccountId ?? "(nil)"
       ])
       NSLog("[NativeBackupEngine] Account changed since batch start — refusing to upload/stage: \(asset.localAssetId)")
+      return false
+    }
+
+    // Staged rows previously skipped PhotoKit entirely. If their source was
+    // deleted after staging they could retry/upload forever from encrypted
+    // staging even though the camera roll no longer contained the photo.
+    guard PHAsset.fetchAssets(withLocalIdentifiers: [asset.localAssetId], options: nil).firstObject != nil else {
+      dbQueue.sync {
+        guard admitsWrite(ticket, "markLocalMissing.preflight") else { return }
+        markLocalMissing(assetId: asset.localAssetId)
+      }
+      RuntimeTrace.event("backup.native.asset.local_missing", [
+        "assetType": asset.assetType,
+        "phase": asset.stagedFileId == nil ? "pending" : "staged"
+      ])
+      refreshProgress()
+      updateBackupStatusSurfaces(reason: "Removed a photo no longer on this iPhone")
       return false
     }
 
@@ -4516,6 +4658,8 @@ final class NativeBackupEngine: NSObject {
     // transaction (`BackupManifestStore.recordStaging`).
     let recordedStaging: Bool = dbQueue.sync {
       guard admitsWrite(ticket, "markStaged") else { return false }
+      // A photo that left the library while it was encrypting is not staged.
+      guard !isLocalMissingInDatabase(asset.localAssetId) else { return false }
       return markStaged(
         assetId: asset.localAssetId,
         fileId: fileId,
@@ -4740,10 +4884,7 @@ final class NativeBackupEngine: NSObject {
         authToken: authToken,
         baseURL: baseURL
       ) {
-      // Round 15: the resume path keeps its old reading of a trashed file
-      // (complete); only the resolution and the flush treat it as not
-      // backed up.
-      case .complete, .completeInTrash:
+      case .complete:
         let recorded: Bool = dbQueue.sync {
           guard admitsWrite(ticket, "markUploadComplete") else { return false }
           guard markUploadComplete(assetId: asset.localAssetId, remoteFileId: serverFileId, accountId: batchAccountId) else {
@@ -4781,12 +4922,12 @@ final class NativeBackupEngine: NSObject {
         )
         return true
 
-      case .gone:
+      case .completeInTrash, .gone:
         dbQueue.sync {
           guard admitsWrite(ticket, "clearStagedStateForRestage") else { return }
           clearStagedStateForRestage(
             assetId: asset.localAssetId,
-            error: "Remote upload session disappeared; re-encrypting"
+            error: "Remote backup is not live; re-encrypting"
           )
         }
         removeStagedDirectory(stagedDir: stagedDir, fileId: fileId)
@@ -5949,7 +6090,7 @@ final class NativeBackupEngine: NSObject {
   private func markUploading(assetId: String) {
     guard let db = db else { return }
     let nowMs = nowMs()
-    let sql = "UPDATE backup_assets SET status = 'uploading', last_attempt_at = ? WHERE local_asset_id = ?"
+    let sql = "UPDATE backup_assets SET status = 'uploading', last_attempt_at = ? WHERE local_asset_id = ? AND status != 'local_missing'"
     var stmt: OpaquePointer?
     guard exsqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
     defer { exsqlite3_finalize(stmt) }
@@ -5969,6 +6110,7 @@ final class NativeBackupEngine: NSObject {
         upload_session_id = COALESCE(?, upload_session_id),
         last_attempt_at = ?
     WHERE local_asset_id = ?
+      AND status != 'local_missing'
     """
     var stmt: OpaquePointer?
     guard exsqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -5986,7 +6128,7 @@ final class NativeBackupEngine: NSObject {
 
   private func markStaging(assetId: String) {
     guard let db = db else { return }
-    let sql = "UPDATE backup_assets SET status = 'staging', last_attempt_at = ? WHERE local_asset_id = ?"
+    let sql = "UPDATE backup_assets SET status = 'staging', last_attempt_at = ? WHERE local_asset_id = ? AND status != 'local_missing'"
     var stmt: OpaquePointer?
     guard exsqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
     defer { exsqlite3_finalize(stmt) }
@@ -6003,6 +6145,7 @@ final class NativeBackupEngine: NSObject {
         error_message = ?,
         last_attempt_at = ?
     WHERE local_asset_id = ?
+      AND status != 'local_missing'
     """
     var stmt: OpaquePointer?
     guard exsqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -6080,6 +6223,7 @@ final class NativeBackupEngine: NSObject {
         error_message = ?,
         last_attempt_at = ?
     WHERE local_asset_id = ?
+      AND status != 'local_missing'
     """
     var stmt: OpaquePointer?
     guard exsqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -6095,6 +6239,7 @@ final class NativeBackupEngine: NSObject {
     let sql = """
     UPDATE backup_assets
     SET status = 'local_missing',
+        selected_for_backup = 0,
         retry_count = 0,
         error_message = 'Photo no longer on this iPhone or no longer shared with Beebeeb',
         last_attempt_at = ?
@@ -6118,15 +6263,18 @@ final class NativeBackupEngine: NSObject {
   }
 
   private func isLocalMissing(_ localId: String) -> Bool {
-    return dbQueue.sync {
-      guard let db = self.db else { return false }
-      var stmt: OpaquePointer?
-      defer { exsqlite3_finalize(stmt) }
-      let sql = "SELECT 1 FROM backup_assets WHERE local_asset_id = ? AND status = 'local_missing' LIMIT 1"
-      guard exsqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
-      BackupManifestStore.bindText(stmt, 1, localId)
-      return exsqlite3_step(stmt) == SQLITE_ROW
-    }
+    return dbQueue.sync { isLocalMissingInDatabase(localId) }
+  }
+
+  /// dbQueue-only form for a staged-write block that already owns the queue.
+  private func isLocalMissingInDatabase(_ localId: String) -> Bool {
+    guard let db = self.db else { return false }
+    var stmt: OpaquePointer?
+    defer { exsqlite3_finalize(stmt) }
+    let sql = "SELECT 1 FROM backup_assets WHERE local_asset_id = ? AND status = 'local_missing' LIMIT 1"
+    guard exsqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+    BackupManifestStore.bindText(stmt, 1, localId)
+    return exsqlite3_step(stmt) == SQLITE_ROW
   }
 
   /// LD-0002 (B5): one transaction in `BackupManifestStore`. A replace that
@@ -6693,10 +6841,9 @@ final class NativeBackupEngine: NSObject {
               )
             }
           },
-          // Round 15 (review items 2 and 3): complete ONLY on the API's 2xx
-          // body with is_uploading false and the file not in the Trash; a
-          // trashed file is not backed up, so the row is dropped and the
-          // photo queued. Anything that is not the API's answer throws (defer).
+          // Complete only on the API's live-file answer. A completed file in
+          // Trash is not backed up, so the kept row is dropped and queued.
+          // Anything that is not the API's answer throws (defer).
           ask: { row in
             try await self.inspectExistingUpload(
               fileId: row.fileId, authToken: authToken, baseURL: baseURL
@@ -7106,11 +7253,9 @@ final class NativeBackupEngine: NSObject {
   /// unmarked for `flushServerMarks` to retry. Returns false when the caller
   /// should stop sending more marks now (network, 429, 5xx, account change).
   ///
-  /// Round 5 (Codex P1 "Fail closed when the identifier route returns 404"):
-  /// a 404 is done ("file gone, nothing to map") ONLY with the API's own
-  /// NotFound body (`PhotoBackupServerResponses.markOutcome`). Any other 404
-  /// is a failure: no `server_marked_at`, so the row stays a pending mark,
-  /// the sign-out reset keeps it and the next sign-in promotes it.
+  /// An API-shaped 404 proves the uploaded file is gone, so its exact
+  /// manifest row is CAS-requeued for upload. Any non-API 404 is a transient
+  /// failure: no `server_marked_at`, and the pending mark is retried later.
   @discardableResult
   ///
   /// Round 8: the local record runs behind the caller's write `ticket` (the
@@ -7150,12 +7295,28 @@ final class NativeBackupEngine: NSObject {
         contentType: http?.value(forHTTPHeaderField: "Content-Type"),
         data: data
       )
+      if outcome.requiresReupload {
+        RuntimeTrace.event("backup.native.server_mark.file_gone")
+        let requeue = dbQueue.sync {
+          FencedManifestWrites.requeueRemoteGone(
+            self.db,
+            fence: self.manifestHandle.writeFence,
+            ticket: ticket,
+            assetId: assetId,
+            fileId: fileId,
+            nowMs: self.nowMs()
+          )
+        }
+        switch requeue {
+        case .requeued, .alreadySettled:
+          return true
+        case .failed:
+          return false
+        }
+      }
       guard outcome.recordsServerMark else {
         RuntimeTrace.event("backup.native.server_mark.failed", ["status": statusCode])
         return false
-      }
-      if outcome == .fileGone {
-        RuntimeTrace.event("backup.native.server_mark.file_gone")
       }
       dbQueue.sync {
         _ = FencedManifestWrites.recordServerMarked(
@@ -7271,7 +7432,7 @@ final class NativeBackupEngine: NSObject {
         case let .inFlight(assetId, fileId):
           return await SignOutMarkFlush.settleInFlight(
             isComplete: {
-              // Round 15: complete only on the API's answer, never trashed.
+              // Complete only on the API's live-file answer, never Trash.
               try await self.inspectExistingUpload(
                 fileId: fileId, authToken: authToken, baseURL: baseURL, requestTimeout: requestTimeout
               ) == .complete
@@ -8010,7 +8171,8 @@ extension NativeBackupEngine: PHPhotoLibraryChangeObserver {
     // then not inserted (the next full scan takes it).
     guard lifecycle.replaceFetchResult(expected: old, with: details.fetchResultAfterChanges) else { return }
     let inserted = scannedAssets(details.insertedObjects)
-    if !inserted.isEmpty {
+    let removedIds = Set(details.removedObjects.map(\.localIdentifier))
+    if !inserted.isEmpty || !removedIds.isEmpty {
       dbQueue.async { [weak self] in
         guard let self else { return }
         let written = FencedManifestWrites.scanInsert(
@@ -8019,14 +8181,26 @@ extension NativeBackupEngine: PHPhotoLibraryChangeObserver {
         )
         self.recordScanInsert(written, assets: inserted.count, source: .incremental)
         guard written != .fenced else { return }
+        let removed = FencedManifestWrites.markMissing(
+          self.db,
+          fence: self.manifestHandle.writeFence,
+          ticket: ticket,
+          localAssetIds: removedIds,
+          nowMs: self.nowMs()
+        )
+        if let removed, removed > 0 {
+          RuntimeTrace.event("backup.native.photo_library.removed", ["count": removed])
+        }
         if self.hasPendingUploads() {
           self.wakeDrainLoop(reason: "photo-library")
         }
         DispatchQueue.main.async {
-          self.updateBackupStatusSurfaces(reason: "New photos detected")
+          self.updateBackupStatusSurfaces(
+            reason: inserted.isEmpty ? "Removed photos no longer on this iPhone" : "New photos detected"
+          )
         }
       }
-      NSLog("[NativeBackupEngine] Detected \(inserted.count) new assets in photo library")
+      NSLog("[NativeBackupEngine] Photo library changed: \(inserted.count) inserted, \(removedIds.count) removed")
     }
   }
 }

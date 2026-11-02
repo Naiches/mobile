@@ -14,6 +14,7 @@ import {
   ActivityIndicator,
   Dimensions,
   FlatList,
+  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -139,10 +140,8 @@ interface PptxRendererProps {
    * (vertical, since the list itself pages horizontally between slides) —
    * `slideWrapper`'s `flex:1` then resolves to the smaller height left over,
    * so the card sits clear of both bars instead of touching the screen edge.
-   * There is no vertical SCROLL for this renderer (it only pages
-   * horizontally between slides), so unlike the text/doc renderers there is
-   * no "content moves under the bar as you scroll" behaviour to give it —
-   * the vertical position is fixed regardless of which slide is showing.
+   * Each card can scroll its extracted text vertically while the outer list
+   * continues to page horizontally between slides.
    */
   topInset?: number;
   bottomInset?: number;
@@ -204,7 +203,12 @@ export function PptxRenderer({ data, colors: c, topInset = 0, bottomInset = 0 }:
                 </Text>
               </View>
             ) : (
-              <View style={styles.slideContent}>
+              <ScrollView
+                style={styles.slideContent}
+                contentContainerStyle={styles.slideContentInner}
+                nestedScrollEnabled
+                showsVerticalScrollIndicator
+              >
                 {item.textBlocks.map((text, i) => {
                   // First non-empty text block is typically the title
                   const isTitle = i === 0;
@@ -220,7 +224,7 @@ export function PptxRenderer({ data, colors: c, topInset = 0, bottomInset = 0 }:
                     </Text>
                   );
                 })}
-              </View>
+              </ScrollView>
             )}
           </View>
         </View>
@@ -359,6 +363,8 @@ const styles = StyleSheet.create({
   },
   slideContent: {
     flex: 1,
+  },
+  slideContentInner: {
     paddingHorizontal: 16,
     paddingBottom: 16,
     gap: 8,

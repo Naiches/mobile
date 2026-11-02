@@ -33,6 +33,15 @@ private let fileProviderTrustedMountKey = BeebeebKeychainCore.fileProviderTruste
 private let fileProviderAuthRequiredKey = "io.beebeeb.fileProvider.requireDeviceAuth"
 private let fileProviderUnlockedUntilKey = "io.beebeeb.fileProvider.unlockedUntilMs"
 private let fileProviderEnumeratorStatePrefix = "io.beebeeb.fileProvider.enumerator."
+// The id of the protected root "Backups" folder, published in the cache's `sync_state` for the
+// extension (FileProviderItem.protectedBackupsRootKey reads the same key). The sign-out reset of
+// `sync_state` clears it with the rest of the account's cache.
+private let fileProviderProtectedBackupsRootKey = "protected.backupsRootId"
+// `sync_state` key under which the File Provider extension records (Unix seconds) the last time it
+// told Files "Authentication Required". The app reads it at unlock to decide whether to say that
+// Files is ready again, and clears it. The extension (`SyncEngine.swift`
+// `FileProviderAuthRequirement`) writes the same literal; a guard test keeps them equal.
+private let fileProviderAuthRequiredAtKey = "files.authRequiredAt"
 // Task 1593 round 8 (R2) — the "purge epoch" used to live here as an App
 // Group UserDefaults counter (`fileProviderPurgeEpochKey`,
 // `bumpFileProviderPurgeEpoch`). Removed: `UserDefaults(suiteName:)` is
@@ -174,6 +183,23 @@ func photoPreviewImageSource(localIdentifier: String) async throws -> CGImageSou
                   userInfo: [NSLocalizedDescriptionKey: "Photo data is not a readable image"])
   }
   return source
+}
+
+/// Opens the sandboxed file copy returned by PHPicker/ImagePicker. Unlike a
+/// PhotoKit identifier, this remains readable with limited-library access.
+func photoPreviewFileImageSource(sourcePath: String) throws -> CGImageSource {
+  let url = URL(fileURLWithPath: sourcePath)
+  guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+    throw NSError(domain: "BeebeebPhotoPreview", code: 4,
+                  userInfo: [NSLocalizedDescriptionKey: "Picked photo is not a readable image"])
+  }
+  return source
+}
+
+func photoPreviewFileSize(sourcePath: String) -> Int? {
+  let attributes = try? FileManager.default.attributesOfItem(atPath: sourcePath)
+  let bytes = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+  return bytes > 0 ? bytes : nil
 }
 
 /// File size of the photo's original resource, from PhotoKit metadata. nil when unavailable.
@@ -584,6 +610,32 @@ private final class PreviewDownloadProgress: DownloadProgressCallback, FileProgr
     for (key, value) in extra { body[key] = value }
     emit(body)
   }
+}
+
+/// Downloads one file and writes its decrypted bytes to `outputURL` through the
+/// same streaming pipeline the preview uses (no whole-file buffer). Used by the
+/// Contacts and Calendar backups to read the existing server copy.
+func downloadDecryptedFileToDisk(
+  master: MasterKeyHandle,
+  apiUrl: String,
+  token: String,
+  fileId: String,
+  nameEncrypted: String,
+  outputURL: URL
+) async throws -> Int {
+  let base = apiUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+  guard let url = URL(string: "\(base)/api/v1/files/\(fileId)/download") else {
+    throw NSError(domain: "BeebeebBackupBaseline", code: 1,
+                  userInfo: [NSLocalizedDescriptionKey: "Invalid download URL"])
+  }
+  var request = URLRequest(url: url)
+  ProvenanceHeaders.apply(to: &request)
+  request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+  let format = try SharedKeyOps.previewChunkFormat(master: master, fileId: fileId, nameEncrypted: nameEncrypted)
+  let progress = PreviewDownloadProgress(requestId: nil, fileId: fileId) { _ in }
+  let delegate = PreviewStreamingDownloadDelegate(
+    progress: progress, fileId: fileId, outputURL: outputURL, master: master, expectedChunkFormat: format)
+  return try await delegate.download(request: request).plaintextSize
 }
 
 private final class PreviewStreamingDownloadDelegate: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate, @unchecked Sendable {
@@ -3304,6 +3356,10 @@ public class BeebeebCryptoModule: Module {
       }
     }
 
+    AsyncFunction("secureStoreItemExistsWithoutReadingData") { (label: String) throws -> Bool in
+      try KeychainManager.secureStoreItemExistsWithoutReadingData(label: label)
+    }
+
     AsyncFunction("loadKeyFromKeychain") { (label: String) throws -> Data? in
       RuntimeTrace.event("keychain.bridge.load_bytes.request", [
         "label": label,
@@ -4238,6 +4294,101 @@ public class BeebeebCryptoModule: Module {
       return removed
     }
 
+    // When the extension last told Files "Authentication Required" (Unix seconds), or nil.
+    AsyncFunction("getFileProviderAuthRequiredAt") { () -> Double? in
+      guard let dbUrl = fileProviderCacheDatabaseUrl(),
+            FileManager.default.fileExists(atPath: dbUrl.path) else { return nil }
+      var db: OpaquePointer?
+      guard sqlite3_open_v2(dbUrl.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else {
+        sqlite3_close(db)
+        return nil
+      }
+      defer { sqlite3_close(db) }
+      sqlite3_busy_timeout(db, 2000)
+      let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, "SELECT value FROM sync_state WHERE key = ?", -1, &stmt, nil) == SQLITE_OK else { return nil }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_text(stmt, 1, (fileProviderAuthRequiredAtKey as NSString).utf8String, -1, transient)
+      guard sqlite3_step(stmt) == SQLITE_ROW, let cstr = sqlite3_column_text(stmt, 0) else { return nil }
+      return Double(String(cString: cstr))
+    }
+
+    // Forget the extension's "Authentication Required" record once the app has handled it.
+    AsyncFunction("clearFileProviderAuthRequired") { () -> Bool in
+      guard let dbUrl = fileProviderCacheDatabaseUrl(),
+            FileManager.default.fileExists(atPath: dbUrl.path) else { return true }
+      var db: OpaquePointer?
+      guard sqlite3_open_v2(dbUrl.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else {
+        sqlite3_close(db)
+        return false
+      }
+      defer { sqlite3_close(db) }
+      sqlite3_busy_timeout(db, 2000)
+      for statement in fileProviderCacheSchemaStatements {
+        sqlite3_exec(db, statement, nil, nil, nil)
+      }
+      let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, "DELETE FROM sync_state WHERE key = ?", -1, &stmt, nil) == SQLITE_OK else { return false }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_text(stmt, 1, (fileProviderAuthRequiredAtKey as NSString).utf8String, -1, transient)
+      return sqlite3_step(stmt) == SQLITE_DONE
+    }
+
+    // Signal Files to reload the root and the working set (a no-op when Beebeeb is not mounted).
+    AsyncFunction("signalFileProviderEnumerators") { () async -> Bool in
+      if #available(iOS 16.0, *) {
+        await signalBeebeebFileProviderEnumerators()
+        return true
+      }
+      return false
+    }
+
+    // Publish (or clear, with nil) the id of the protected root Backups folder to the extension, then
+    // signal the root and working set so Files re-reads the folder's capabilities.
+    AsyncFunction("setFileProviderProtectedFolder") { (id: String?) -> Bool in
+      guard let dbUrl = fileProviderCacheDatabaseUrl() else { return false }
+      var db: OpaquePointer?
+      guard sqlite3_open_v2(dbUrl.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else {
+        sqlite3_close(db)
+        return false
+      }
+      defer { sqlite3_close(db) }
+      for statement in fileProviderCacheSchemaStatements {
+        sqlite3_exec(db, statement, nil, nil, nil)
+      }
+      let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+      var current: String?
+      var readStmt: OpaquePointer?
+      if sqlite3_prepare_v2(db, "SELECT value FROM sync_state WHERE key = ?", -1, &readStmt, nil) == SQLITE_OK {
+        sqlite3_bind_text(readStmt, 1, (fileProviderProtectedBackupsRootKey as NSString).utf8String, -1, transient)
+        if sqlite3_step(readStmt) == SQLITE_ROW, let cstr = sqlite3_column_text(readStmt, 0) {
+          current = String(cString: cstr)
+        }
+      }
+      sqlite3_finalize(readStmt)
+      let next = (id?.isEmpty ?? true) ? nil : id
+      if current == next { return true }
+
+      var stmt: OpaquePointer?
+      let sql = next == nil
+        ? "DELETE FROM sync_state WHERE key = ?"
+        : "INSERT INTO sync_state(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_text(stmt, 1, (fileProviderProtectedBackupsRootKey as NSString).utf8String, -1, transient)
+      if let next { sqlite3_bind_text(stmt, 2, (next as NSString).utf8String, -1, transient) }
+      guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+
+      if #available(iOS 16.0, *) {
+        let manager = NSFileProviderManager(for: beebeebFileProviderDomain())
+        manager?.signalEnumerator(for: .rootContainer) { _ in }
+        manager?.signalEnumerator(for: .workingSet) { _ in }
+      }
+      return true
+    }
+
     // ── Backup management ──────────────────────────────────────────────
 
     AsyncFunction("configureBackupFolder") { (category: String, parentFolderId: String?) in
@@ -4400,6 +4551,26 @@ public class BeebeebCryptoModule: Module {
 
     AsyncFunction("enableContactsBackup") { (authToken: String, userId: String) in
       ContactsBackupManager.shared.enable(authToken: authToken, userId: userId, runNow: true)
+    }
+
+    AsyncFunction("prepareContactsBackup") { (authToken: String, userId: String) in
+      ContactsBackupManager.shared.prepare(authToken: authToken, userId: userId)
+    }
+
+    AsyncFunction("runContactsBackupNow") { (force: Bool?) -> String in
+      return ContactsBackupManager.shared.backupNow(force: force ?? false).rawValue
+    }
+
+    AsyncFunction("prepareCalendarBackup") { (authToken: String, userId: String) in
+      CalendarBackupManager.shared.prepare(authToken: authToken, userId: userId)
+    }
+
+    AsyncFunction("runCalendarBackupNow") { (force: Bool?) -> String in
+      return CalendarBackupManager.shared.backupNow(force: force ?? false).rawValue
+    }
+
+    AsyncFunction("wakePhotoBackupDrain") { () in
+      NativeBackupEngine.shared.wakeForManifestChange()
     }
 
     AsyncFunction("resumeContactsBackup") { (authToken: String, userId: String) in
@@ -4615,6 +4786,16 @@ public class BeebeebCryptoModule: Module {
 
     AsyncFunction("resumeNativeBackup") { () in
       NativeBackupEngine.shared.resume()
+    }
+
+    // Run diagnostics (see RunDiagnostics in BeebeebAppDelegate.swift): how the previous run
+    // ended, and this process's memory footprint in bytes.
+    AsyncFunction("consumePreviousRunNative") { () -> [String: Any] in
+      return RunDiagnostics.consumePreviousRun()
+    }
+
+    Function("memoryFootprintBytesNative") { () -> Int in
+      return Int(RunDiagnostics.physFootprintBytes())
     }
 
     AsyncFunction("getNativeBackupProgress") { () -> [String: Any] in
@@ -5281,6 +5462,19 @@ public class BeebeebCryptoModule: Module {
       return ["path": url.path, "bytes": encoded.data.count, "width": encoded.width, "height": encoded.height]
     }
 
+    AsyncFunction("encodePhotoPreviewSampleFromSource") { (
+      sourcePath: String, format: String, px: Int
+    ) async throws -> [String: Any] in
+      let fmt = try photoPreviewFormat(format)
+      try validatePhotoPreviewPx(px)
+      let source = try photoPreviewFileImageSource(sourcePath: sourcePath)
+      let encoded = try PhotoPreviewEncoder.encode(source: source, format: fmt, longEdge: px)
+      let url = try photoPreviewSamplesDirectory()
+        .appendingPathComponent("sample-\(fmt.rawValue)-\(px)-\(UUID().uuidString).\(fmt.fileExtension)")
+      try encoded.data.write(to: url, options: .atomic)
+      return ["path": url.path, "bytes": encoded.data.count, "width": encoded.width, "height": encoded.height]
+    }
+
     AsyncFunction("estimatePhotoPreviewBytes") { (
       localIdentifiers: [String], format: String, px: Int
     ) async throws -> [String: Any] in
@@ -5325,6 +5519,25 @@ public class BeebeebCryptoModule: Module {
       var result: [String: Any] = ["path": url.path, "width": encoded.width, "height": encoded.height]
       // Size of the original file in the library (not of the downsampled copy above).
       if let bytes = photoOriginalFileSize(localIdentifier: localIdentifier) {
+        result["originalBytes"] = bytes
+      }
+      return result
+    }
+
+    AsyncFunction("originalPhotoForCompareFromSource") { (
+      sourcePath: String, maxPx: Int
+    ) async throws -> [String: Any] in
+      guard maxPx >= 1 else {
+        throw NSError(domain: "BeebeebPhotoPreview", code: 6,
+                      userInfo: [NSLocalizedDescriptionKey: "Invalid maximum size"])
+      }
+      let source = try photoPreviewFileImageSource(sourcePath: sourcePath)
+      let encoded = try PhotoPreviewEncoder.encode(source: source, format: .jpeg, longEdge: maxPx, quality: 1.0)
+      let url = try photoPreviewSamplesDirectory()
+        .appendingPathComponent("original-\(maxPx)-\(UUID().uuidString).jpg")
+      try encoded.data.write(to: url, options: .atomic)
+      var result: [String: Any] = ["path": url.path, "width": encoded.width, "height": encoded.height]
+      if let bytes = photoPreviewFileSize(sourcePath: sourcePath) {
         result["originalBytes"] = bytes
       }
       return result

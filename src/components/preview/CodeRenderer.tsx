@@ -32,7 +32,14 @@
  */
 
 import React, { useMemo } from 'react';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import {
+  ScrollView,
+  StyleSheet,
+  Text,
+  useWindowDimensions,
+  View,
+  type GestureResponderEvent,
+} from 'react-native';
 import { fonts } from '../../theme';
 import hljs from 'highlight.js/lib/core';
 import hljsBash from 'highlight.js/lib/languages/bash';
@@ -96,6 +103,10 @@ interface CodeRendererProps {
    */
   topInset?: number;
   bottomInset?: number;
+  onScrollOffsetChange?: (offset: number) => void;
+  onTouchStart?: (event: GestureResponderEvent) => void;
+  onTouchEnd?: (event: GestureResponderEvent) => void;
+  onTouchCancel?: (event: GestureResponderEvent) => void;
 }
 
 // Same Atom One Dark palette the old CSS build used, keyed by hljs class name.
@@ -254,6 +265,10 @@ export interface CodeView {
   truncated: boolean;
 }
 
+export function codeGutterMinWidth(totalDigits: number, fontScale: number): number {
+  return (totalDigits + 1) * 7.2 * fontScale;
+}
+
 /** Pure computation behind CodeRenderer's `useMemo` — no React needed, so it
  * is directly unit-testable without a renderer/reconciler. */
 export function computeCodeView(code: string, language: string): CodeView {
@@ -262,7 +277,17 @@ export function computeCodeView(code: string, language: string): CodeView {
   return { lines: highlightCode(visibleCode, language), truncated };
 }
 
-export function CodeRenderer({ code, language, topInset = 0, bottomInset = 0 }: CodeRendererProps) {
+export function CodeRenderer({
+  code,
+  language,
+  topInset = 0,
+  bottomInset = 0,
+  onScrollOffsetChange,
+  onTouchStart,
+  onTouchEnd,
+  onTouchCancel,
+}: CodeRendererProps) {
+  const { fontScale } = useWindowDimensions();
   const { lines, truncated } = useMemo(() => computeCodeView(code, language), [code, language]);
   const totalDigits = Math.max(2, String(lines.length).length);
 
@@ -304,6 +329,11 @@ export function CodeRenderer({ code, language, topInset = 0, bottomInset = 0 }: 
       <ScrollView
         showsVerticalScrollIndicator
         style={styles.vScroll}
+        onTouchStart={onTouchStart}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchCancel}
+        scrollEventThrottle={16}
+        onScroll={(event) => onScrollOffsetChange?.(event.nativeEvent.contentOffset.y)}
         // Round 5 — on `contentContainerStyle`, not the inner `code` View's
         // own padding: `truncated`'s notice is a SIBLING of `code`, rendered
         // BEFORE it, so padding on `code` alone would leave the notice
@@ -323,7 +353,7 @@ export function CodeRenderer({ code, language, topInset = 0, bottomInset = 0 }: 
         <View style={styles.code}>
           {lines.map((spans, idx) => (
             <View key={idx} style={styles.line}>
-              <Text style={[styles.lineno, { minWidth: (totalDigits + 1) * 7.2 }]}>
+              <Text style={[styles.lineno, { minWidth: codeGutterMinWidth(totalDigits, fontScale) }]}>
                 {String(idx + 1).padStart(totalDigits, ' ')}
               </Text>
               <Text style={styles.lineContent}>

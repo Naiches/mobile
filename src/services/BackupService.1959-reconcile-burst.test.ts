@@ -26,6 +26,7 @@ mock.module('expo-application', () => ({ nativeApplicationVersion: '1.0.1', nati
 type Entry = { id: string; parent_id: string | null; is_folder: boolean; name_encrypted: string; created_at: string; updated_at?: string; size_bytes?: number; chunk_count?: number };
 
 const listings = new Map<string, Entry[]>();
+let trashRows: Entry[] = [];
 const readable = new Map<string, string>();
 
 function sealed(id: string, parent: string | null): Entry {
@@ -91,7 +92,9 @@ mock.module('../lib/api', () => ({
   createFolder: async () => { throw new Error('this test must not create folders'); },
   deleteFile: async () => {},
   downloadFile: async () => { throw new Error('not used'); },
-  listAllFiles: async (parentId?: string) => listings.get(parentId ?? 'root') ?? [],
+  listAllFiles: async (parentId?: string, options?: { trashed?: boolean }) => (
+    options?.trashed ? [...trashRows] : listings.get(parentId ?? 'root') ?? []
+  ),
   findFile: async (parentId: string | undefined, match: (f: Entry) => boolean | Promise<boolean>) => {
     for (const f of listings.get(parentId ?? 'root') ?? []) {
       if (await match(f)) return f;
@@ -126,11 +129,13 @@ mock.module('../lib/file-index-cache', () => ({
   cachedFileIndexEpoch: () => undefined,
 }));
 
+let drainWakeCount = 0;
 mock.module('../../modules/beebeeb-crypto', () => ({
   getContactsBackupStatus: async () => ({ hasKnownBackupState: false }),
   getCalendarBackupStatus: async () => ({ hasKnownBackupState: false }),
   resetContactsBackup: async () => {},
   resetCalendarBackup: async () => {},
+  wakePhotoBackupDrain: async () => { drainWakeCount += 1; },
 }));
 mock.module('../lib/encrypted-upload', () => ({
   encryptedUpload: async () => ({ id: 'manifest' }),
@@ -143,7 +148,10 @@ mock.module('./BackupDatabase', () => ({
     if (uploadedHold) await new Promise<void>((resolve) => uploadedPending.push(resolve));
     return new Set(uploadedRemote);
   },
-  resetUploadedState: async (ids?: string[]) => { requeued.push(ids ?? ['<all>']); return ids?.length ?? 0; },
+  resetUploadedState: async (ids?: string[]) => {
+    requeued.push(ids ?? ['<all>']);
+    return ids?.length ?? uploadedRemote.size;
+  },
 }));
 mock.module('../lib/offline-manager', () => ({
   offlineManager: { offlineFileIds: () => [], offlineFolderIds: () => [], removeFile: async () => {}, removeFolder: async () => {} },
@@ -155,6 +163,11 @@ mock.module('../lib/thumbnail-cache', () => ({
 }));
 mock.module('../lib/name-cache', () => ({ loadNameCache: async () => ({}), pruneNameCache: async () => {} }));
 mock.module('../lib/device-identity', () => ({ getDeviceId: async () => 'device-1' }));
+mock.module('../lib/file-provider-mount', () => ({
+  syncDecryptedEntriesToFileProvider: async () => 0,
+  removeFromFileProviderCache: async () => {},
+  setFileProviderProtectedBackupsRoot: async () => {},
+}));
 mock.module('../lib/runtime-trace', () => ({ recordRuntimeTrace: () => null }));
 
 // Task 1959 round 2: the account epoch (api.ts setToken/clearToken move it).
@@ -162,7 +175,11 @@ mock.module('../lib/runtime-trace', () => ({ recordRuntimeTrace: () => null }));
 const epoch = await import('../lib/account-epoch').catch(() => null);
 
 const BackupService = await import('./BackupService');
-const { ensureBackupFolders, reconcileDerivedStateAgainstServer, setBackupEncryption } = BackupService;
+const {
+  ensureBackupFolders,
+  reconcileDerivedStateAgainstServer,
+  setBackupEncryption,
+} = BackupService;
 const loader = await import('../lib/file-index-loader').catch(() => null);
 
 const realNow = Date.now;
@@ -172,10 +189,12 @@ beforeEach(() => {
   clock = 1_000_000;
   Date.now = () => clock;
   listings.clear();
+  trashRows = [];
   readable.clear();
   secure.clear();
   indexCalls.length = 0;
   requeued.length = 0;
+  drainWakeCount = 0;
   indexCache = null;
   cacheGeneration = 0;
   uploadedRemote = new Set();
@@ -230,6 +249,16 @@ function completeBackupItem(i: number) {
 }
 
 describe('task 1959 — backup reconcile burst', () => {
+  test('a remote backup in Trash is requeued because only the live index counts as backed up', async () => {
+    uploadedRemote.add('photo-in-trash');
+    trashRows = [fileRow('photo-in-trash', 'cam')];
+    serverHash = 'without-trashed-photo';
+
+    await reconcileDerivedStateAgainstServer();
+    expect(requeued).toEqual([['photo-in-trash']]);
+    expect(drainWakeCount).toBe(1);
+  });
+
   test('50 completed backup items, each re-running SettingsScreen.refreshBackupStats -> getDeviceManifest -> ensureBackupFolders, cost ONE /files/index request', async () => {
     for (let i = 0; i < 50; i += 1) {
       completeBackupItem(i);
@@ -271,6 +300,7 @@ describe('task 1959 — backup reconcile burst', () => {
     await reconcileDerivedStateAgainstServer();
     expect(indexCalls.length).toBe(2);
     expect(requeued).toEqual([['gone-1']]);
+    expect(drainWakeCount).toBe(1);
   });
 
   test('the reconcile never decides orphans from a cached list: a screen refreshed the index, then an item finished uploading', async () => {

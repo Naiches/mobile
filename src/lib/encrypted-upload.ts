@@ -1,5 +1,6 @@
 import { accountEpoch, isCurrentAccountEpoch } from './account-epoch'
 import { onOwnerUpload } from './shared-folder-publish'
+import { markOwnerUploadComplete } from './shared-folder-keys'
 /**
  * Streaming encrypted upload for the Beebeeb mobile client.
  *
@@ -80,6 +81,103 @@ export interface EncryptedUploadOptions {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/**
+ * Local preparation should normally finish in milliseconds. This is an
+ * inactivity bound for file inspection, persisted-resume lookup and native
+ * bridge startup; it is deliberately not a total-transfer timeout.
+ */
+export const UPLOAD_STARTUP_INACTIVITY_TIMEOUT_MS = 30_000
+
+export class UploadPreparationTimeoutError extends Error {
+  constructor(stage: 'selected file' | 'encryption engine') {
+    super(stage === 'selected file'
+      ? 'Reading the selected file took too long. Choose it again and retry.'
+      : 'Starting the encrypted upload took too long. Try again.')
+    this.name = 'UploadPreparationTimeoutError'
+  }
+}
+
+async function withUploadPreparationDeadline<T>(
+  work: () => Promise<T>,
+  stage: 'selected file' | 'encryption engine',
+  abort: () => void,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      abort()
+      reject(new UploadPreparationTimeoutError(stage))
+    }, UPLOAD_STARTUP_INACTIVITY_TIMEOUT_MS)
+  })
+  try {
+    return await Promise.race([Promise.resolve().then(work), deadline])
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
+}
+
+/**
+ * Both engines emit one synthetic `preparing` event after resume/session
+ * setup. That proves the JS engine is alive; the native path waits for one
+ * additional bridge event. From that point the timer is removed so a
+ * legitimate large transfer stays unbounded.
+ */
+async function withUploadEngineStartupDeadline<T>(
+  work: (reportProgress: (progress: UploadProgress) => void) => Promise<T>,
+  onProgress: ((progress: UploadProgress) => void) | undefined,
+  abort: () => void,
+  waitForBridgeProgress: boolean,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let rejectDeadline: ((error: UploadPreparationTimeoutError) => void) | null = null
+  let sawPreparing = false
+  let startupConfirmed = false
+
+  const clear = () => {
+    if (timer !== null) clearTimeout(timer)
+    timer = null
+  }
+  const arm = () => {
+    clear()
+    timer = setTimeout(() => {
+      abort()
+      rejectDeadline?.(new UploadPreparationTimeoutError('encryption engine'))
+    }, UPLOAD_STARTUP_INACTIVITY_TIMEOUT_MS)
+  }
+  const deadline = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = reject
+    arm()
+  })
+  const reportProgress = (progress: UploadProgress) => {
+    onProgress?.(progress)
+    if (startupConfirmed) return
+    if (!sawPreparing && progress.phase === 'preparing') {
+      sawPreparing = true
+      if (!waitForBridgeProgress) {
+        startupConfirmed = true
+        clear()
+        return
+      }
+      // Resume/session preparation is complete; give the bridge its own full
+      // startup window rather than sharing what remains of the first one.
+      arm()
+      return
+    }
+    startupConfirmed = true
+    clear()
+  }
+
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => work(reportProgress)),
+      deadline,
+    ])
+  } finally {
+    clear()
+    rejectDeadline = null
+  }
+}
+
 /** Decode a base64 string (as returned by expo-file-system) to Uint8Array. */
 function b64ToUint8Array(b64: string): Uint8Array {
   const binaryStr = atob(b64)
@@ -149,21 +247,45 @@ export async function encryptedUpload(opts: EncryptedUploadOptions): Promise<Fil
     v2InitNameEncrypted, encryptChunkFn, encryptMetadataFn, masterKeyHandleId, onProgress, signal,
   } = opts
 
+  // Own an abortable signal for this attempt so a startup deadline can stop
+  // the native bridge even when the caller did not supply a signal. Caller
+  // aborts still forward through the same controller.
+  const attemptController = new AbortController()
+  const forwardCallerAbort = () => attemptController.abort()
+  if (signal?.aborted) forwardCallerAbort()
+  else signal?.addEventListener('abort', forwardCallerAbort, { once: true })
+
   // Task 1683f: if trash fires while this upload is in flight, clear the
   // persisted resume state (the upload must not resume for a trashed file)
   // and reject with an AbortError. `registerUploadAbort` also registers the
   // controller so `abortUploadForFile(fileId)` can reach it from the trash
   // action even when the trash starts on a different JS task.
-  const abortSignal = registerUploadAbort(fileId, signal)
+  const abortSignal = registerUploadAbort(fileId, attemptController.signal)
+  let resumeKey: string | undefined
   const onAborted = () => {
     void clearUploadResumeState(resumeKey)
   }
   if (abortSignal.aborted) onAborted()
   abortSignal.addEventListener('abort', onAborted, { once: true })
+  const settleAttempt = () => {
+    signal?.removeEventListener('abort', forwardCallerAbort)
+    abortSignal.removeEventListener('abort', onAborted)
+    settleUploadSignal(fileId, abortSignal)
+  }
 
   // ── 1. Get file size ────────────────────────────────────────────────────
-  const info = await FileSystem.getInfoAsync(uri)
-  if (!info.exists) throw new Error(`File not found: ${uri}`)
+  let info: FileSystem.FileInfo
+  try {
+    info = await withUploadPreparationDeadline(
+      () => FileSystem.getInfoAsync(uri),
+      'selected file',
+      () => attemptController.abort(),
+    )
+    if (!info.exists) throw new Error(`File not found: ${uri}`)
+  } catch (error) {
+    settleAttempt()
+    throw error
+  }
   // Expo types: size is on FileInfo when { size: true } is passed
   const plaintextSize: number = (info as FileSystem.FileInfo & { size?: number }).size ?? 0
 
@@ -219,7 +341,7 @@ export async function encryptedUpload(opts: EncryptedUploadOptions): Promise<Fil
   }
 
   // ── 3. Init → upload chunks → complete ──────────────────────────────────
-  const resumeKey = hashResumeKey([
+  resumeKey = hashResumeKey([
     parentId ?? 'root',
     uri,
     name,
@@ -236,50 +358,64 @@ export async function encryptedUpload(opts: EncryptedUploadOptions): Promise<Fil
   // and a later trash call would abort nothing (harmless) but leak the entry.
   try {
     if (masterKeyHandleId != null) {
-      const native = await uploadEncryptedFileNative({
-        masterKeyHandleId,
-        fileId,
-        inputUri: uri,
-        nameEncrypted: nameEncryptedForFileId,
-        v2InitNameEncrypted,
-        parentId,
-        isMedia: mediaFlag,
-        createdAt,
-        plaintextSizeBytes: plaintextSize,
-        resumeKey,
-        resumeMeta: { sourceUri: uri, name, mimeType: mimeType ?? null },
+      const native = await withUploadEngineStartupDeadline(
+        (reportProgress) => uploadEncryptedFileNative({
+          masterKeyHandleId,
+          fileId,
+          inputUri: uri,
+          nameEncrypted: nameEncryptedForFileId,
+          v2InitNameEncrypted,
+          parentId,
+          isMedia: mediaFlag,
+          createdAt,
+          plaintextSizeBytes: plaintextSize,
+          resumeKey,
+          resumeMeta: { sourceUri: uri, name, mimeType: mimeType ?? null },
+          onProgress: reportProgress,
+          signal: abortSignal,
+        }),
         onProgress,
-        signal: abortSignal,
-      })
+        () => attemptController.abort(),
+        true,
+      )
       if (native) {
         // Task SF-0001 (2275 L13/A7): the owner row is written under the id
         // this client chose and the parent it chose — never under an echoed
-        // id or a server-reported parent.
+        // id or a server-reported parent. The finished file opens with this
+        // account's key; pending-row failures can never override that proof.
+        if (isCurrentAccountEpoch(uploadEpoch)) markOwnerUploadComplete(fileId)
         if (isCurrentAccountEpoch(uploadEpoch)) onOwnerUpload({ id: fileId, parent_id: parentId ?? null })
         return native
       }
     }
 
-    const entry = await uploadEncryptedChunked({
-      fileId,
-      nameEncrypted: nameEncryptedForFileId,
-      v2InitNameEncrypted,
-      parentId,
-      mimeType: undefined,
-      isMedia: mediaFlag,
-      createdAt,
-      plaintextSizeBytes: plaintextSize,
-      resumeKey,
-      resumeMeta: { sourceUri: uri, name, mimeType: mimeType ?? null },
-      onProgress: onProgress
-        ? (p) => onProgress({ ...p, cryptoBytesPerSec: measuredCryptoRate() })
-        : undefined,
-      readEncryptedChunk,
-      signal: abortSignal,
-    })
+    const entry = await withUploadEngineStartupDeadline(
+      (reportProgress) => uploadEncryptedChunked({
+        fileId,
+        nameEncrypted: nameEncryptedForFileId,
+        v2InitNameEncrypted,
+        parentId,
+        mimeType: undefined,
+        isMedia: mediaFlag,
+        createdAt,
+        plaintextSizeBytes: plaintextSize,
+        resumeKey,
+        resumeMeta: { sourceUri: uri, name, mimeType: mimeType ?? null },
+        onProgress: (progress) => reportProgress({
+          ...progress,
+          cryptoBytesPerSec: measuredCryptoRate(),
+        }),
+        readEncryptedChunk,
+        signal: abortSignal,
+      }),
+      onProgress,
+      () => attemptController.abort(),
+      false,
+    )
+    if (isCurrentAccountEpoch(uploadEpoch)) markOwnerUploadComplete(fileId)
     if (isCurrentAccountEpoch(uploadEpoch)) onOwnerUpload({ id: fileId, parent_id: parentId ?? null })
     return entry
   } finally {
-    settleUploadSignal(fileId, abortSignal)
+    settleAttempt()
   }
 }

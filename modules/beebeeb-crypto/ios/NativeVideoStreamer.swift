@@ -348,9 +348,9 @@ private final class NativeVideoStreamSession: @unchecked Sendable {
     progress.emitProgress(stage: "downloading", bytesDownloaded: 0, bytesTotal: 0)
     let head = try fetchChunkToDisk(index: 0, encryptedOffset: 0, expectedLength: nil)
     let resolvedChunkCount = head.chunkCount
-    if let declaredChunkCount, declaredChunkCount != resolvedChunkCount {
-      throw streamError("Declared chunk count does not match chunk endpoint metadata")
-    }
+    // The file list can carry a stale chunk count (a long video reported as one chunk while the
+    // server holds hundreds). The chunk endpoint's count is the authority, every chunk is
+    // authenticated, and the declared size is still checked below, so a wrong hint is ignored.
     let resolvedChunkSize = max(0, head.bytesWritten - Int64(NativeVideoChunkMath.overheadBytes))
     let tail: NativeVideoChunkFetchResult
     if resolvedChunkCount == 1 {
@@ -794,6 +794,8 @@ private final class NativeVideoStreamSession: @unchecked Sendable {
     }
     progress.onComplete()
     try? FileManager.default.removeItem(at: encryptedUrl)
+    // The plaintext now lives at outputUrl; the working directory has nothing left in it.
+    try? FileManager.default.removeItem(at: tempDir)
     clearFileKey()
     notifyTerminalOnce()
   }

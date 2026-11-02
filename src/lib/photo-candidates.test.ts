@@ -8,7 +8,9 @@
 // failure and the revert-to-green run.
 import { describe, expect, test } from 'bun:test';
 import {
+  isMediaFile,
   isVisibleMediaFile,
+  previewMimeType,
   mediaMimeType,
   photoCandidatesFromIndex,
 } from './photo-candidates';
@@ -74,9 +76,25 @@ describe('photoCandidatesFromIndex (task 1687c)', () => {
 });
 
 describe('mediaMimeType (1687c regression detail)', () => {
-  test('falls back to the upload-time is_media classification when nothing else is decodable', () => {
-    expect(mediaMimeType(freshUploadingImageRow())).toBe('image/jpeg');
-    expect(mediaMimeType(freshUploadingImageRow({ is_media: false }))).toBe(null);
+  test('is_media alone says "media", not "image": the kind stays unknown until the name is decrypted', () => {
+    // A video row as the index serves it: encrypted name, is_media set, no
+    // thumbnail yet. Guessing image/jpeg here made the pager open it as a photo.
+    const video = freshUploadingImageRow({ id: 'video-1' });
+    expect(mediaMimeType(video)).toBe(null);
+    expect(isMediaFile(video)).toBe(true);
+    expect(isMediaFile(freshUploadingImageRow({ is_media: false }))).toBe(false);
+  });
+
+  test('a known category or file name still decides the kind', () => {
+    expect(mediaMimeType(freshUploadingImageRow({ category: 'video' }))).toBe('video/mp4');
+    expect(mediaMimeType(freshUploadingImageRow({ category: 'photo' }))).toBe('image/jpeg');
+  });
+
+  test('previewMimeType: the decrypted mime wins; an unknown kind stays undefined, never image/jpeg', () => {
+    const video = freshUploadingImageRow({ id: 'video-1' });
+    expect(previewMimeType(video, { 'video-1': 'video/quicktime' })).toBe('video/quicktime');
+    expect(previewMimeType(video, {})).toBeUndefined();
+    expect(previewMimeType({ ...video, mime_type: 'image/heic' }, {})).toBe('image/heic');
   });
 
   test('name_encrypted is never mistaken for a filename', () => {

@@ -87,7 +87,7 @@ function producerOrder(src: string): string[] {
   check('batch.upload', 'func processBatch(', 'manifestWriteTicket(', 'uploadSingleAsset(');
   check('sign_out_mark_flush', 'func flushServerMarksForSignOut(', 'manifestWriteTicket(', 'SignOutMarkFlush.run(');
   check('background_task', 'private func handleBackgroundTask(', 'manifestWriteTicket(', 'scanPhotoLibraryForPendingUploads(');
-  check('drain', 'private func startDrainLoop(', 'manifestWriteTicket(', 'recoverStuckUploads()');
+  check('drain', 'private func runDrainLoop(', 'manifestWriteTicket(', 'recoverStuckUploads()');
   check('claim', 'func claimManifest(', 'manifestWriteTicket(', 'dbQueue.sync');
   check('chunk_put', 'private func uploadStagedChunk(', 'chunkTaskTickets[task.taskIdentifier] = ticket', 'task.resume()');
   return bad;
@@ -113,7 +113,7 @@ describe('NativeBackupEngine.swift: every manifest write is fenced', () => {
     const fenced = new Set(audit.sections.filter((s) => s.status === 'fenced').map((s) => s.fn));
     for (const fn of [
       'scanPhotoLibraryForPendingUploads', 'photoLibraryDidChange', 'ensureManifestReadyForUploads',
-      'applyKeptPendingMarks', 'markOnServer', 'flushServerMarksForSignOut', 'processBatch', 'startDrainLoop',
+      'applyKeptPendingMarks', 'markOnServer', 'flushServerMarksForSignOut', 'processBatch', 'runDrainLoop',
       'uploadSingleAsset', 'uploadStagedAsset', 'stageEncryptedAsset', 'resolveStagedChunks', 'uploadStagedChunk',
       'urlSession', 'claimManifest',
     ]) expect(fenced.has(fn)).toBe(true);
@@ -146,6 +146,32 @@ describe('NativeBackupEngine.swift: every manifest write is fenced', () => {
     expect(before(stop, 'cancelScanTasks()', 'guard isRunning else { return }')).toBe(true);
     const scan = body(code, 'func scanPhotoLibraryForPendingUploads(');
     expect(before(scan, 'fetchAssetsForBackup(', 'guard !Task.isCancelled else { return false }')).toBe(true);
+  });
+
+  test('manual backup returns after admission while its full PhotoKit scan runs as a tracked task', () => {
+    const manual = body(engine, 'func triggerManualBackup(limit: Int = 50) async throws -> [String: Any] {');
+    expect(manual).toMatch(/spawnScan\(reason: "Manual backup scan", wakeReason: "manual-watch"\)/);
+    expect(manual).not.toMatch(/await scanPhotoLibraryForPendingUploads/);
+    expect(before(manual, 'spawnScan(reason: "Manual backup scan"', 'var progress = currentProgress()')).toBe(true);
+  });
+
+  test('a drain wake is atomic and interrupts only the active sleep', () => {
+    const start = body(engine, 'private func startDrainLoop(reason: String) {');
+    expect(before(start, 'engineStateLock.lock()', 'if _drainTask != nil')).toBe(true);
+    const transition = start.slice(start.indexOf('if _drainTask != nil'));
+    expect(before(transition, '_pendingDrainWakeReason = reason', 'engineStateLock.unlock()')).toBe(true);
+    expect(before(transition, 'installDrainLoopLocked(reason: reason)', 'engineStateLock.unlock()')).toBe(true);
+    expect(before(start, 'engineStateLock.unlock()', 'sleepToCancel?.cancel()')).toBe(true);
+    expect(start).not.toMatch(/_drainTask\?\.cancel\(\)/);
+
+    const finish = body(engine, 'private func finishDrainLoop(generation: Int) {');
+    expect(before(finish, 'engineStateLock.lock()', '_drainTask = nil')).toBe(true);
+    expect(before(finish, 'installDrainLoopLocked(reason: reason)', 'engineStateLock.unlock()')).toBe(true);
+
+    const sleep = body(engine, 'private func sleepIfStillRunning(nanoseconds: UInt64) async -> Bool {');
+    expect(before(sleep, '_pendingDrainWakeReason == nil', '_drainSleepTask = sleeper')).toBe(true);
+    expect(before(sleep, '_drainSleepTask = sleeper', 'let completed = await sleeper.value')).toBe(true);
+    expect(sleep).toMatch(/if _drainSleepGeneration == generation \{\s*_drainSleepTask = nil/);
   });
 
   test('the sign-out runs stop() before the reset, and bindAccount (the sign-in) binds the fence before its first write', () => {
@@ -186,7 +212,8 @@ describe('BackupManifestHandle.swift: every reset advances the fence first', () 
     const fns = [...enumBody.matchAll(/static func (\w+)\(/g)].map((m) => m[1]);
     // Round 10: + promoteCheckedHits (the batch server check).
     // Round 14: + loadSignOutInFlight, recordInFlightComplete, loadKeptInFlight, resolveKeptInFlight.
-    expect(fns.length).toBe(11);
+    // A mark whose server file disappeared and PhotoKit removals both flow through this fence.
+    expect(fns.length).toBe(13);
     for (const f of fns) {
       const b = body(enumBody, `static func ${f}(`);
       expect(before(b, 'fence.admits(ticket, writer:', 'guard let db else')).toBe(true);
@@ -245,14 +272,15 @@ describe('BackupDatabase.ts: every JS write takes a ticket', () => {
     expect((verifier.match(/recordVerification\([^;]*writeTicket\)/g) ?? []).length).toBe(6);
     const cascade = body(read('./delete-cascade.ts'), 'export async function onFilesDeleted(');
     expect(before(statements(cascade), 'const writeTicket = backupWriteTicket();', 'await ')).toBe(true);
-    expect(cascade).toMatch(/markRemoteDeletedByFileIds\(unique, writeTicket\)/);
+    expect(cascade).toMatch(/resetUploadedState\(unique, writeTicket\)/);
     const reconcile = body(read('../services/BackupService.ts'), 'export async function reconcileDerivedStateAgainstServer(): Promise<void> {');
     expect(before(statements(reconcile), 'const writeTicket = backupWriteTicket();', 'await ')).toBe(true);
     expect((reconcile.match(/resetUploadedState\([^)]*, writeTicket\)/g) ?? []).length).toBe(2);
     const photos = read('../screens/PhotosScreen.tsx');
-    const del = photos.slice(photos.indexOf("setBulkStatus('Deleting from Beebeeb...');"));
-    expect(before(statements(del), 'const writeTicket = backupWriteTicket();', 'await trashFiles(')).toBe(true);
-    expect(del).toMatch(/markRemoteDeleted\(localAssetId, writeTicket\)/);
+    const del = photos.slice(photos.indexOf('const deleteSelectedPhotos'), photos.indexOf('const shareSelectedPhotos'));
+    expect(before(statements(del), 'const writeTicket = backupWriteTicket();', 'void moveToTrashWithUndo(')).toBe(true);
+    expect(del).not.toMatch(/markRemoteDeleted\(localAssetId, writeTicket\)/);
+    expect(del).toMatch(/markUploadComplete\(localAssetId, id, writeTicket\)/);
   });
 });
 

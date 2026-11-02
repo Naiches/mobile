@@ -12,12 +12,13 @@ const manifestPending: Array<() => void> = [];
 const pruneEpochs: unknown[] = [];
 
 mock.module('../services/BackupDatabase', () => ({
-  markRemoteDeletedByFileIds: async () => {
+  resetUploadedState: async () => {
     if (holdManifest) await new Promise<void>((resolve) => manifestPending.push(resolve));
     return 0;
   },
 }));
 mock.module('../services/BackupService', () => ({ invalidateBackupFolderCacheIfDeleted: async () => {} }));
+mock.module('../../modules/beebeeb-crypto', () => ({ wakePhotoBackupDrain: async () => {} }));
 mock.module('./offline-manager', () => ({
   offlineManager: { offlineFolderIds: () => [], getStatus: () => null, removeFile: async () => {}, removeFolder: async () => {} },
 }));

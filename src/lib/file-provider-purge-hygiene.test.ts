@@ -15,7 +15,7 @@
  * calls per mobile/CLAUDE.md "Tests".
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -41,6 +41,14 @@ const CACHE_MANAGER_SWIFT_PATH = join(
 const FILE_PROVIDER_EXTENSION_SWIFT_PATH = join(
   REPO_ROOT, 'targets', 'file-provider', 'FileProviderExtension.swift',
 );
+const REPLACE_CHILDREN_SIGNATURE = [
+  'func replaceChildren(',
+  '    parent: String?,',
+  '    with items: [CachedItem],',
+  '    expectedEpoch: Int,',
+  '    pruningNamespacePrefix: String? = nil',
+  '  ) -> Bool {',
+].join('\n');
 const CONSTANTS_SWIFT_PATH = join(
   REPO_ROOT, 'targets', 'file-provider', 'Constants.swift',
 );
@@ -515,7 +523,7 @@ describe('C1 (round 7, P1): the File Provider extension refuses a write whose pu
     // call-site ORDER, which is unchanged.
     const body = bracedBody(
       cacheManagerSwift,
-      'func replaceChildren(parent: String?, with items: [CachedItem], expectedEpoch: Int) -> Bool {',
+      REPLACE_CHILDREN_SIGNATURE,
     );
     const queueSyncIdx = body.indexOf('queue.sync');
     const beginImmediateIdx = body.indexOf('guard beginImmediate() else { return false }');
@@ -547,7 +555,9 @@ describe('C1 (round 7, P1): the File Provider extension refuses a write whose pu
   test('SyncEngine.refreshContainer captures the epoch BEFORE the network fetch, not after', () => {
     const body = bracedBody(syncEngineSwift, 'static func refreshContainer(containerId: String) async -> FileProviderRefreshOutcome {');
     const epochIdx = body.indexOf('CacheManager.shared.currentPurgeEpoch()');
-    const fetchIdx = body.indexOf('ApiClient.shared.listFiles(parentId: parentId)');
+    const fetchIdx = body.search(
+      /ApiClient\.shared\.listFiles\(\s*parentId: parentId,\s*trashed: listing\.trashed,\s*maxEntries: listing\.isTrashRoot \? FilesTrash\.rootListingLimit : nil\s*\)/,
+    );
     expect(epochIdx).toBeGreaterThan(-1);
     expect(fetchIdx).toBeGreaterThan(-1);
     expect(epochIdx).toBeLessThan(fetchIdx);
@@ -555,7 +565,7 @@ describe('C1 (round 7, P1): the File Provider extension refuses a write whose pu
 
   test('SyncEngine.refreshContainer passes that captured epoch to replaceChildren and discards on refusal', () => {
     const body = bracedBody(syncEngineSwift, 'static func refreshContainer(containerId: String) async -> FileProviderRefreshOutcome {');
-    expect(body).toMatch(/replaceChildren\(\s*parent: parentId, with: rowsToUpsert, expectedEpoch: epochAtStart\s*\)/);
+    expect(body).toMatch(/replaceChildren\(\s*parent: listing\.cacheParent,\s*with: rowsToUpsert,\s*expectedEpoch: epochAtStart,\s*pruningNamespacePrefix: listing\.isTrashRoot \? FilesTrash\.itemPrefix : nil\s*\)/);
     expect(body).toMatch(/guard committed else \{[\s\S]*?return \.serverUnreachable\s*\}/);
     // A discarded write must not update sync_state as if it had landed.
     const guardIdx = body.indexOf('guard committed else');
@@ -947,7 +957,8 @@ describe('R3 (round 8, P2): FileProviderExtension captures the epoch BEFORE its 
     const body = bracedBody(swift, 'func createItem(');
     const epochIdx = body.indexOf('let epochAtStart = CacheManager.shared.currentPurgeEpoch()');
     const uploadIdx = body.indexOf('try await Self.streamUpload(');
-    const upsertIdx = body.indexOf('CacheManager.shared.upsert(cached, expectedEpoch: epochAtStart)');
+    const upsertIdx = body.indexOf('CacheManager.shared.upsert(cached, expectedEpoch: epochAtStart)', uploadIdx);
+    expect(body.indexOf('CacheManager.shared.upsert(cached, expectedEpoch: epochAtStart)')).toBeGreaterThan(body.indexOf('ApiClient.shared.createFolder('));
     expect(epochIdx).toBeGreaterThan(-1);
     expect(uploadIdx).toBeGreaterThan(-1);
     expect(upsertIdx).toBeGreaterThan(-1);
@@ -1245,7 +1256,7 @@ describe('round 10 (reviewer F-b): CacheManager checks COMMIT results and never 
 
   test('all three epoch-gated writers use currentEpochMatches, not a bare equality check', () => {
     for (const signature of [
-      'func replaceChildren(parent: String?, with items: [CachedItem], expectedEpoch: Int) -> Bool {',
+      REPLACE_CHILDREN_SIGNATURE,
       'func upsert(_ item: CachedItem, expectedEpoch: Int) -> Bool {',
       'func delete(id: String, expectedEpoch: Int) -> Bool {',
     ]) {
@@ -1264,7 +1275,7 @@ describe('round 10 (reviewer F-b): CacheManager checks COMMIT results and never 
 
   test('all three epoch-gated writers commit through commitOrRollback, not a bare execute("COMMIT")', () => {
     for (const signature of [
-      'func replaceChildren(parent: String?, with items: [CachedItem], expectedEpoch: Int) -> Bool {',
+      REPLACE_CHILDREN_SIGNATURE,
       'func upsert(_ item: CachedItem, expectedEpoch: Int) -> Bool {',
       'func delete(id: String, expectedEpoch: Int) -> Bool {',
     ]) {
@@ -3070,6 +3081,7 @@ describe('task 1722: forced Files mount retries transient cache-reset failure be
     expect(helper).toMatch(/storage\.purge\.file_provider_cache_reset_failed/);
 
     const dir = mkdtempSync(join(tmpdir(), 'bb-reset-retry-'));
+    try {
     const source = join(dir, 'RetryHarness.swift');
     writeFileSync(source, `
 import Foundation
@@ -3113,6 +3125,9 @@ if RuntimeTrace.events != [
 `);
     runSwiftc([source, '-o', join(dir, 'RetryHarness')]);
     execFileSync(join(dir, 'RetryHarness'), [], { stdio: 'pipe' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   nativeSwiftHarnessTest('actual SQLite reset helper recovers from a transient live DB lock and still fails closed on a persistent lock', () => {
@@ -3127,6 +3142,7 @@ if RuntimeTrace.events != [
     const schemaDeclaration = moduleSwift.slice(schemaStart, schemaEnd + 2);
 
     const dir = mkdtempSync(join(tmpdir(), 'bb-reset-sqlite-'));
+    try {
     const source = join(dir, 'SQLiteResetHarness.swift');
     writeFileSync(source, `
 import Foundation
@@ -3177,7 +3193,7 @@ func scalarInt(_ db: OpaquePointer?, _ sql: String) -> Int32 {
 }
 
 func makeRuntimeSchemaDb(_ name: String) -> URL {
-  let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("bb-reset-sqlite-\\(UUID().uuidString)", isDirectory: true)
+  let dir = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true).appendingPathComponent("runtime-\\(UUID().uuidString)", isDirectory: true)
   try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
   let url = dir.appendingPathComponent(name)
   let db = openDb(url)
@@ -3271,7 +3287,10 @@ require(scalarInt(persistentCheck, "PRAGMA user_version") == 1, "persistent user
 sqlite3_close(persistentCheck)
 `);
     runSwiftc([source, '-o', join(dir, 'SQLiteResetHarness'), '-lsqlite3']);
-    execFileSync(join(dir, 'SQLiteResetHarness'), [], { stdio: 'pipe' });
+    execFileSync(join(dir, 'SQLiteResetHarness'), [dir], { stdio: 'pipe' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 60_000);
 });
 
@@ -3308,6 +3327,7 @@ describe('task 1722: File Provider cache preserves JS-bridged file sizes', () =>
     expect(floatingHelper).toContain('value.rounded(.towardZero) == value');
 
     const dir = mkdtempSync(join(tmpdir(), 'bb-size-bridge-'));
+    try {
     const source = join(dir, 'SizeBridgeHarness.swift');
     writeFileSync(source, `
 import Foundation
@@ -3334,6 +3354,9 @@ require(fileProviderCacheSizeBytes(nil) == 0, "nil should reject")
 `);
     runSwiftc([source, '-o', join(dir, 'SizeBridgeHarness')]);
     execFileSync(join(dir, 'SizeBridgeHarness'), [], { stdio: 'pipe' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

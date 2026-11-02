@@ -4,10 +4,12 @@ import {
   KeyboardAvoidingView,
   Linking,
   Platform,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -116,6 +118,8 @@ export default function SharedViewScreen() {
   const route = useRoute<SharedViewRoute>();
   const insets = useSafeAreaInsets();
   const { colors: c } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const accessibilityLayout = fontScale >= 1.3;
   const rawToken = route.params.token;
   const { token, shareKey: routeShareKey } = useMemo(
     () => splitShareTokenParam(rawToken),
@@ -366,7 +370,7 @@ export default function SharedViewScreen() {
   return (
     <View style={[styles.root, { paddingTop: insets.top, paddingBottom: insets.bottom, backgroundColor: c.paper2 }]}>
       {/* Header */}
-      <View style={[styles.header, { borderBottomColor: c.line }]}>
+      <View style={[styles.header, accessibilityLayout && styles.headerAccessibility, { borderBottomColor: c.line }]}>
         <TouchableOpacity
           onPress={handleClose}
           style={[styles.closeBtn, { backgroundColor: c.paper, borderColor: c.line }]}
@@ -374,18 +378,18 @@ export default function SharedViewScreen() {
         >
           <Ionicons name="close" size={18} color={c.ink2} />
         </TouchableOpacity>
-        <Text style={[styles.title, { color: c.ink }]}>Shared file</Text>
+        <Text style={[styles.title, { color: c.ink }]} numberOfLines={2}>Shared file</Text>
         <View style={{ width: 32 }} />
       </View>
 
       {/* Body */}
       {loading ? (
-        <View style={styles.centeredBody}>
+        <ScrollView contentContainerStyle={styles.centeredBody}>
           <ActivityIndicator color={c.amber} size="large" />
           <Text style={[styles.loadingText, { color: c.ink3 }]}>Loading share info...</Text>
-        </View>
+        </ScrollView>
       ) : error ? (
-        <View style={styles.centeredBody}>
+        <ScrollView contentContainerStyle={styles.centeredBody}>
           <Ionicons name="alert-circle-outline" size={48} color={c.red} style={{ opacity: 0.7 }} />
           <Text style={[styles.errorTitle, { color: c.ink }]}>Link unavailable</Text>
           <Text style={[styles.errorSub, { color: c.ink3 }]}>{error}</Text>
@@ -397,7 +401,7 @@ export default function SharedViewScreen() {
             <Ionicons name="open-outline" size={16} color={c.ink} />
             <Text style={[styles.primaryBtnText, { color: c.ink }]}>Try in browser</Text>
           </TouchableOpacity>
-        </View>
+        </ScrollView>
       ) : info?.requires_passphrase === true ? (
         // Task 1539 (finding 4): the server withholds every field but
         // {id, share_type, requires_passphrase, expires_at} until this is
@@ -408,7 +412,10 @@ export default function SharedViewScreen() {
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           style={{ flex: 1 }}
         >
-          <View style={styles.body}>
+          <ScrollView
+            contentContainerStyle={[styles.body, accessibilityLayout && styles.bodyAccessibility]}
+            keyboardShouldPersistTaps="handled"
+          >
             <View style={[styles.fileIconBox, { backgroundColor: c.amberBg }]}>
               <Ionicons name="lock-closed" size={36} color={c.amberDeep} />
             </View>
@@ -455,49 +462,49 @@ export default function SharedViewScreen() {
                 {verifying ? 'Verifying...' : 'Unlock file'}
               </Text>
             </TouchableOpacity>
-            <View style={[styles.encBadge, { backgroundColor: c.amberBg, borderColor: c.amber }]}>
+            <View style={[styles.encBadge, accessibilityLayout && styles.encBadgeAccessibility, { backgroundColor: c.amberBg, borderColor: c.amber }]}>
               <View style={[styles.encDot, { backgroundColor: c.amber }]} />
               <Text style={[styles.encText, { color: c.amberDeep }]}>End-to-end encrypted · AES-256-GCM</Text>
             </View>
-          </View>
+          </ScrollView>
         </KeyboardAvoidingView>
       ) : info ? (
-        <View style={styles.body}>
+        <ScrollView contentContainerStyle={[styles.body, accessibilityLayout && styles.bodyAccessibility]}>
           {/* File icon */}
           <View style={[styles.fileIconBox, { backgroundColor: iconBg }]}>
             <Ionicons name={iconName} size={36} color="#FFFFFF" />
           </View>
 
           {/* File name */}
-          <Text style={[styles.fileName, { color: c.ink }]} numberOfLines={3}>
+          <Text style={[styles.fileName, { color: c.ink }]} numberOfLines={accessibilityLayout ? undefined : 3}>
             {displayFileName(info, decryptedName)}
           </Text>
 
           {/* Meta card */}
           <View style={[styles.metaCard, { backgroundColor: c.paper, borderColor: c.line }]}>
             {info.size_bytes != null && info.size_bytes > 0 && (
-              <View style={styles.metaRow}>
+              <View style={[styles.metaRow, accessibilityLayout && styles.metaRowAccessibility]}>
                 <Ionicons name="cube-outline" size={14} color={c.ink3} />
                 <Text style={[styles.metaLabel, { color: c.ink3 }]}>Size</Text>
                 <Text style={[styles.metaValue, { color: c.ink }]}>{formatSize(info.size_bytes)}</Text>
               </View>
             )}
             {effectiveMime && (
-              <View style={styles.metaRow}>
+              <View style={[styles.metaRow, accessibilityLayout && styles.metaRowAccessibility]}>
                 <Ionicons name="document-outline" size={14} color={c.ink3} />
                 <Text style={[styles.metaLabel, { color: c.ink3 }]}>Type</Text>
-                <Text style={[styles.metaValue, { color: c.ink }]} numberOfLines={1}>{effectiveMime}</Text>
+                <Text style={[styles.metaValue, accessibilityLayout && styles.metaValueAccessibility, { color: c.ink }]} numberOfLines={accessibilityLayout ? undefined : 1}>{effectiveMime}</Text>
               </View>
             )}
             {info.sender_email && (
-              <View style={styles.metaRow}>
+              <View style={[styles.metaRow, accessibilityLayout && styles.metaRowAccessibility]}>
                 <Ionicons name="person-outline" size={14} color={c.ink3} />
                 <Text style={[styles.metaLabel, { color: c.ink3 }]}>Shared by</Text>
-                <Text style={[styles.metaValue, { color: c.ink }]} numberOfLines={1}>{info.sender_email}</Text>
+                <Text style={[styles.metaValue, accessibilityLayout && styles.metaValueAccessibility, { color: c.ink }]} numberOfLines={accessibilityLayout ? undefined : 1}>{info.sender_email}</Text>
               </View>
             )}
             {info.expires_at && (
-              <View style={styles.metaRow}>
+              <View style={[styles.metaRow, accessibilityLayout && styles.metaRowAccessibility]}>
                 <Ionicons name="time-outline" size={14} color={c.ink3} />
                 <Text style={[styles.metaLabel, { color: c.ink3 }]}>Expiry</Text>
                 <Text style={[styles.metaValue, { color: c.ink }]}>{formatExpiry(info.expires_at)}</Text>
@@ -509,27 +516,27 @@ export default function SharedViewScreen() {
                 below renders before this body is ever reached while
                 requires_passphrase is true. */}
             {info.requires_passphrase && (
-              <View style={styles.metaRow}>
+              <View style={[styles.metaRow, accessibilityLayout && styles.metaRowAccessibility]}>
                 <Ionicons name="lock-closed-outline" size={14} color={c.amber} />
                 <Text style={[styles.metaLabel, { color: c.ink3 }]}>Passphrase</Text>
                 <Text style={[styles.metaValue, { color: c.amber }]}>Required</Text>
               </View>
             )}
-            <View style={styles.metaRow}>
+            <View style={[styles.metaRow, accessibilityLayout && styles.metaRowAccessibility]}>
               <Ionicons name="key-outline" size={14} color={c.ink3} />
               <Text style={[styles.metaLabel, { color: c.ink3 }]}>Token</Text>
-              <Text style={[styles.metaToken, { color: c.ink2 }]} numberOfLines={1}>{token}</Text>
+              <Text style={[styles.metaToken, accessibilityLayout && styles.metaValueAccessibility, { color: c.ink2 }]} numberOfLines={accessibilityLayout ? undefined : 1}>{token}</Text>
             </View>
           </View>
 
           {/* Encryption badges */}
           <View style={{ gap: 6, alignItems: 'center' }}>
-            <View style={[styles.encBadge, { backgroundColor: c.amberBg, borderColor: c.amber }]}>
+            <View style={[styles.encBadge, accessibilityLayout && styles.encBadgeAccessibility, { backgroundColor: c.amberBg, borderColor: c.amber }]}>
               <View style={[styles.encDot, { backgroundColor: c.amber }]} />
               <Text style={[styles.encText, { color: c.amberDeep }]}>End-to-end encrypted · AES-256-GCM</Text>
             </View>
             {info.double_encrypted && (
-              <View style={[styles.encBadge, { backgroundColor: c.amberBg, borderColor: c.amber }]}>
+              <View style={[styles.encBadge, accessibilityLayout && styles.encBadgeAccessibility, { backgroundColor: c.amberBg, borderColor: c.amber }]}>
                 <Ionicons name="shield-checkmark" size={12} color={c.amberDeep} />
                 <Text style={[styles.encText, { color: c.amberDeep }]}>Double encrypted</Text>
               </View>
@@ -602,7 +609,7 @@ export default function SharedViewScreen() {
               Decrypted on-device. The plaintext never reached our servers.
             </Text>
           ) : null}
-        </View>
+        </ScrollView>
       ) : null}
     </View>
   );
@@ -622,6 +629,7 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
+  headerAccessibility: { alignItems: 'flex-start' },
   closeBtn: {
     width: 32,
     height: 32,
@@ -633,11 +641,12 @@ const styles = StyleSheet.create({
   title: { flex: 1, textAlign: 'center', fontSize: 16, fontWeight: '600' },
 
   centeredBody: {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 32,
     gap: 14,
+    paddingVertical: 32,
   },
   loadingText: { fontSize: 13 },
   errorTitle: { fontSize: 18, fontWeight: '700', marginTop: 4 },
@@ -645,20 +654,23 @@ const styles = StyleSheet.create({
   // Task 1539 (finding 4): passphrase-gate text input.
   passphraseInput: {
     width: '100%',
-    height: 46,
+    minHeight: 46,
     borderWidth: 1,
     borderRadius: radii.md,
     paddingHorizontal: 14,
+    paddingVertical: 11,
     fontSize: 15,
   },
 
   body: {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     paddingHorizontal: 24,
     paddingTop: 32,
     gap: 16,
+    paddingBottom: 32,
   },
+  bodyAccessibility: { alignItems: 'stretch' },
 
   fileIconBox: {
     width: 80,
@@ -688,9 +700,11 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     gap: 8,
   },
+  metaRowAccessibility: { alignItems: 'flex-start', flexWrap: 'wrap' },
   metaLabel: { fontSize: 12, width: 80 },
   metaValue: { fontSize: 13, fontWeight: '500', flex: 1 },
   metaToken: { fontSize: 11, fontFamily: 'Courier', flex: 1 },
+  metaValueAccessibility: { flexBasis: '65%' },
 
   encBadge: {
     flexDirection: 'row',
@@ -701,6 +715,7 @@ const styles = StyleSheet.create({
     borderRadius: radii.round,
     borderWidth: 1,
   },
+  encBadgeAccessibility: { flexWrap: 'wrap', alignSelf: 'stretch', justifyContent: 'center' },
   encDot: { width: 6, height: 6, borderRadius: 3 },
   encText: { fontSize: 11, fontWeight: '500' },
 

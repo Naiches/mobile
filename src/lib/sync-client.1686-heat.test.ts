@@ -110,7 +110,8 @@ const realSetTimeout = globalThis.setTimeout;
 function withCapturedTimers<T>(fn: () => T): T {
   capturedTimers = [];
   globalThis.setTimeout = ((inner: () => void, ms?: number) => {
-    capturedTimers.push({ fn: inner, ms: ms ?? 0 });
+    // The 60 s stream-liveness check is covered by sync-client.liveness.test.ts.
+    if ((ms ?? 0) !== 60_000) capturedTimers.push({ fn: inner, ms: ms ?? 0 });
     return 0 as unknown as ReturnType<typeof setTimeout>;
   }) as typeof setTimeout;
   try {

@@ -1,7 +1,7 @@
 // @ts-nocheck -- compile the real uploader with a URLProtocol and crypto/engine stubs.
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 const nativeTest = process.platform === 'darwin' ? test : test.skip;
@@ -9,6 +9,7 @@ const ios = join(import.meta.dir, '../../modules/beebeeb-crypto/ios');
 
 nativeTest('legacy backup uploader forwards a typed refusal and stops subsequent requests', () => {
   const dir = mkdtempSync(join(tmpdir(), 'bb-aux-refusal-'));
+  try {
   const engine = readFileSync(join(ios, 'NativeBackupEngine.swift'), 'utf8');
   const methods = engine.slice(engine.indexOf('  func recordAuxiliaryAccountRefusal('), engine.indexOf('  // MARK: - Lifecycle', engine.indexOf('  func recordAuxiliaryAccountRefusal(')));
   writeFileSync(join(dir, 'main.swift'), String.raw`
@@ -84,12 +85,15 @@ print("auxiliary refusal: 8 assertions passed, 0 failed")
 `);
   execFileSync('swiftc', ['-module-cache-path', join(dir, 'modules'), join(ios, 'NativeEncryptedBackupUploader.swift'), join(ios, 'AccountRefusalDetection.swift'), join(ios, 'BackupCreateUploadFlow.swift'), join(ios, 'UploadItemIdEcho.swift'), join(dir, 'main.swift'), '-o', join(dir, 'aux')], {timeout: 60000});
   expect(execFileSync(join(dir, 'aux'), [], {encoding:'utf8', timeout:10000})).toContain('auxiliary refusal: 8 assertions passed, 0 failed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 90000);
 
 test('contacts and calendar gate export and manual retry uses the shared refusal state', () => {
   for (const file of ['ContactsBackupManager.swift', 'CalendarBackupManager.swift']) {
     const source = readFileSync(join(ios, file), 'utf8');
-    const body = source.slice(source.indexOf('  func backup()'), source.indexOf('  func status()'));
+    const body = source.slice(source.indexOf('  func backup(force: Bool = false)'), source.indexOf('  func status()'));
     expect(body).toContain('guard !NativeBackupEngine.shared.accountUploadRefused');
     expect(source).toContain('clearAuxiliaryAccountRefusal(accountId: userId)');
   }
